@@ -243,8 +243,10 @@ test {
     _ = @import("input.zig");
     _ = @import("log.zig");
     _ = @import("models.zig");
+    _ = @import("request.zig");
     _ = @import("settings.zig");
     _ = @import("spin.zig");
+    _ = @import("stream.zig");
     _ = @import("term.zig");
     _ = @import("tools.zig");
     _ = @import("transport.zig");

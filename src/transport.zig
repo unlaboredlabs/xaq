@@ -39,6 +39,22 @@ pub fn postStream(
     callback_context: ?*anyopaque,
     callback: StreamFn,
 ) !Response {
+    return postStreamWithToken(gpa, io, url, content_type, headers, body, callback_context, callback, cancel.processToken());
+}
+
+/// `postStream` with caller-owned cancellation. This is the transport entry
+/// point used by embedded agents; it does not touch the CLI's process token.
+pub fn postStreamWithToken(
+    gpa: std.mem.Allocator,
+    io: Io,
+    url: []const u8,
+    content_type: []const u8,
+    headers: []const Header,
+    body: []const u8,
+    callback_context: ?*anyopaque,
+    callback: StreamFn,
+    token: *cancel.Token,
+) !Response {
     const path = try requestFile(gpa, io, body);
     defer {
         Io.Dir.cwd().deleteFile(io, path) catch {};
@@ -53,8 +69,8 @@ pub fn postStream(
         .pgid = 0,
     });
     defer if (child.id != null) child.kill(io);
-    cancel.setChild(child.id.?);
-    defer cancel.clearChild();
+    token.setChild(child.id.?);
+    defer token.clearChild();
 
     var config_buffer: [4096]u8 = undefined;
     var config: Io.File.Writer = .init(child.stdin.?, io, &config_buffer);
@@ -82,8 +98,12 @@ pub fn postStream(
     child.stdin.?.close(io);
     child.stdin = null;
 
-    var read_buffer: [64 * 1024]u8 = undefined;
-    var file_reader: Io.File.Reader = .init(child.stdout.?, io, &read_buffer);
+    // Heap buffer: a single SSE line carries whole tool-call items, so a
+    // large write/edit argument payload can far exceed 64 KiB; a line
+    // that cannot fit still fails, but only past this bound.
+    const read_buffer = try gpa.alloc(u8, 8 * 1024 * 1024);
+    defer gpa.free(read_buffer);
+    var file_reader: Io.File.Reader = .init(child.stdout.?, io, read_buffer);
     const reader = &file_reader.interface;
     var status: u16 = 0;
     var retry_after: ?u64 = null;
@@ -91,7 +111,13 @@ pub fn postStream(
     var error_body: Io.Writer.Allocating = .init(gpa);
     defer error_body.deinit();
 
-    while (try reader.takeDelimiter('\n')) |line_raw| {
+    while (reader.takeDelimiter('\n') catch |err| {
+        // SIGINT terminates curl and can make its stdout pipe report a read
+        // failure rather than EOF. Cancellation must win over that transport
+        // detail so the interactive loop can restore the prompt.
+        if (token.isRequested()) return error.Cancelled;
+        return err;
+    }) |line_raw| {
         const line = std.mem.trimEnd(u8, line_raw, "\r");
         if (in_headers) {
             if (std.mem.startsWith(u8, line, "HTTP/")) {
@@ -99,17 +125,18 @@ pub fn postStream(
                 retry_after = null;
             } else if (line.len == 0) {
                 if (status == 0) return error.InvalidHttpResponse;
+                if (status >= 100 and status < 200) {
+                    // 1xx (e.g. 100-continue): the real header block
+                    // follows. Only here may a new HTTP/ line appear;
+                    // treating body lines that start with "HTTP/" as new
+                    // blocks would corrupt legitimate payloads.
+                    status = 0;
+                    continue;
+                }
                 in_headers = false;
             } else if (headerValue(line, "retry-after")) |value| {
                 retry_after = std.fmt.parseInt(u64, std.mem.trim(u8, value, " \t"), 10) catch null;
             }
-            continue;
-        }
-        // A proxy or informational response may introduce another header block.
-        if (std.mem.startsWith(u8, line, "HTTP/")) {
-            status = parseStatus(line) orelse return error.InvalidHttpResponse;
-            retry_after = null;
-            in_headers = true;
             continue;
         }
         if (status >= 200 and status < 300) {
@@ -122,8 +149,12 @@ pub fn postStream(
     }
     child.stdout.?.close(io);
     child.stdout = null;
-    const term = try child.wait(io);
-    if (cancel.requested()) return error.Cancelled;
+    if (token.isRequested()) return error.Cancelled;
+    const term = child.wait(io) catch |err| {
+        if (token.isRequested()) return error.Cancelled;
+        return err;
+    };
+    if (token.isRequested()) return error.Cancelled;
     switch (term) {
         .exited => |code| if (code != 0) return error.TransportFailed,
         else => return error.TransportFailed,
@@ -143,6 +174,7 @@ fn requestFile(gpa: std.mem.Allocator, io: Io, body: []const u8) ![]u8 {
     const suffix = std.base64.url_safe_no_pad.Encoder.encode(&encoded, &random);
     const path = try std.fmt.allocPrint(gpa, "/tmp/xaq-request-{s}", .{suffix});
     errdefer gpa.free(path);
+    errdefer Io.Dir.cwd().deleteFile(io, path) catch {};
     try Io.Dir.cwd().writeFile(io, .{
         .sub_path = path,
         .data = body,
