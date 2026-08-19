@@ -107,7 +107,9 @@ const JsonOutput = struct {
             .completed => |completed| {
                 try self.output.writeAll(if (self.format == .streaming_json) "{\"type\":\"end\",\"text\":" else "{\"text\":");
                 try writeJsonString(self.output, completed.text);
-                try self.output.writeAll(",\"stop_reason\":\"completed\",\"provider\":");
+                try self.output.writeAll(",\"stop_reason\":");
+                try writeJsonString(self.output, @tagName(completed.stop_reason));
+                try self.output.writeAll(",\"provider\":");
                 try writeJsonString(self.output, @tagName(completed.provider));
                 try self.output.writeAll(",\"model\":");
                 try writeJsonString(self.output, completed.model);
@@ -602,12 +604,35 @@ test "json output is one final result object" {
         .usage = .{ .input = 12, .cached = 3, .output = 4 },
         .rounds = 2,
         .tool_calls = 1,
+        .stop_reason = .completed,
     } });
 
     try std.testing.expectEqualStrings(
         "{\"text\":\"done\\ncleanly\",\"stop_reason\":\"completed\",\"provider\":\"chatgpt\",\"model\":\"gpt-test\",\"thread_id\":null,\"usage\":{\"input_tokens\":12,\"cached_input_tokens\":3,\"output_tokens\":4},\"num_turns\":2,\"tool_calls\":1}\n",
         output.buffered(),
     );
+}
+
+test "json output identifies an interrupted response" {
+    var storage: [512]u8 = undefined;
+    var output: Io.Writer = .fixed(&storage);
+    var json_output: JsonOutput = .{ .output = &output, .format = .json };
+
+    try json_output.writeEvent(.{ .completed = .{
+        .text = "partial",
+        .provider = .claude,
+        .model = "claude-test",
+        .thread_id = "thread",
+        .usage = .{ .input = 3, .output = 1 },
+        .rounds = 1,
+        .tool_calls = 0,
+        .stop_reason = .stream_interrupted,
+    } });
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, std.mem.trimEnd(u8, output.buffered(), "\n"), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("partial", parsed.value.object.get("text").?.string);
+    try std.testing.expectEqualStrings("stream_interrupted", parsed.value.object.get("stop_reason").?.string);
 }
 
 test "streaming json emits typed lines and an authoritative end" {
@@ -630,6 +655,7 @@ test "streaming json emits typed lines and an authoritative end" {
         .usage = .{ .input = 5, .cached = 2, .output = 1 },
         .rounds = 1,
         .tool_calls = 1,
+        .stop_reason = .stream_interrupted,
     } });
 
     var lines = std.mem.splitScalar(u8, output.buffered(), '\n');
@@ -639,6 +665,9 @@ test "streaming json emits typed lines and an authoritative end" {
         var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, line, .{});
         defer parsed.deinit();
         try std.testing.expectEqualStrings(expected, parsed.value.object.get("type").?.string);
+        if (std.mem.eql(u8, expected, "end")) {
+            try std.testing.expectEqualStrings("stream_interrupted", parsed.value.object.get("stop_reason").?.string);
+        }
     }
     try std.testing.expectEqualStrings("", lines.next().?);
     try std.testing.expectEqual(null, lines.next());

@@ -46,6 +46,11 @@ pub const ToolFinished = struct {
     duration_ms: u64,
 };
 
+pub const StopReason = enum {
+    completed,
+    stream_interrupted,
+};
+
 pub const RunCompleted = struct {
     text: []const u8,
     provider: auth.Provider,
@@ -54,6 +59,7 @@ pub const RunCompleted = struct {
     usage: Usage,
     rounds: usize,
     tool_calls: usize,
+    stop_reason: StopReason,
 };
 
 /// Event payloads borrow session memory and are valid only for the callback.
@@ -403,6 +409,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
     var run_usage: Usage = .{};
     var run_rounds: usize = 0;
     var run_tool_calls: usize = 0;
+    var run_stop_reason: StopReason = .completed;
     while (true) {
         if (session.subagent_manager) |*manager| {
             if (try manager.takeNotifications(session.allocator())) |notification| {
@@ -444,7 +451,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
         run_rounds += 1;
         try session.emit(.{ .round_start = .{ .number = run_rounds } });
         tui.noteState(.thinking, "");
-        const answer = performRound(&session) catch |err| switch (err) {
+        const round_result = performRound(&session) catch |err| switch (err) {
             error.NotLoggedIn => {
                 session.turn -|= 1;
                 const reader = options.input orelse return err;
@@ -536,6 +543,8 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
             },
             else => return err,
         };
+        const answer = round_result.answer;
+        if (round_result.stop_reason == .stream_interrupted) run_stop_reason = .stream_interrupted;
         session.usage.input += answer.usage.input;
         session.usage.cached += answer.usage.cached;
         session.usage.output += answer.usage.output;
@@ -560,6 +569,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
                     .usage = run_usage,
                     .rounds = run_rounds,
                     .tool_calls = run_tool_calls,
+                    .stop_reason = run_stop_reason,
                 } });
                 return;
             };
@@ -2204,7 +2214,7 @@ fn compactWithModel(session: *Session, model: []const u8, entries: []const Entry
     const body = try request.buildCompact(request_arena.allocator(), session.provider, model, effectiveCompactEffort(session), fast, entries);
     var sink: Io.Writer.Allocating = .init(session.gpa);
     defer sink.deinit();
-    const answer = try performBody(session, model, body, &sink.writer, "compact", fast);
+    const answer = (try performBody(session, model, body, &sink.writer, "compact", fast)).answer;
     if (answer.calls.len > 0 or answer.text.len == 0) return null;
     session.usage.input += answer.usage.input;
     session.usage.cached += answer.usage.cached;
@@ -2314,7 +2324,12 @@ fn eventInteger(value: std.json.Value, key: []const u8) ?u64 {
     };
 }
 
-fn performRound(session: *Session) !Assistant {
+const RoundResult = struct {
+    answer: Assistant,
+    stop_reason: StopReason,
+};
+
+fn performRound(session: *Session) !RoundResult {
     var request_arena: std.heap.ArenaAllocator = .init(session.gpa);
     defer request_arena.deinit();
     const body = try request.build(
@@ -2335,7 +2350,7 @@ fn performRound(session: *Session) !Assistant {
     return performBody(session, session.model, body, session.output, "round", session.fast);
 }
 
-fn performBody(session: *Session, model: []const u8, body: []const u8, output: *Io.Writer, kind: []const u8, fast: bool) !Assistant {
+fn performBody(session: *Session, model: []const u8, body: []const u8, output: *Io.Writer, kind: []const u8, fast: bool) !RoundResult {
     log.logf("agent", "event=request kind={s} provider={s} model={s} fast={s} turn={d} entries={d} body_bytes={d}", .{ kind, @tagName(session.provider), model, if (fast) "on" else "off", session.turn, session.entries.items.len, body.len });
     var attempt: usize = 0;
     var refreshed = false;
@@ -2355,22 +2370,22 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
         spin.start(session.io, if (compacting) "compacting" else "thinking");
         const response = requestStream(session.gpa, session.io, session.provider, credential, body, &decoder, fast) catch |err| {
             spin.stop();
-            if (err == error.Cancelled or err == error.ProviderRequestFailed) {
+            const partial = interruptedRound(&decoder, compacting, err) catch |terminal| {
                 // Close any active markdown style before control returns to
                 // the prompt or an error line is printed.
                 decoder.finishRendering() catch {};
-                return err;
-            }
+                return terminal;
+            };
             // A partial answer is worth keeping for a normal round; a
             // partial compaction summary is silent data loss, because it
             // would replace history it never covered.
-            if (decoder.received and !compacting) {
+            if (partial) |result| {
                 // A short construct may still be buffered. Flush it before
                 // the interruption notice so display order stays faithful.
                 try decoder.finishRendering();
                 try output.writeAll("\n[stream interrupted; partial response saved]\n");
                 try output.flush();
-                return decoder.finish();
+                return result;
             }
             if (attempt + 1 < 3 and retryableTransport(err)) {
                 spin.start(session.io, "retrying");
@@ -2384,7 +2399,7 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
         spin.stop();
         defer session.gpa.free(response.body);
         log.logf("agent", "event=response kind={s} turn={d} status={d} attempt={d}", .{ kind, session.turn, response.status, attempt + 1 });
-        if (response.status >= 200 and response.status < 300) return decoder.finish();
+        if (response.status >= 200 and response.status < 300) return finishRound(&decoder, .completed);
         if (response.status == 401 and !refreshed) {
             var refresh_arena: std.heap.ArenaAllocator = .init(session.gpa);
             defer refresh_arena.deinit();
@@ -2425,6 +2440,19 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
         return error.ProviderRequestFailed;
     }
     return error.ProviderRequestFailed;
+}
+
+fn finishRound(decoder: *Decoder, stop_reason: StopReason) !RoundResult {
+    return .{
+        .answer = try decoder.finish(),
+        .stop_reason = stop_reason,
+    };
+}
+
+fn interruptedRound(decoder: *Decoder, compacting: bool, transport_error: anyerror) !?RoundResult {
+    if (transport_error == error.Cancelled or transport_error == error.ProviderRequestFailed) return transport_error;
+    if (!decoder.received or compacting) return null;
+    return try finishRound(decoder, .stream_interrupted);
 }
 
 /// Extract the human-facing message from a JSON provider error body
@@ -2805,4 +2833,18 @@ test "stream decoder renders each Responses delta immediately" {
     try std.testing.expectEqualStrings("one two", writer.buffered());
     const result = try decoder.finish();
     try std.testing.expectEqualStrings("one two", result.text);
+}
+
+test "interrupted stream keeps partial decoder output and stop reason" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buffer: [128]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buffer);
+    var decoder = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), &writer, null);
+    try decoder.feed("data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}");
+
+    const result = (try interruptedRound(&decoder, false, error.TransportFailed)).?;
+
+    try std.testing.expectEqualStrings("partial", result.answer.text);
+    try std.testing.expectEqual(StopReason.stream_interrupted, result.stop_reason);
 }
