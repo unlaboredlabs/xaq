@@ -28,7 +28,8 @@ scratch=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/xaq-edge-package.XXXXXX")
 cleanup() {
     rm -rf "$scratch"
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
 
 asset="xaq-${platform}-${git_sha}"
 package_dir="$scratch/package/$asset"

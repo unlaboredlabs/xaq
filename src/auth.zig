@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
+const cancel = @import("cancel.zig");
 const input_mod = @import("input.zig");
 const spin = @import("spin.zig");
 const term = @import("term.zig");
@@ -415,6 +416,7 @@ fn authorizationState(gpa: std.mem.Allocator, value: []const u8) !?[]const u8 {
 }
 
 fn loginGrok(gpa: std.mem.Allocator, io: Io, output: *Io.Writer) !Credential {
+    try checkLoginCancellation();
     const body = try transport.formEncode(gpa, &.{
         .{ "client_id", xai_client }, .{ "scope", "openid profile email offline_access grok-cli:access api:access" }, .{ "referrer", "xaq" },
     });
@@ -437,11 +439,12 @@ fn loginGrok(gpa: std.mem.Allocator, io: Io, output: *Io.Writer) !Credential {
     spin.start(io, "waiting for approval");
     defer spin.stop();
     while (true) {
-        try io.sleep(.fromSeconds(@max(interval, 1)), .awake);
+        try waitForLoginPoll(io, interval);
         const poll_body = try transport.formEncode(gpa, &.{
             .{ "grant_type", "urn:ietf:params:oauth:grant-type:device_code" }, .{ "client_id", xai_client }, .{ "device_code", device },
         });
         defer gpa.free(poll_body);
+        try checkLoginCancellation();
         const poll = try transport.post(gpa, io, "https://auth.x.ai/oauth2/token", "application/x-www-form-urlencoded", &.{}, poll_body);
         defer gpa.free(poll.body);
         if (poll.status >= 200 and poll.status < 300) return tokenCredential(gpa, io, poll.body, null);
@@ -451,6 +454,21 @@ fn loginGrok(gpa: std.mem.Allocator, io: Io, output: *Io.Writer) !Credential {
         if (std.mem.eql(u8, kind, "authorization_pending") or std.mem.eql(u8, kind, "slow_down")) continue;
         try requireStatus(poll);
     }
+}
+
+fn checkLoginCancellation() !void {
+    if (cancel.requested()) return error.Cancelled;
+}
+
+fn waitForLoginPoll(io: Io, seconds: i64) !void {
+    var remaining_ms: i64 = @min(@max(seconds, @as(i64, 1)), @as(i64, 60)) * @as(i64, 1000);
+    while (remaining_ms > 0) {
+        try checkLoginCancellation();
+        const step = @min(remaining_ms, 100);
+        try io.sleep(.fromMilliseconds(step), .awake);
+        remaining_ms -= step;
+    }
+    try checkLoginCancellation();
 }
 
 fn refresh(gpa: std.mem.Allocator, io: Io, provider: Provider, old: Credential) !Credential {
@@ -492,6 +510,30 @@ test "provider parsing" {
     try std.testing.expectEqual(Provider.chatgpt, Provider.parse("chatgpt").?);
     try std.testing.expectEqual(@as(?Provider, null), Provider.parse("openai"));
     try std.testing.expectEqualStrings("ChatGPT", Provider.chatgpt.label());
+}
+
+test "guided login cancellation is checked before polling" {
+    cancel.reset();
+    defer cancel.reset();
+    try checkLoginCancellation();
+    cancel.processToken().request();
+    try std.testing.expectError(error.Cancelled, checkLoginCancellation());
+}
+
+test "guided login wait responds to cancellation" {
+    const Request = struct {
+        fn run(io: Io) void {
+            io.sleep(.fromMilliseconds(20), .awake) catch return;
+            cancel.processToken().request();
+        }
+    };
+    cancel.reset();
+    defer cancel.reset();
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var future = try threaded.io().concurrent(Request.run, .{threaded.io()});
+    try std.testing.expectError(error.Cancelled, waitForLoginPoll(threaded.io(), 5));
+    future.await(threaded.io());
 }
 
 test "login status reads the local store without refreshing" {

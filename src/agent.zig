@@ -254,7 +254,7 @@ const Session = struct {
     }
 
     fn rewind(self: *Session, count: usize) !void {
-        const index = rewindIndex(self.entries.items, count) orelse return error.NotEnoughTurns;
+        const index = (try rewindIndex(self.entries.items, count)) orelse return error.NotEnoughTurns;
         if (self.subagent_manager) |*manager| manager.reset();
         const previous_len = self.entries.items.len;
         self.entries.items.len = index;
@@ -935,12 +935,13 @@ fn runShellEscape(session: *Session, command: []const u8, add_to_context: bool) 
     try session.output.flush();
 }
 
-fn rewindIndex(entries: []const Entry, count: usize) ?usize {
+fn rewindIndex(entries: []const Entry, count: usize) error{CompactedHistoryBoundary}!?usize {
     if (count == 0) return null;
     var remaining = count;
     var index = entries.len;
     while (index > 0) {
         index -= 1;
+        if (isCompactionSummary(entries[index])) return error.CompactedHistoryBoundary;
         if (entries[index] == .user) {
             remaining -= 1;
             if (remaining == 0) return index;
@@ -1243,6 +1244,11 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
                     try output.flush();
                     return true;
                 },
+                error.CompactedHistoryBoundary => {
+                    try output.writeAll("cannot rewind across compacted history; start a new thread or rewind fewer turns\n");
+                    try output.flush();
+                    return true;
+                },
                 else => return err,
             };
             try replayFullscreenTranscript(session);
@@ -1318,8 +1324,12 @@ fn pickLogin(session: *Session, reader: *Io.Reader) !void {
 fn connectLogin(session: *Session, reader: *Io.Reader, provider: auth.Provider) !bool {
     var scratch: std.heap.ArenaAllocator = .init(session.gpa);
     defer scratch.deinit();
+    // Guided login shares the process cancellation token with curl. Consume
+    // its Ctrl-C before returning to the agent loop so the next prompt does
+    // not begin pre-cancelled.
+    defer consumeLoginCancellation();
     auth.login(scratch.allocator(), session.io, session.home, provider, reader, session.output) catch |err| {
-        if (err == error.EndOfStream) {
+        if (err == error.EndOfStream or err == error.Cancelled) {
             try session.output.writeAll("login cancelled\n");
         } else {
             const message: []const u8 = switch (err) {
@@ -1336,6 +1346,10 @@ fn connectLogin(session: *Session, reader: *Io.Reader, provider: auth.Provider) 
         try session.output.print("Use it with: xaq --provider {s}\n", .{@tagName(provider)});
     }
     return true;
+}
+
+fn consumeLoginCancellation() void {
+    if (cancel.requested()) cancel.reset();
 }
 
 /// Interactive model switcher: current model first, then per-provider
@@ -1891,10 +1905,22 @@ fn toolFailure(text: []const u8) ?[]const u8 {
     }
     const trimmed = std.mem.trimEnd(u8, text, " \n");
     const last_start = if (std.mem.findScalarLast(u8, trimmed, '\n')) |pos| pos + 1 else 0;
-    const last = trimmed[last_start..];
-    if (last.len >= 3 and last[0] == '[' and last[last.len - 1] == ']') {
-        const info = last[1 .. last.len - 1];
-        if (!std.mem.startsWith(u8, info, "truncated:")) return info;
+    return processFailureMarker(trimmed[last_start..]);
+}
+
+fn processFailureMarker(line: []const u8) ?[]const u8 {
+    if (line.len < 3 or line[0] != '[' or line[line.len - 1] != ']') return null;
+    const info = line[1 .. line.len - 1];
+    if (std.mem.eql(u8, info, "interrupted") or std.mem.eql(u8, info, "process terminated")) return info;
+    for ([_][]const u8{ "exit ", "signal " }) |prefix| {
+        if (!std.mem.startsWith(u8, info, prefix)) continue;
+        _ = std.fmt.parseUnsigned(u16, info[prefix.len..], 10) catch continue;
+        return info;
+    }
+    const timeout_prefix = "timeout after ";
+    if (std.mem.startsWith(u8, info, timeout_prefix) and std.mem.endsWith(u8, info, "s")) {
+        const seconds = info[timeout_prefix.len .. info.len - 1];
+        if (std.fmt.parseUnsigned(u64, seconds, 10)) |_| return info else |_| {}
     }
     return null;
 }
@@ -2072,6 +2098,11 @@ fn writePreview(output: *Io.Writer, text: []const u8) !void {
 }
 
 const compact_summary_bytes = 64 * 1024;
+const compact_summary_prefix = "Compacted earlier conversation:\n";
+
+fn isCompactionSummary(entry: Entry) bool {
+    return entry == .user and std.mem.startsWith(u8, entry.user.text, compact_summary_prefix);
+}
 
 fn compactIfNeeded(session: *Session, force: bool) !bool {
     const entry_tokens = types.approximateTokens(session.entries.items);
@@ -2102,7 +2133,7 @@ fn compactIfNeeded(session: *Session, force: bool) !bool {
     try session.trace.flush();
     var summary: Io.Writer.Allocating = .init(session.gpa);
     defer summary.deinit();
-    try summary.writer.writeAll("Compacted earlier conversation:\n");
+    try summary.writer.writeAll(compact_summary_prefix);
     const generated = compactWithModel(session, compact_model, session.entries.items[0..keep_start]) catch |err| fallback: {
         // A cancelled summary must not silently fall back and keep
         // working; the caller's loop-top check handles the message.
@@ -2113,7 +2144,7 @@ fn compactIfNeeded(session: *Session, force: bool) !bool {
     if (generated) |text| {
         if (text.len > 0) try summary.writer.writeAll(text);
     }
-    if (generated == null or summary.written().len == "Compacted earlier conversation:\n".len) {
+    if (generated == null or summary.written().len == compact_summary_prefix.len) {
         try session.trace.print("{s}[using local compaction fallback]{s}\n", .{ term.dim(), term.reset() });
         try session.trace.flush();
         for (session.entries.items[0..keep_start]) |entry| {
@@ -2615,11 +2646,28 @@ test "rewind index removes whole recent user exchanges" {
         .{ .assistant = .{ .text = "two", .calls = &.{} } },
         .{ .user = .{ .text = "third" } },
     };
-    try std.testing.expectEqual(@as(?usize, 4), rewindIndex(&entries, 1));
-    try std.testing.expectEqual(@as(?usize, 2), rewindIndex(&entries, 2));
-    try std.testing.expectEqual(@as(?usize, 0), rewindIndex(&entries, 3));
-    try std.testing.expectEqual(@as(?usize, null), rewindIndex(&entries, 4));
-    try std.testing.expectEqual(@as(?usize, null), rewindIndex(&entries, 0));
+    try std.testing.expectEqual(@as(?usize, 4), try rewindIndex(&entries, 1));
+    try std.testing.expectEqual(@as(?usize, 2), try rewindIndex(&entries, 2));
+    try std.testing.expectEqual(@as(?usize, 0), try rewindIndex(&entries, 3));
+    try std.testing.expectEqual(@as(?usize, null), try rewindIndex(&entries, 4));
+    try std.testing.expectEqual(@as(?usize, null), try rewindIndex(&entries, 0));
+}
+
+test "rewind refuses to cross compacted history" {
+    const entries = [_]Entry{
+        .{ .user = .{ .text = compact_summary_prefix ++ "Earlier decisions." } },
+        .{ .user = .{ .text = "recent" } },
+        .{ .assistant = .{ .text = "answer", .calls = &.{} } },
+    };
+    try std.testing.expectEqual(@as(?usize, 1), try rewindIndex(&entries, 1));
+    try std.testing.expectError(error.CompactedHistoryBoundary, rewindIndex(&entries, 2));
+}
+
+test "guided login cancellation is consumed before the next prompt" {
+    cancel.reset();
+    cancel.processToken().request();
+    consumeLoginCancellation();
+    try std.testing.expect(!cancel.requested());
 }
 
 test "resume replay includes every user and assistant message" {
@@ -2698,6 +2746,15 @@ test "tool completions keep failures and useful metadata visible" {
     try std.testing.expect(!try printToolCompletion(&writer, "web_search", search.value, "web_search failed: Firecrawl HTTP 429: rate limit exceeded", 2400));
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "Edited src/tui.zig · 2 edits") != null);
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "Failed to search \"Zig release\" · Firecrawl HTTP 429: rate limit exceeded · 2.4s") != null);
+}
+
+test "tool failures recognize only exact process markers" {
+    try std.testing.expectEqual(@as(?[]const u8, null), toolFailure("installed\n[dependencies]"));
+    try std.testing.expectEqual(@as(?[]const u8, null), toolFailure("all good\n[ok]"));
+    try std.testing.expectEqualStrings("exit 7", toolFailure("output\n[exit 7]").?);
+    try std.testing.expectEqualStrings("signal 15", toolFailure("output\n[signal 15]").?);
+    try std.testing.expectEqualStrings("timeout after 30s", toolFailure("output\n[timeout after 30s]").?);
+    try std.testing.expectEqualStrings("interrupted", toolFailure("output\n[interrupted]").?);
 }
 
 test "routine summaries are compact and naturally pluralized" {
