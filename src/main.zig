@@ -242,6 +242,7 @@ test {
     _ = @import("context.zig");
     _ = @import("input.zig");
     _ = @import("log.zig");
+    _ = @import("markdown.zig");
     _ = @import("models.zig");
     _ = @import("request.zig");
     _ = @import("settings.zig");
