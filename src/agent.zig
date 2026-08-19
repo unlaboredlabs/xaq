@@ -4,6 +4,7 @@ const auth = @import("auth.zig");
 const cancel = @import("cancel.zig");
 const context = @import("context.zig");
 const git = @import("git.zig");
+const image_input = @import("image.zig");
 const input_mod = @import("input.zig");
 const log = @import("log.zig");
 const markdown = @import("markdown.zig");
@@ -22,11 +23,54 @@ const types = @import("types.zig");
 
 pub const ToolCall = types.ToolCall;
 const ToolResult = types.ToolResult;
-const Usage = types.Usage;
+pub const Usage = types.Usage;
 const Assistant = types.Assistant;
 const Entry = types.Entry;
+const Image = types.Image;
 
 pub const Effort = models.Effort;
+
+pub const RunStarted = struct {
+    provider: auth.Provider,
+    model: []const u8,
+    thread_id: ?[]const u8,
+};
+
+pub const RoundStarted = struct {
+    number: usize,
+};
+
+pub const ToolFinished = struct {
+    call: ToolCall,
+    result: []const u8,
+    duration_ms: u64,
+};
+
+pub const RunCompleted = struct {
+    text: []const u8,
+    provider: auth.Provider,
+    model: []const u8,
+    thread_id: ?[]const u8,
+    usage: Usage,
+    rounds: usize,
+    tool_calls: usize,
+};
+
+/// Event payloads borrow session memory and are valid only for the callback.
+pub const Event = union(enum) {
+    run_start: RunStarted,
+    round_start: RoundStarted,
+    text_delta: []const u8,
+    tool_start: ToolCall,
+    tool_finish: ToolFinished,
+    usage: Usage,
+    completed: RunCompleted,
+};
+
+pub const EventSink = struct {
+    context: ?*anyopaque = null,
+    emit: *const fn (context: ?*anyopaque, event: Event) anyerror!void,
+};
 
 pub const Options = struct {
     home: []const u8,
@@ -36,6 +80,7 @@ pub const Options = struct {
     effort: ?Effort = null,
     fast: bool = false,
     first_prompt: ?[]const u8 = null,
+    first_images: []const Image = &.{},
     input: ?*Io.Reader = null,
     output: *Io.Writer,
     /// Destination for tool call/aftermath lines and compaction notices.
@@ -44,8 +89,12 @@ pub const Options = struct {
     tool_trace: ?*Io.Writer = null,
     /// Empty means the latest thread for cwd; non-empty is an explicit ID.
     resume_id: ?[]const u8 = null,
+    /// Interactive sessions normally persist. False keeps all thread state in
+    /// memory and makes resume and fork unavailable.
+    save_thread: bool = true,
     /// Hidden worker controls used by subagent child processes.
     subagent_control: ?[]const u8 = null,
+    events: ?EventSink = null,
 };
 
 pub fn defaultModel(provider: auth.Provider) []const u8 {
@@ -68,6 +117,7 @@ const Session = struct {
     instructions: []u8,
     settings: settings_mod.Loaded,
     thread: ?threads.Thread = null,
+    save_thread: bool = true,
     turn: u64 = 0,
     usage: Usage = .{},
     git_status: git.Status = .{},
@@ -77,12 +127,17 @@ const Session = struct {
     /// True when a prompt reader exists; failed rounds return to the
     /// prompt instead of ending the process.
     interactive: bool = false,
+    events: ?EventSink = null,
     subagent_manager: ?subagents.Manager = null,
     subagent_control: ?[]const u8 = null,
     subagent_control_seen: usize = 0,
 
     fn allocator(self: *Session) std.mem.Allocator {
         return self.arena.allocator();
+    }
+
+    fn emit(self: *Session, event: Event) !void {
+        if (self.events) |sink| try sink.emit(sink.context, event);
     }
 
     fn deinit(self: *Session) void {
@@ -127,7 +182,21 @@ const Session = struct {
     }
 
     fn appendUser(self: *Session, text: []const u8) !void {
-        try self.appendEntry(.{ .user = try self.allocator().dupe(u8, text) });
+        try self.appendUserWithImages(text, &.{});
+    }
+
+    fn appendUserWithImages(self: *Session, text: []const u8, images: []const Image) !void {
+        try image_input.validateProvider(self.provider, images);
+        const owned_images = try self.allocator().alloc(Image, images.len);
+        for (images, 0..) |image, index| owned_images[index] = .{
+            .name = try self.allocator().dupe(u8, image.name),
+            .media_type = try self.allocator().dupe(u8, image.media_type),
+            .data = try self.allocator().dupe(u8, image.data),
+        };
+        try self.appendEntry(.{ .user = .{
+            .text = try self.allocator().dupe(u8, text),
+            .images = owned_images,
+        } });
     }
 
     fn replaceArena(self: *Session) void {
@@ -146,6 +215,7 @@ const Session = struct {
     }
 
     fn startThread(self: *Session) !void {
+        if (!self.save_thread) return;
         // Null out before deinit: if create fails, teardown must not
         // deinit the poisoned old payload a second time.
         if (self.thread) |*thread| {
@@ -160,7 +230,56 @@ const Session = struct {
         self.replaceArena();
         self.turn = 0;
         self.usage = .{};
-        try self.startThread();
+        if (self.save_thread) try self.startThread();
+    }
+
+    fn recount(self: *Session) void {
+        self.turn = 0;
+        self.usage = .{};
+        for (self.entries.items) |entry| switch (entry) {
+            .assistant => |answer| {
+                self.turn += 1;
+                self.usage.input += answer.usage.input;
+                self.usage.cached += answer.usage.cached;
+                self.usage.output += answer.usage.output;
+            },
+            else => {},
+        };
+    }
+
+    fn rewind(self: *Session, count: usize) !void {
+        const index = (try rewindIndex(self.entries.items, count)) orelse return error.NotEnoughTurns;
+        if (self.subagent_manager) |*manager| manager.reset();
+        const previous_len = self.entries.items.len;
+        self.entries.items.len = index;
+        self.recount();
+        persistSnapshot(self) catch |err| {
+            self.entries.items.len = previous_len;
+            self.recount();
+            return err;
+        };
+    }
+
+    fn forkThread(self: *Session) !void {
+        if (!self.save_thread) return error.EphemeralSession;
+        if (self.subagent_manager) |*manager| manager.reset();
+        // Refresh the original before create applies the retention limit, so
+        // forking a deliberately resumed old thread cannot prune its source.
+        try persistSnapshot(self);
+        var fork = try threads.create(self.gpa, self.io, self.home, self.cwd, self.provider, self.model, if (self.effort) |value| @tagName(value) else null, self.fast);
+        var installed = false;
+        errdefer if (!installed) fork.discard();
+        try fork.rewrite(
+            self.provider,
+            self.model,
+            if (self.effort) |value| @tagName(value) else null,
+            self.fast,
+            self.cwd,
+            self.entries.items,
+        );
+        if (self.thread) |*thread| thread.deinit();
+        self.thread = fork;
+        installed = true;
     }
 
     fn resumeThread(self: *Session, requested: ?[]const u8) !void {
@@ -191,17 +310,7 @@ const Session = struct {
         if (self.effort) |effort| {
             if (!models.supportsEffort(self.provider, self.model, effort)) self.effort = null;
         }
-        self.turn = 0;
-        self.usage = .{};
-        for (self.entries.items) |entry| switch (entry) {
-            .assistant => |answer| {
-                self.turn += 1;
-                self.usage.input += answer.usage.input;
-                self.usage.cached += answer.usage.cached;
-                self.usage.output += answer.usage.output;
-            },
-            else => {},
-        };
+        self.recount();
         if (self.entries.items.len > 0) switch (self.entries.items[self.entries.items.len - 1]) {
             .assistant => |answer| if (answer.calls.len > 0) {
                 const results = try self.allocator().alloc(ToolResult, answer.calls.len);
@@ -236,6 +345,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
         .output = options.output,
         .trace = options.tool_trace orelse options.output,
         .interactive = options.input != null,
+        .events = options.events,
         .subagent_manager = if (options.subagent_control == null) try subagents.Manager.init(gpa, io, options.cwd, .{
             .enabled = user_settings.value.subagents_enabled,
             .max_concurrent = user_settings.value.subagent_max_concurrent,
@@ -245,6 +355,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
         .arena = .init(gpa),
         .instructions = try context.load(gpa, io, options.home, options.cwd),
         .settings = user_settings,
+        .save_thread = options.save_thread,
     };
     settings_owned = false;
     defer session.deinit();
@@ -259,26 +370,45 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
         }
         // Orientation matters most interactively; one-shot output stays clean.
         if (options.input != null) try printResumed(&session);
-    } else if (options.input != null) {
+    } else if (options.input != null and options.save_thread) {
         try session.startThread();
     }
+    try session.emit(.{ .run_start = .{
+        .provider = session.provider,
+        .model = session.model,
+        .thread_id = if (session.thread) |thread| thread.id else null,
+    } });
     refreshGit(&session);
     syncTui(&session);
     if (options.first_prompt) |prompt| {
-        try session.appendUser(prompt);
+        try session.appendUserWithImages(prompt, options.first_images);
     } else {
         const reader = options.input orelse return;
-        const prompt = (try readPrompt(&session, reader, null)) orelse return;
-        defer gpa.free(prompt);
-        try session.appendUser(prompt);
+        var prompt = (try readPrompt(&session, reader, null, options.first_images)) orelse return;
+        defer prompt.deinit();
+        try session.appendUserWithImages(prompt.text, prompt.images);
     }
+
+    var busy_storage: input_mod.BusyInput = undefined;
+    const busy: ?*input_mod.BusyInput = if (options.input != null and tui.active) blk: {
+        busy_storage = input_mod.BusyInput.init(gpa, io, options.input.?, options.output, &slash_suggestions, .{
+            .io = io,
+            .cwd = session.cwd,
+        });
+        break :blk &busy_storage;
+    } else null;
+    defer if (busy) |queue| queue.deinit();
+    if (busy) |queue| try queue.start();
 
     var exchange_start = Io.Clock.now(.awake, io);
     var exchange_base = session.usage;
+    var run_usage: Usage = .{};
+    var run_rounds: usize = 0;
+    var run_tool_calls: usize = 0;
     while (true) {
         if (session.subagent_manager) |*manager| {
             if (try manager.takeNotifications(session.allocator())) |notification| {
-                try session.appendEntry(.{ .user = notification });
+                try session.appendEntry(.{ .user = .{ .text = notification } });
                 refreshGit(&session);
             }
             syncTui(&session);
@@ -291,9 +421,11 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
         if (cancel.requested()) {
             cancel.reset();
             var prefill: ?[]const u8 = null;
+            var carried_images: []const Image = &.{};
             if (session.entries.items.len > 0 and session.entries.items[session.entries.items.len - 1] == .user) {
                 const popped = session.entries.pop().?;
-                prefill = popped.user;
+                prefill = popped.user.text;
+                carried_images = popped.user.images;
                 try persistSnapshot(&session);
             }
             try options.output.writeAll("\ninterrupted\n");
@@ -301,16 +433,55 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
             tui.noteState(.idle, "");
             syncTui(&session);
             const reader = options.input orelse return error.Interrupted;
-            const prompt = (try readPrompt(&session, reader, prefill)) orelse return;
-            defer gpa.free(prompt);
-            try session.appendUser(prompt);
+            if (busy) |queue| try queue.stop();
+            var prompt = (try readPrompt(&session, reader, prefill, carried_images)) orelse return;
+            defer prompt.deinit();
+            try session.appendUserWithImages(prompt.text, prompt.images);
+            if (busy) |queue| try queue.start();
             exchange_start = Io.Clock.now(.awake, io);
             exchange_base = session.usage;
             continue;
         }
         session.turn += 1;
+        run_rounds += 1;
+        try session.emit(.{ .round_start = .{ .number = run_rounds } });
         tui.noteState(.thinking, "");
         const answer = performRound(&session) catch |err| switch (err) {
+            error.NotLoggedIn => {
+                session.turn -|= 1;
+                const reader = options.input orelse return err;
+                tui.noteState(.idle, "");
+                syncTui(&session);
+                try setTitle(&session, false);
+                try options.output.print("{s} is not connected. Let's connect it now.\n", .{session.provider.label()});
+                try options.output.flush();
+                if (busy) |queue| try queue.stop();
+                if (try connectLogin(&session, reader, session.provider)) {
+                    if (busy) |queue| try queue.start();
+                    exchange_start = Io.Clock.now(.awake, io);
+                    exchange_base = session.usage;
+                    continue;
+                }
+                // Setup was cancelled or failed. Keep the unsent prompt
+                // available for editing instead of dropping it.
+                var prefill: ?[]const u8 = null;
+                var carried_images: []const Image = &.{};
+                if (session.entries.items.len > 0 and session.entries.items[session.entries.items.len - 1] == .user) {
+                    const popped = session.entries.pop().?;
+                    prefill = popped.user.text;
+                    carried_images = popped.user.images;
+                    try persistSnapshot(&session);
+                }
+                tui.noteState(.idle, "");
+                syncTui(&session);
+                var prompt = (try readPrompt(&session, reader, prefill, carried_images)) orelse return;
+                defer prompt.deinit();
+                try session.appendUserWithImages(prompt.text, prompt.images);
+                if (busy) |queue| try queue.start();
+                exchange_start = Io.Clock.now(.awake, io);
+                exchange_base = session.usage;
+                continue;
+            },
             error.ProviderRequestFailed => {
                 // The HTTP error body was already printed to the transcript.
                 // Interactively the session survives: the failed prompt is
@@ -319,16 +490,20 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
                 session.turn -|= 1;
                 const reader = options.input orelse return err;
                 var prefill: ?[]const u8 = null;
+                var carried_images: []const Image = &.{};
                 if (session.entries.items.len > 0 and session.entries.items[session.entries.items.len - 1] == .user) {
                     const popped = session.entries.pop().?;
-                    prefill = popped.user; // arena-owned; stays valid until reset
+                    prefill = popped.user.text; // arena-owned; stays valid until reset
+                    carried_images = popped.user.images;
                     try persistSnapshot(&session);
                 }
                 tui.noteState(.idle, "");
                 syncTui(&session);
-                const prompt = (try readPrompt(&session, reader, prefill)) orelse return;
-                defer gpa.free(prompt);
-                try session.appendUser(prompt);
+                if (busy) |queue| try queue.stop();
+                var prompt = (try readPrompt(&session, reader, prefill, carried_images)) orelse return;
+                defer prompt.deinit();
+                try session.appendUserWithImages(prompt.text, prompt.images);
+                if (busy) |queue| try queue.start();
                 exchange_start = Io.Clock.now(.awake, io);
                 exchange_base = session.usage;
                 continue;
@@ -337,9 +512,11 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
                 session.turn -|= 1;
                 cancel.reset();
                 var prefill: ?[]const u8 = null;
+                var carried_images: []const Image = &.{};
                 if (session.entries.items.len > 0 and session.entries.items[session.entries.items.len - 1] == .user) {
                     const popped = session.entries.pop().?;
-                    prefill = popped.user; // arena-owned; stays valid until reset
+                    prefill = popped.user.text; // arena-owned; stays valid until reset
+                    carried_images = popped.user.images;
                     try persistSnapshot(&session);
                 }
                 const interrupted_ms: u64 = @intCast(@max(0, @divTrunc(Io.Clock.now(.awake, io).nanoseconds - exchange_start.nanoseconds, std.time.ns_per_ms)));
@@ -350,9 +527,11 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
                 tui.noteState(.idle, "");
                 syncTui(&session);
                 const reader = options.input orelse return error.Interrupted;
-                const prompt = (try readPrompt(&session, reader, prefill)) orelse return;
-                defer gpa.free(prompt);
-                try session.appendUser(prompt);
+                if (busy) |queue| try queue.stop();
+                var prompt = (try readPrompt(&session, reader, prefill, carried_images)) orelse return;
+                defer prompt.deinit();
+                try session.appendUserWithImages(prompt.text, prompt.images);
+                if (busy) |queue| try queue.start();
                 exchange_start = Io.Clock.now(.awake, io);
                 exchange_base = session.usage;
                 continue;
@@ -362,13 +541,44 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
         session.usage.input += answer.usage.input;
         session.usage.cached += answer.usage.cached;
         session.usage.output += answer.usage.output;
+        run_usage.input += answer.usage.input;
+        run_usage.cached += answer.usage.cached;
+        run_usage.output += answer.usage.output;
+        try session.emit(.{ .usage = answer.usage });
         log.logf("usage", "event=tokens turn={d} input={d} cached={d} output={d} session_input={d} session_cached={d} session_output={d}", .{ session.turn, answer.usage.input, answer.usage.cached, answer.usage.output, session.usage.input, session.usage.cached, session.usage.output });
         try session.appendEntry(.{ .assistant = answer });
         syncTui(&session);
         if (answer.calls.len == 0) {
-            tui.noteState(.idle, "");
             log.flush();
             try options.output.writeByte('\n');
+            try options.output.flush();
+            if (options.input == null and try consumeSteering(&session) > 0) continue;
+            const reader = options.input orelse {
+                try session.emit(.{ .completed = .{
+                    .text = answer.text,
+                    .provider = session.provider,
+                    .model = session.model,
+                    .thread_id = if (session.thread) |thread| thread.id else null,
+                    .usage = run_usage,
+                    .rounds = run_rounds,
+                    .tool_calls = run_tool_calls,
+                } });
+                return;
+            };
+
+            if (busy) |queue| {
+                try queue.stop();
+                switch (try consumeQueuedPrompt(&session, reader, queue, .steer)) {
+                    .appended => {
+                        try queue.start();
+                        continue;
+                    },
+                    .exit => return,
+                    .none => {},
+                }
+            }
+
+            tui.noteState(.idle, "");
             if (options.input != null) {
                 const elapsed_ms: u64 = @intCast(@max(0, @divTrunc(Io.Clock.now(.awake, io).nanoseconds - exchange_start.nanoseconds, std.time.ns_per_ms)));
                 try printExchangeStats(options.output, elapsed_ms, .{
@@ -378,17 +588,31 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
                 }, contextPercent(&session));
             }
             try options.output.flush();
-            if (options.input == null and try consumeSteering(&session) > 0) continue;
-            const reader = options.input orelse return;
-            const prompt = (try readPrompt(&session, reader, null)) orelse return;
-            defer gpa.free(prompt);
-            try session.appendUser(prompt);
+
+            if (busy) |queue| switch (try consumeQueuedPrompt(&session, reader, queue, .follow_up)) {
+                .appended => {
+                    exchange_start = Io.Clock.now(.awake, io);
+                    exchange_base = session.usage;
+                    try queue.start();
+                    continue;
+                },
+                .exit => return,
+                .none => if (queue.ended()) return,
+            };
+
+            const draft = if (busy) |queue| queue.takeDraft() else null;
+            defer if (draft) |line| gpa.free(line);
+            var prompt = (try readPrompt(&session, reader, draft, &.{})) orelse return;
+            defer prompt.deinit();
+            try session.appendUserWithImages(prompt.text, prompt.images);
+            if (busy) |queue| try queue.start();
             exchange_start = Io.Clock.now(.awake, io);
             exchange_base = session.usage;
             continue;
         }
 
         const results = try session.allocator().alloc(ToolResult, answer.calls.len);
+        run_tool_calls += answer.calls.len;
         // Tool blocks are blank-line separated from streamed text: two
         // breaks close the open text line and leave a gap; pure tool
         // rounds start at column zero already. The breaks stay on the
@@ -399,21 +623,34 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
             try options.output.writeAll("\n\n");
             try options.output.flush();
         }
+        var grouped_remaining: usize = 0;
+        var grouped_broken = false;
+        var routine_counts: RoutineToolCounts = .{};
         for (answer.calls, 0..) |call, i| {
-            tui.noteState(.tooling, call.name);
+            if (grouped_remaining == 0 and !session.verbose and isRoutineTool(call.name)) {
+                const run_length = routineRunLength(answer.calls, i);
+                if (run_length >= 3) grouped_remaining = run_length;
+            }
+            const in_routine_group = grouped_remaining > 0;
+            try session.emit(.{ .tool_start = call });
             const start = Io.Clock.now(.awake, io);
             var scratch: std.heap.ArenaAllocator = .init(gpa);
             defer scratch.deinit();
             const scratch_gpa = scratch.allocator();
+            var arguments: ?std.json.Value = null;
             invoke: {
-                var parsed = std.json.parseFromSlice(std.json.Value, scratch_gpa, call.arguments, .{}) catch |err| {
-                    try printToolCall(trace, call.name, null);
+                const parsed = std.json.parseFromSliceLeaky(std.json.Value, scratch_gpa, call.arguments, .{}) catch |err| {
                     results[i] = .{ .id = call.id, .text = try std.fmt.allocPrint(session.allocator(), "invalid tool arguments: {s}", .{@errorName(err)}) };
                     break :invoke;
                 };
-                defer parsed.deinit();
-                try printToolCall(trace, call.name, parsed.value);
-                const result = tools.executeWithContext(scratch_gpa, io, call.name, parsed.value, .{
+                arguments = parsed;
+                var activity_buffer: [192]u8 = undefined;
+                var activity: Io.Writer = .fixed(&activity_buffer);
+                try writeToolDescription(&activity, call.name, parsed, .running, null);
+                tui.noteState(.tooling, activity.buffered());
+                spin.start(io, activity.buffered());
+                defer spin.stop();
+                const result = tools.executeWithContext(scratch_gpa, io, call.name, parsed, .{
                     .cwd = session.cwd,
                     .firecrawl_api_key = session.settings.value.firecrawl_api_key,
                     .write_enabled = true,
@@ -433,17 +670,33 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
                 syncTui(&session);
             }
             const elapsed_ms: i64 = @intCast(@divTrunc(Io.Clock.now(.awake, io).nanoseconds - start.nanoseconds, std.time.ns_per_ms));
-            if (elapsed_ms >= slow_tool_ms) {
-                try trace.writeAll(" \u{b7} ");
-                try writeDuration(trace, @intCast(elapsed_ms));
-            }
-            try trace.print("{s}\n", .{term.reset()});
-            try trace.flush();
+            try session.emit(.{ .tool_finish = .{
+                .call = call,
+                .result = results[i].text,
+                .duration_ms = @intCast(@max(0, elapsed_ms)),
+            } });
             log.logf("tool", "event=call turn={d} name={s} args_bytes={d} result_bytes={d} ms={d}", .{ session.turn, call.name, call.arguments.len, results[i].text.len, elapsed_ms });
-            if (isSubagentTool(call.name)) {
-                try printSubagentOutcome(trace, results[i].text);
+            const elapsed: u64 = @intCast(@max(0, elapsed_ms));
+            const succeeded = toolFailure(results[i].text) == null;
+            if (in_routine_group and !grouped_broken) {
+                if (succeeded) {
+                    routine_counts.add(call.name, elapsed);
+                } else {
+                    try printRoutineSummary(trace, routine_counts);
+                    routine_counts = .{};
+                    _ = try printToolCompletion(trace, call.name, arguments, results[i].text, elapsed);
+                    grouped_broken = true;
+                }
             } else {
-                try printToolOutcome(trace, results[i].text);
+                _ = try printToolCompletion(trace, call.name, arguments, results[i].text, elapsed);
+            }
+            if (in_routine_group) {
+                grouped_remaining -= 1;
+                if (grouped_remaining == 0) {
+                    try printRoutineSummary(trace, routine_counts);
+                    routine_counts = .{};
+                    grouped_broken = false;
+                }
             }
             if (session.verbose) try printToolVerbose(trace, results[i].text);
             // A ctrl-c during tool execution ends the whole exchange;
@@ -456,6 +709,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
                 break;
             }
         }
+        try printRoutineSummary(trace, routine_counts);
         // A gap after the block keeps the next streamed answer readable.
         try trace.writeByte('\n');
         try trace.flush();
@@ -472,13 +726,19 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
             tui.noteState(.idle, "");
             syncTui(&session);
             const reader = options.input orelse return error.Interrupted;
-            const prompt = (try readPrompt(&session, reader, null)) orelse return;
-            defer gpa.free(prompt);
-            try session.appendUser(prompt);
+            if (busy) |queue| try queue.stop();
+            var prompt = (try readPrompt(&session, reader, null, &.{})) orelse return;
+            defer prompt.deinit();
+            try session.appendUserWithImages(prompt.text, prompt.images);
+            if (busy) |queue| try queue.start();
             exchange_start = Io.Clock.now(.awake, io);
             exchange_base = session.usage;
             continue;
         }
+        if (busy) |queue| switch (try consumeQueuedPrompt(&session, options.input.?, queue, .steer)) {
+            .appended, .none => {},
+            .exit => return,
+        };
     }
 }
 
@@ -514,14 +774,73 @@ fn consumeSteering(session: *Session) !usize {
     return added;
 }
 
-/// Prompt until a non-empty, non-command line arrives. Slash commands run
-/// locally and re-prompt. Returns null on EOF or /exit. `prefill` seeds
-/// the editor once (for example with a cancelled prompt).
-fn readPrompt(session: *Session, reader: *Io.Reader, prefill: ?[]const u8) !?[]const u8 {
+const QueuedPromptResult = enum { none, appended, exit };
+
+/// Move one completed editor submission into the conversation. Steering and
+/// follow-ups share parsing, but callers choose when each queue is eligible.
+fn consumeQueuedPrompt(session: *Session, reader: *Io.Reader, queue: *input_mod.BusyInput, kind: input_mod.SubmissionKind) !QueuedPromptResult {
+    while (queue.take(kind)) |line| {
+        if (line.len == 0) {
+            session.gpa.free(line);
+            continue;
+        }
+        if (line[0] == '/') {
+            const keep_going = try runCommand(session, reader, line[1..]);
+            session.gpa.free(line);
+            if (!keep_going) return .exit;
+            syncTui(session);
+            continue;
+        }
+        if (line[0] == '!') {
+            const without_context = line.len > 1 and line[1] == '!';
+            const prefix_len: usize = if (without_context) 2 else 1;
+            const command = std.mem.trim(u8, line[prefix_len..], " \t");
+            if (command.len == 0) {
+                try session.output.writeAll("usage: !COMMAND or !!COMMAND\n");
+            } else {
+                try runShellEscape(session, command, !without_context);
+            }
+            session.gpa.free(line);
+            syncTui(session);
+            continue;
+        }
+        var prompt = image_input.fromPrompt(session.gpa, session.io, session.cwd, line, &.{}) catch |err| {
+            try session.output.print("cannot queue prompt: {s}\n", .{imageInputError(err)});
+            try session.output.flush();
+            continue;
+        };
+        defer prompt.deinit();
+        image_input.validateProvider(session.provider, prompt.images) catch |err| {
+            try session.output.print("cannot queue prompt: {s}\n", .{imageInputError(err)});
+            try session.output.flush();
+            continue;
+        };
+        try printQueuedPrompt(session.output, kind, prompt.text);
+        try session.appendUserWithImages(prompt.text, prompt.images);
+        return .appended;
+    }
+    return .none;
+}
+
+fn printQueuedPrompt(output: *Io.Writer, kind: input_mod.SubmissionKind, text: []const u8) !void {
+    const label = if (kind == .steer) "steering" else "follow-up";
+    try output.print("{s}> [{s}] ", .{ term.dim(), label });
+    var shown = @min(text.len, 512);
+    while (shown > 0 and shown < text.len and text[shown] & 0xc0 == 0x80) shown -= 1;
+    try output.writeAll(text[0..shown]);
+    if (shown < text.len) try output.writeAll("…");
+    try output.print("{s}\n\n", .{term.reset()});
+    try output.flush();
+}
+
+/// Prompt until a non-empty, non-command line arrives. Image paths prefixed
+/// with `@`, and bare paths inserted by a terminal file drop, are attached.
+/// `carried_images` preserves attachments while retrying an edited prompt.
+fn readPrompt(session: *Session, reader: *Io.Reader, prefill: ?[]const u8, carried_images: []const Image) !?image_input.Input {
     try setTitle(session, false);
     var initial = prefill;
     while (true) {
-        const line = (try input_mod.readLine(session.gpa, reader, session.output, &slash_suggestions, initial)) orelse return null;
+        const line = (try input_mod.readLine(session.gpa, reader, session.output, &slash_suggestions, .{ .io = session.io, .cwd = session.cwd }, initial)) orelse return null;
         initial = null;
         if (line.len == 0) {
             session.gpa.free(line);
@@ -534,11 +853,94 @@ fn readPrompt(session: *Session, reader: *Io.Reader, prefill: ?[]const u8) !?[]c
             syncTui(session);
             continue;
         }
-        return line;
+        if (line[0] == '!') {
+            const without_context = line.len > 1 and line[1] == '!';
+            const prefix_len: usize = if (without_context) 2 else 1;
+            const command = std.mem.trim(u8, line[prefix_len..], " \t");
+            if (command.len == 0) {
+                try session.output.writeAll("usage: !COMMAND or !!COMMAND\n");
+            } else {
+                try runShellEscape(session, command, !without_context);
+            }
+            session.gpa.free(line);
+            syncTui(session);
+            continue;
+        }
+        var prompt = image_input.fromPrompt(session.gpa, session.io, session.cwd, @constCast(line), carried_images) catch |err| {
+            try session.output.print("cannot attach image: {s}\n", .{imageInputError(err)});
+            try session.output.flush();
+            continue;
+        };
+        image_input.validateProvider(session.provider, prompt.images) catch |err| {
+            prompt.deinit();
+            try session.output.print("cannot attach image: {s}\n", .{imageInputError(err)});
+            try session.output.flush();
+            continue;
+        };
+        if (prompt.images.len > carried_images.len) {
+            const added = prompt.images.len - carried_images.len;
+            try session.output.print("{s}[attached {d} image{s}]{s}\n", .{ term.dim(), added, if (added == 1) "" else "s", term.reset() });
+            try session.output.flush();
+        }
+        return prompt;
     }
 }
 
-const Command = enum { help, model, effort, fast, verbose, firecrawl, agents, settings, status, compact, clear, new, resume_thread, exit };
+fn imageInputError(err: anyerror) []const u8 {
+    return switch (err) {
+        error.FileNotFound => "file not found",
+        error.ImageTooLarge => "each image must be 5 MiB or smaller",
+        error.EmptyImage => "file is empty",
+        error.UnsupportedImage => "supported formats are PNG, JPEG, GIF, and WebP",
+        error.UnsupportedImageForProvider => "Grok accepts PNG and JPEG images only",
+        error.TooManyImages => "at most 4 images can be attached to one prompt",
+        else => @errorName(err),
+    };
+}
+
+fn runShellEscape(session: *Session, command: []const u8, add_to_context: bool) !void {
+    tui.noteState(.tooling, "shell");
+    syncTui(session);
+    const result = tools.runShell(session.gpa, session.io, command, session.cwd) catch |err| {
+        if (cancel.requested()) cancel.reset();
+        tui.noteState(.idle, "");
+        try session.output.print("shell failed: {s}\n", .{@errorName(err)});
+        try session.output.flush();
+        return;
+    };
+    defer session.gpa.free(result);
+    if (cancel.requested()) cancel.reset();
+    tui.noteState(.idle, "");
+    if (result.len == 0) {
+        try session.output.print("{s}[no output]{s}\n", .{ term.dim(), term.reset() });
+    } else {
+        try session.output.writeAll(result);
+        if (result[result.len - 1] != '\n') try session.output.writeByte('\n');
+    }
+    if (add_to_context) {
+        const record = try std.fmt.allocPrint(session.allocator(), "Local shell command:\n{s}\n\nOutput:\n{s}", .{ command, if (result.len == 0) "[no output]" else result });
+        try session.appendEntry(.{ .user = .{ .text = record } });
+    }
+    refreshGit(session);
+    try session.output.flush();
+}
+
+fn rewindIndex(entries: []const Entry, count: usize) error{CompactedHistoryBoundary}!?usize {
+    if (count == 0) return null;
+    var remaining = count;
+    var index = entries.len;
+    while (index > 0) {
+        index -= 1;
+        if (isCompactionSummary(entries[index])) return error.CompactedHistoryBoundary;
+        if (entries[index] == .user) {
+            remaining -= 1;
+            if (remaining == 0) return index;
+        }
+    }
+    return null;
+}
+
+const Command = enum { help, login, model, effort, fast, verbose, firecrawl, agents, settings, status, compact, clear, new, resume_thread, rewind, fork_thread, exit };
 
 const CommandSpec = struct {
     command: Command,
@@ -550,6 +952,7 @@ const CommandSpec = struct {
 
 const command_specs = [_]CommandSpec{
     .{ .command = .help, .name = "help", .help = "list commands" },
+    .{ .command = .login, .name = "login", .args = " [PROVIDER]", .help = "connect a subscription" },
     .{ .command = .model, .name = "model", .args = " [ID]", .help = "pick model, effort, and speed" },
     .{ .command = .effort, .name = "effort", .args = " [LEVEL]", .help = "pick or set reasoning effort" },
     .{ .command = .fast, .name = "fast", .args = " [MODE]", .help = "toggle normal or fast mode" },
@@ -560,8 +963,10 @@ const command_specs = [_]CommandSpec{
     .{ .command = .status, .name = "status", .help = "show session and token usage" },
     .{ .command = .compact, .name = "compact", .help = "compact older context now" },
     .{ .command = .clear, .name = "clear", .help = "clear the current thread" },
-    .{ .command = .new, .name = "new", .help = "start a new saved thread" },
+    .{ .command = .new, .name = "new", .help = "start a new conversation" },
     .{ .command = .resume_thread, .name = "resume", .args = " [ID]", .help = "pick or resume a saved thread" },
+    .{ .command = .rewind, .name = "rewind", .args = " [TURNS]", .help = "remove recent conversation turns" },
+    .{ .command = .fork_thread, .name = "fork", .help = "copy this conversation to a new thread" },
     .{ .command = .exit, .name = "exit", .alias = "quit", .help = "leave xaq" },
 };
 
@@ -632,7 +1037,21 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
                 if (spec.alias) |alias| try output.print(" {s}(also /{s}){s}", .{ term.dim(), alias, term.reset() });
                 try output.writeByte('\n');
             }
+            try output.print("{s}  ! runs shell and keeps output \u{b7} !! omits it from context{s}\n", .{ term.dim(), term.reset() });
             try output.print("{s}  enter sends \u{b7} \\ continues \u{b7} \u{2191}\u{2193} history \u{b7} tab completes \u{b7} ctrl-d exits{s}\n", .{ term.dim(), term.reset() });
+        },
+        .login => if (args.len == 0) {
+            if (input_mod.interactive) {
+                try pickLogin(session, reader);
+            } else {
+                try printLogins(session);
+            }
+        } else if (std.mem.eql(u8, args, "status")) {
+            try printLogins(session);
+        } else if (auth.Provider.parse(args)) |provider| {
+            _ = try connectLogin(session, reader, provider);
+        } else {
+            try output.writeAll("usage: /login [chatgpt|claude|grok|status]\n");
         },
         .model => if (args.len == 0) {
             if (input_mod.interactive) {
@@ -773,13 +1192,24 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
         },
         .clear => {
             try session.clear();
-            try output.writeAll("thread cleared\n");
+            try replayFullscreenTranscript(session);
+            try output.writeAll(if (session.save_thread) "thread cleared\n" else "ephemeral conversation cleared\n");
         },
         .new => {
             try session.newThread();
-            try output.print("new thread {s}\n", .{session.thread.?.id});
+            try replayFullscreenTranscript(session);
+            if (session.thread) |thread| {
+                try output.print("new thread {s}\n", .{thread.id});
+            } else {
+                try output.writeAll("new ephemeral conversation\n");
+            }
         },
         .resume_thread => {
+            if (!session.save_thread) {
+                try output.writeAll("resume is unavailable in a --no-save session\n");
+                try output.flush();
+                return true;
+            }
             if (args.len == 0 and input_mod.interactive) {
                 try pickResume(session, reader);
             } else {
@@ -791,10 +1221,125 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
                 try printResumed(session);
             }
         },
+        .rewind => {
+            const count = if (args.len == 0) 1 else std.fmt.parseUnsigned(usize, args, 10) catch 0;
+            if (count == 0) {
+                try output.writeAll("usage: /rewind [positive turn count]\n");
+                try output.flush();
+                return true;
+            }
+            session.rewind(count) catch |err| switch (err) {
+                error.NotEnoughTurns => {
+                    try output.print("cannot rewind {d} turn{s}; the conversation is shorter\n", .{ count, if (count == 1) "" else "s" });
+                    try output.flush();
+                    return true;
+                },
+                error.CompactedHistoryBoundary => {
+                    try output.writeAll("cannot rewind across compacted history; start a new thread or rewind fewer turns\n");
+                    try output.flush();
+                    return true;
+                },
+                else => return err,
+            };
+            try replayFullscreenTranscript(session);
+            try output.print("rewound {d} turn{s}; file changes were kept\n", .{ count, if (count == 1) "" else "s" });
+        },
+        .fork_thread => {
+            if (args.len != 0) {
+                try output.writeAll("usage: /fork\n");
+                try output.flush();
+                return true;
+            }
+            session.forkThread() catch |err| switch (err) {
+                error.EphemeralSession => {
+                    try output.writeAll("fork is unavailable in a --no-save session\n");
+                    try output.flush();
+                    return true;
+                },
+                else => return err,
+            };
+            try output.print("forked to thread {s}\n", .{session.thread.?.id});
+        },
         .exit => return false,
     }
     try output.flush();
     return true;
+}
+
+const login_providers = [_]auth.Provider{ .chatgpt, .claude, .grok };
+
+fn printLogins(session: *Session) !void {
+    for (login_providers) |provider| {
+        const connected = try auth.isLoggedIn(session.gpa, session.io, session.home, provider);
+        try session.output.print("  {s:<8} {s}", .{ provider.label(), if (connected) "connected" else "not connected" });
+        if (provider == session.provider) try session.output.writeAll(" \u{b7} current session");
+        try session.output.writeByte('\n');
+    }
+}
+
+fn pickLogin(session: *Session, reader: *Io.Reader) !void {
+    var storage: [login_providers.len][64]u8 = undefined;
+    var labels: [login_providers.len][]const u8 = undefined;
+    var connected: [login_providers.len]bool = undefined;
+    var initial: usize = 0;
+    for (login_providers, 0..) |provider, index| {
+        connected[index] = try auth.isLoggedIn(session.gpa, session.io, session.home, provider);
+        if (provider == session.provider) initial = index;
+        labels[index] = try std.fmt.bufPrint(&storage[index], "{s:<8} {s}{s}", .{
+            provider.label(),
+            if (connected[index]) "connected" else "not connected",
+            if (provider == session.provider) " \u{b7} current session" else "",
+        });
+    }
+    try session.output.print("{s}provider login \u{b7} enter connects \u{b7} esc/q closes{s}\r\n", .{ term.dim(), term.reset() });
+    try session.output.flush();
+    const selected = (try input_mod.pick(reader, session.output, &labels, initial)) orelse {
+        try session.output.writeAll("login cancelled\n");
+        return;
+    };
+    const provider = login_providers[selected];
+    if (connected[selected]) {
+        const choices = [_][]const u8{ "keep current login", "replace login" };
+        try session.output.print("{s}{s} is already connected \u{b7} enter confirms \u{b7} esc/q cancels{s}\r\n", .{ term.dim(), provider.label(), term.reset() });
+        try session.output.flush();
+        const choice = (try input_mod.pick(reader, session.output, &choices, 0)) orelse 0;
+        if (choice == 0) {
+            try session.output.print("{s} login unchanged\n", .{provider.label()});
+            return;
+        }
+    }
+    _ = try connectLogin(session, reader, provider);
+}
+
+fn connectLogin(session: *Session, reader: *Io.Reader, provider: auth.Provider) !bool {
+    var scratch: std.heap.ArenaAllocator = .init(session.gpa);
+    defer scratch.deinit();
+    // Guided login shares the process cancellation token with curl. Consume
+    // its Ctrl-C before returning to the agent loop so the next prompt does
+    // not begin pre-cancelled.
+    defer consumeLoginCancellation();
+    auth.login(scratch.allocator(), session.io, session.home, provider, reader, session.output) catch |err| {
+        if (err == error.EndOfStream or err == error.Cancelled) {
+            try session.output.writeAll("login cancelled\n");
+        } else {
+            const message: []const u8 = switch (err) {
+                error.OAuthStateMismatch => "callback from another login attempt",
+                error.InvalidAuthorizationInput => "invalid callback URL or code",
+                error.ReadFailed, error.WriteFailed, error.TransportFailed, error.InvalidHttpResponse => "network connection failed",
+                else => @errorName(err),
+            };
+            try session.output.print("Could not connect {s}: {s}.\n", .{ provider.label(), message });
+        }
+        return false;
+    };
+    if (provider != session.provider) {
+        try session.output.print("Use it with: xaq --provider {s}\n", .{@tagName(provider)});
+    }
+    return true;
+}
+
+fn consumeLoginCancellation() void {
+    if (cancel.requested()) cancel.reset();
 }
 
 /// Interactive model switcher: current model first, then per-provider
@@ -825,7 +1370,7 @@ fn pickModel(session: *Session, reader: *Io.Reader) !void {
         }
         count += 1;
     }
-    try output.print("{s}pick a model \u{b7} enter confirms \u{b7} q cancels \u{b7} any ID via /model <id>{s}\r\n", .{ term.dim(), term.reset() });
+    try output.print("{s}pick a model \u{b7} enter confirms \u{b7} esc/q cancels \u{b7} any ID via /model <id>{s}\r\n", .{ term.dim(), term.reset() });
     try output.flush();
     if (try input_mod.pick(reader, output, labels[0..count], 0)) |index| {
         const selected_model = values[index];
@@ -875,14 +1420,14 @@ fn pickModelPreferences(session: *Session, reader: *Io.Reader, model: []const u8
         var labels: [6][]const u8 = undefined;
         labels[0] = "provider-default";
         for (available_efforts, 1..) |effort, index| labels[index] = @tagName(effort);
-        try session.output.print("{s}effort for {s} \u{b7} enter confirms \u{b7} q cancels{s}\r\n", .{ term.dim(), model, term.reset() });
+        try session.output.print("{s}effort for {s} \u{b7} enter confirms \u{b7} esc/q cancels{s}\r\n", .{ term.dim(), model, term.reset() });
         try session.output.flush();
         const index = (try input_mod.pick(reader, session.output, labels[0 .. available_efforts.len + 1], 0)) orelse return null;
         selected.effort = if (index == 0) null else available_efforts[index - 1];
     }
     if (models.supportsFast(session.provider, model)) {
         const labels = [_][]const u8{ "normal", "fast" };
-        try session.output.print("{s}speed for {s} \u{b7} fast uses more credits \u{b7} enter confirms \u{b7} q cancels{s}\r\n", .{ term.dim(), model, term.reset() });
+        try session.output.print("{s}speed for {s} \u{b7} fast uses more credits \u{b7} enter confirms \u{b7} esc/q cancels{s}\r\n", .{ term.dim(), model, term.reset() });
         try session.output.flush();
         const index = (try input_mod.pick(reader, session.output, &labels, 1)) orelse return null;
         selected.fast = index == 1;
@@ -900,7 +1445,7 @@ fn pickEffort(session: *Session, reader: *Io.Reader) !void {
         if (session.effort == effort) initial = count;
         count += 1;
     }
-    try session.output.print("{s}pick reasoning effort \u{b7} enter confirms \u{b7} q cancels{s}\r\n", .{ term.dim(), term.reset() });
+    try session.output.print("{s}pick reasoning effort \u{b7} enter confirms \u{b7} esc/q cancels{s}\r\n", .{ term.dim(), term.reset() });
     try session.output.flush();
     if (try input_mod.pick(reader, session.output, labels[0..count], initial)) |index| {
         const value: ?Effort = if (index == 0) null else models.efforts(session.provider, session.model)[index - 1];
@@ -959,7 +1504,7 @@ fn pickSettings(session: *Session, reader: *Io.Reader) !void {
             try std.fmt.bufPrint(&storage[5], "agent concurrency  {d}", .{session.settings.value.subagent_max_concurrent}),
             try std.fmt.bufPrint(&storage[6], "agent default      {s}", .{if (session.settings.value.subagent_default_background) "background" else "foreground"}),
         };
-        try session.output.print("{s}settings for {s} \u{b7} enter edits \u{b7} q closes{s}\r\n", .{ term.dim(), @tagName(session.provider), term.reset() });
+        try session.output.print("{s}settings for {s} \u{b7} enter edits \u{b7} esc/q closes{s}\r\n", .{ term.dim(), @tagName(session.provider), term.reset() });
         try session.output.flush();
         const selected = (try input_mod.pick(reader, session.output, &items, 0)) orelse return;
         switch (selected) {
@@ -1090,7 +1635,7 @@ fn pickResume(session: *Session, reader: *Io.Reader) !void {
         items[i] = try std.fmt.allocPrint(session.gpa, "{s}  {s:<7} {s}", .{ summary.id, age, summary.preview });
         built += 1;
     }
-    try session.output.print("{s}pick a thread \u{b7} newest first \u{b7} enter confirms \u{b7} q cancels{s}\r\n", .{ term.dim(), term.reset() });
+    try session.output.print("{s}pick a thread \u{b7} newest first \u{b7} enter confirms \u{b7} esc/q cancels{s}\r\n", .{ term.dim(), term.reset() });
     try session.output.flush();
     if (try input_mod.pick(reader, session.output, items, 0)) |index| {
         session.resumeThread(summaries[index].id) catch |err| {
@@ -1112,34 +1657,44 @@ pub fn fmtAge(buffer: []u8, now_seconds: i64, modified_ns: i96) []const u8 {
     return std.fmt.bufPrint(buffer, "{d}d ago", .{@divTrunc(delta, 24 * 60 * 60)}) catch "?";
 }
 
-/// Orientation after any resume: identity line plus the tail of the last
-/// exchange, so the user knows where the thread left off.
+/// Replace the fullscreen transcript and replay the visible messages from a
+/// resumed thread. Tool transport entries remain context-only.
 fn printResumed(session: *Session) !void {
     const output = session.output;
+    syncTui(session);
+    if (tui.active) tui.clearTranscript();
     try output.print("{s}resumed {s} \u{b7} {s}/{s} \u{b7} {d} entries{s}\n", .{ term.dim(), session.thread.?.id, @tagName(session.provider), session.model, session.entries.items.len, term.reset() });
-    var last_user: ?[]const u8 = null;
-    var last_assistant: ?[]const u8 = null;
-    for (session.entries.items) |entry| switch (entry) {
-        .user => |text| last_user = text,
-        .assistant => |answer| {
-            if (answer.text.len > 0) last_assistant = answer.text;
+    try replayEntries(output, session.entries.items);
+    try output.flush();
+}
+
+fn replayEntries(output: *Io.Writer, entries: []const Entry) !void {
+    for (entries) |entry| switch (entry) {
+        .user => |user| {
+            try output.print("\n{s}> ", .{term.dim()});
+            var safe: term.SafeWriter = .{ .output = output };
+            try safe.write(user.text);
+            if (user.images.len > 0) {
+                if (user.text.len > 0) try output.writeByte(' ');
+                try output.print("[{d} image attachment{s}]", .{ user.images.len, if (user.images.len == 1) "" else "s" });
+            }
+            try output.print("{s}\n\n", .{term.reset()});
+        },
+        .assistant => |answer| if (answer.text.len > 0) {
+            var rendered = markdown.Writer.init(output);
+            try rendered.write(answer.text);
+            try rendered.finish();
+            try output.writeAll("\n\n");
         },
         .results => {},
     };
-    if (last_user) |text| {
-        try output.print("{s}\u{258c}", .{term.dim()});
-        try writePreview(output, text);
-        try output.print("{s}\n", .{term.reset()});
-    }
-    if (last_assistant) |text| {
-        const replay_limit = 2048;
-        if (text.len > replay_limit) try output.print("{s}[\u{2026}]{s} ", .{ term.dim(), term.reset() });
-        var rendered = markdown.Writer.init(output);
-        try rendered.write(if (text.len > replay_limit) text[text.len - replay_limit ..] else text);
-        try rendered.finish();
-        try output.writeByte('\n');
-    }
-    try output.flush();
+}
+
+fn replayFullscreenTranscript(session: *Session) !void {
+    if (!tui.active) return;
+    syncTui(session);
+    tui.clearTranscript();
+    try replayEntries(session.output, session.entries.items);
 }
 
 const slow_tool_ms = 2000;
@@ -1186,24 +1741,250 @@ fn resumeErrorMessage(err: anyerror) []const u8 {
     };
 }
 
-/// Dim aftermath line for failed tool calls: `  ↳ exit 2`. Success stays
-/// silent (timing is appended inline on the call line); failures should not
-/// require reading the model's reaction to be noticed. Routine read
-/// truncation is model-facing pagination, not a failure, and stays silent.
-fn printToolOutcome(output: *Io.Writer, text: []const u8) !void {
-    var info: ?[]const u8 = null;
-    if (std.mem.startsWith(u8, text, "tool error:") or std.mem.startsWith(u8, text, "invalid tool arguments")) {
-        info = text[0 .. std.mem.findScalar(u8, text, '\n') orelse text.len];
-    } else {
-        const trimmed = std.mem.trimEnd(u8, text, " \n");
-        const last_start = if (std.mem.findScalarLast(u8, trimmed, '\n')) |pos| pos + 1 else 0;
-        const last = trimmed[last_start..];
-        if (last.len >= 3 and last[0] == '[' and last[last.len - 1] == ']') info = last[1 .. last.len - 1];
+/// Tool activity has two visual states: a present-tense label while it runs,
+/// then a quiet, past-tense ledger entry in the transcript.
+const ToolPhase = enum { running, completed, failed };
+
+const RoutineToolCounts = struct {
+    files: usize = 0,
+    searches: usize = 0,
+    pages: usize = 0,
+    duration_ms: u64 = 0,
+
+    fn add(self: *RoutineToolCounts, name: []const u8, elapsed_ms: u64) void {
+        if (std.mem.eql(u8, name, "read")) {
+            self.files += 1;
+        } else if (std.mem.eql(u8, name, "web_search")) {
+            self.searches += 1;
+        } else if (std.mem.eql(u8, name, "web_fetch")) {
+            self.pages += 1;
+        }
+        self.duration_ms += elapsed_ms;
     }
-    if (info == null) return;
-    if (std.mem.startsWith(u8, info.?, "truncated:")) return;
-    try output.print("{s}  \u{21b3} ", .{term.dim()});
-    try writePreview(output, info.?);
+
+    fn total(self: RoutineToolCounts) usize {
+        return self.files + self.searches + self.pages;
+    }
+};
+
+fn isKnownTool(name: []const u8) bool {
+    return std.mem.eql(u8, name, "read") or
+        std.mem.eql(u8, name, "bash") or
+        std.mem.eql(u8, name, "edit") or
+        std.mem.eql(u8, name, "write") or
+        std.mem.eql(u8, name, "web_search") or
+        std.mem.eql(u8, name, "web_fetch") or
+        isSubagentTool(name);
+}
+
+fn isRoutineTool(name: []const u8) bool {
+    return std.mem.eql(u8, name, "read") or std.mem.eql(u8, name, "web_search") or std.mem.eql(u8, name, "web_fetch");
+}
+
+fn routineRunLength(calls: []const ToolCall, start: usize) usize {
+    var end = start;
+    while (end < calls.len and isRoutineTool(calls[end].name)) : (end += 1) {}
+    return end - start;
+}
+
+fn subagentStatus(text: []const u8) ?[]const u8 {
+    const marker = "Status: ";
+    const start = (std.mem.indexOf(u8, text, marker) orelse return null) + marker.len;
+    const tail = text[start..];
+    const pipe = std.mem.findScalar(u8, tail, '|') orelse tail.len;
+    const newline = std.mem.findScalar(u8, tail, '\n') orelse tail.len;
+    return std.mem.trim(u8, tail[0..@min(pipe, newline)], " ");
+}
+
+fn toolAction(name: []const u8, phase: ToolPhase, result: ?[]const u8) []const u8 {
+    if (std.mem.eql(u8, name, "read")) return switch (phase) {
+        .running => "Reading",
+        .completed => "Read",
+        .failed => "Failed to read",
+    };
+    if (std.mem.eql(u8, name, "bash")) return switch (phase) {
+        .running => "Running",
+        .completed => "Ran",
+        .failed => "Failed to run",
+    };
+    if (std.mem.eql(u8, name, "edit")) return switch (phase) {
+        .running => "Editing",
+        .completed => "Edited",
+        .failed => "Failed to edit",
+    };
+    if (std.mem.eql(u8, name, "write")) return switch (phase) {
+        .running => "Writing",
+        .completed => "Wrote",
+        .failed => "Failed to write",
+    };
+    if (std.mem.eql(u8, name, "web_search")) return switch (phase) {
+        .running => "Searching",
+        .completed => "Searched",
+        .failed => "Failed to search",
+    };
+    if (std.mem.eql(u8, name, "web_fetch")) return switch (phase) {
+        .running => "Fetching",
+        .completed => "Fetched",
+        .failed => "Failed to fetch",
+    };
+    if (std.mem.eql(u8, name, "Agent")) return switch (phase) {
+        .running => "Starting agent",
+        .failed => "Failed to start agent",
+        .completed => if (result) |text|
+            if (std.mem.indexOf(u8, text, " queued in background") != null)
+                "Queued agent"
+            else if (std.mem.eql(u8, subagentStatus(text) orelse "", "completed"))
+                "Finished agent"
+            else if (std.mem.eql(u8, subagentStatus(text) orelse "", "failed"))
+                "Agent failed"
+            else if (std.mem.eql(u8, subagentStatus(text) orelse "", "stopped"))
+                "Stopped agent"
+            else
+                "Started agent"
+        else
+            "Started agent",
+    };
+    if (std.mem.eql(u8, name, "get_subagent_result")) return switch (phase) {
+        .running => "Checking agent",
+        .completed => "Checked agent",
+        .failed => "Failed to check agent",
+    };
+    if (std.mem.eql(u8, name, "steer_subagent")) return switch (phase) {
+        .running => "Steering agent",
+        .completed => "Steered agent",
+        .failed => "Failed to steer agent",
+    };
+    return switch (phase) {
+        .running => "Calling",
+        .completed => "Called",
+        .failed => "Failed to call",
+    };
+}
+
+fn writeToolDescription(output: *Io.Writer, name: []const u8, arguments: ?std.json.Value, phase: ToolPhase, result: ?[]const u8) !void {
+    try output.writeAll(toolAction(name, phase, result));
+    if (!isKnownTool(name)) try output.print(" {s}", .{name});
+    if (toolArgument(name, arguments)) |preview| {
+        try output.writeByte(' ');
+        if (std.mem.eql(u8, name, "web_search")) try output.writeByte('"');
+        try writePreview(output, preview);
+        if (std.mem.eql(u8, name, "web_search")) try output.writeByte('"');
+        if (std.mem.eql(u8, name, "read")) {
+            if (arguments) |value| if (eventInteger(value, "offset")) |offset| {
+                if (offset > 1) try output.print(":{d}", .{offset});
+            };
+        }
+    }
+}
+
+/// Return a compact model-independent failure reason. Read pagination uses
+/// the same bracket form as process failures but is not an error.
+fn toolFailure(text: []const u8) ?[]const u8 {
+    const prefixes = [_][]const u8{
+        "tool error:",
+        "invalid tool arguments:",
+        "web_fetch failed:",
+        "web_search failed:",
+        "unknown tool:",
+    };
+    inline for (prefixes) |prefix| {
+        if (std.mem.startsWith(u8, text, prefix)) {
+            const line = text[0 .. std.mem.findScalar(u8, text, '\n') orelse text.len];
+            return std.mem.trim(u8, line[prefix.len..], " ");
+        }
+    }
+    const trimmed = std.mem.trimEnd(u8, text, " \n");
+    const last_start = if (std.mem.findScalarLast(u8, trimmed, '\n')) |pos| pos + 1 else 0;
+    return processFailureMarker(trimmed[last_start..]);
+}
+
+fn processFailureMarker(line: []const u8) ?[]const u8 {
+    if (line.len < 3 or line[0] != '[' or line[line.len - 1] != ']') return null;
+    const info = line[1 .. line.len - 1];
+    if (std.mem.eql(u8, info, "interrupted") or std.mem.eql(u8, info, "process terminated")) return info;
+    for ([_][]const u8{ "exit ", "signal " }) |prefix| {
+        if (!std.mem.startsWith(u8, info, prefix)) continue;
+        _ = std.fmt.parseUnsigned(u16, info[prefix.len..], 10) catch continue;
+        return info;
+    }
+    const timeout_prefix = "timeout after ";
+    if (std.mem.startsWith(u8, info, timeout_prefix) and std.mem.endsWith(u8, info, "s")) {
+        const seconds = info[timeout_prefix.len .. info.len - 1];
+        if (std.fmt.parseUnsigned(u64, seconds, 10)) |_| return info else |_| {}
+    }
+    return null;
+}
+
+fn writeByteSize(output: *Io.Writer, count: usize) !void {
+    if (count < 1024) {
+        try output.print("{d} B", .{count});
+    } else if (count < 1024 * 1024) {
+        const tenths = (count * 10 + 512) / 1024;
+        try output.print("{d}.{d} KiB", .{ tenths / 10, tenths % 10 });
+    } else {
+        const tenths = (count * 10 + 512 * 1024) / (1024 * 1024);
+        try output.print("{d}.{d} MiB", .{ tenths / 10, tenths % 10 });
+    }
+}
+
+fn writeToolMetadata(output: *Io.Writer, name: []const u8, arguments: ?std.json.Value, result: []const u8) !void {
+    if (arguments) |value| {
+        if (std.mem.eql(u8, name, "edit")) {
+            if (eventObject(value, "edits")) |edits| switch (edits) {
+                .array => |items| try output.print(" · {d} edit{s}", .{ items.items.len, if (items.items.len == 1) "" else "s" }),
+                else => {},
+            };
+        } else if (std.mem.eql(u8, name, "write")) {
+            if (eventString(value, "content")) |content| {
+                try output.writeAll(" · ");
+                try writeByteSize(output, content.len);
+            }
+        }
+    }
+    if (isSubagentTool(name)) {
+        if (subagentStatus(result)) |status| try output.print(" · {s}", .{status});
+    }
+}
+
+/// Completed calls are a one-line semantic ledger. Success is intentionally
+/// quiet; failures carry their reason on the same line.
+fn printToolCompletion(output: *Io.Writer, name: []const u8, arguments: ?std.json.Value, result: []const u8, elapsed_ms: u64) !bool {
+    const failure = toolFailure(result);
+    try output.print("{s}", .{term.dim()});
+    try writeToolDescription(output, name, arguments, if (failure == null) .completed else .failed, result);
+    if (failure) |reason| {
+        try output.writeAll(" · ");
+        try writePreview(output, reason);
+    } else {
+        try writeToolMetadata(output, name, arguments, result);
+    }
+    if (elapsed_ms >= slow_tool_ms) {
+        try output.writeAll(" · ");
+        try writeDuration(output, elapsed_ms);
+    }
+    try output.print("{s}\n", .{term.reset()});
+    try output.flush();
+    return failure == null;
+}
+
+fn writeRoutinePart(output: *Io.Writer, count: usize, singular: []const u8, plural: []const u8, wrote: *bool) !void {
+    if (count == 0) return;
+    if (wrote.*) try output.writeAll(" · ");
+    try output.print("{d} {s}", .{ count, if (count == 1) singular else plural });
+    wrote.* = true;
+}
+
+fn printRoutineSummary(output: *Io.Writer, counts: RoutineToolCounts) !void {
+    if (counts.total() == 0) return;
+    try output.print("{s}Explored ", .{term.dim()});
+    var wrote = false;
+    try writeRoutinePart(output, counts.files, "file", "files", &wrote);
+    try writeRoutinePart(output, counts.searches, "search", "searches", &wrote);
+    try writeRoutinePart(output, counts.pages, "page", "pages", &wrote);
+    if (counts.duration_ms >= slow_tool_ms) {
+        try output.writeAll(" · ");
+        try writeDuration(output, counts.duration_ms);
+    }
     try output.print("{s}\n", .{term.reset()});
     try output.flush();
 }
@@ -1230,40 +2011,25 @@ fn printToolVerbose(output: *Io.Writer, text: []const u8) !void {
     try output.flush();
 }
 
-/// One dim line per call: `[bash] zig build test · 4.2s`. Previews show the
-/// first line of the main argument, sanitized and clamped, never full
-/// contents. The line stays open (dim, no newline) so the caller can append
-/// the elapsed time once the tool returns.
-fn printToolCall(output: *Io.Writer, name: []const u8, arguments: ?std.json.Value) !void {
-    try output.print("{s}[{s}]", .{ term.dim(), name });
-    if (arguments) |value| {
-        const key = if (std.mem.eql(u8, name, "bash"))
-            "command"
-        else if (std.mem.eql(u8, name, "Agent"))
-            "description"
-        else if (std.mem.eql(u8, name, "get_subagent_result") or std.mem.eql(u8, name, "steer_subagent"))
-            "agent_id"
-        else
-            "path";
-        if (eventString(value, key)) |preview| {
-            try output.writeByte(' ');
-            try writePreview(output, preview);
-        }
-    }
-    try output.flush();
+fn toolArgument(name: []const u8, arguments: ?std.json.Value) ?[]const u8 {
+    const value = arguments orelse return null;
+    const key = if (std.mem.eql(u8, name, "bash"))
+        "command"
+    else if (std.mem.eql(u8, name, "web_search"))
+        "query"
+    else if (std.mem.eql(u8, name, "web_fetch"))
+        "url"
+    else if (std.mem.eql(u8, name, "Agent"))
+        "description"
+    else if (std.mem.eql(u8, name, "get_subagent_result") or std.mem.eql(u8, name, "steer_subagent"))
+        "agent_id"
+    else
+        "path";
+    return eventString(value, key);
 }
 
 fn isSubagentTool(name: []const u8) bool {
     return std.mem.eql(u8, name, "Agent") or std.mem.eql(u8, name, "get_subagent_result") or std.mem.eql(u8, name, "steer_subagent");
-}
-
-fn printSubagentOutcome(output: *Io.Writer, text: []const u8) !void {
-    const first_end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
-    if (first_end == 0) return;
-    try output.print("{s}  \u{21b3} ", .{term.dim()});
-    try writePreview(output, text[0..first_end]);
-    try output.print("{s}\n", .{term.reset()});
-    try output.flush();
 }
 
 /// One dim trailer per exchange: `2.4s (↑1 ↓104) · 34%`. Time spans the
@@ -1315,12 +2081,18 @@ const preview_max_bytes = 80;
 
 fn writePreview(output: *Io.Writer, text: []const u8) !void {
     const line_end = std.mem.findScalar(u8, text, '\n') orelse text.len;
-    const clamped = @min(line_end, preview_max_bytes);
+    var clamped = @min(line_end, preview_max_bytes);
+    while (clamped > 0 and !std.unicode.utf8ValidateSlice(text[0..clamped])) clamped -= 1;
     for (text[0..clamped]) |byte| try output.writeByte(if (byte < 0x20 or byte == 0x7f) ' ' else byte);
     if (clamped < text.len) try output.writeAll("...");
 }
 
 const compact_summary_bytes = 64 * 1024;
+const compact_summary_prefix = "Compacted earlier conversation:\n";
+
+fn isCompactionSummary(entry: Entry) bool {
+    return entry == .user and std.mem.startsWith(u8, entry.user.text, compact_summary_prefix);
+}
 
 fn compactIfNeeded(session: *Session, force: bool) !bool {
     const entry_tokens = types.approximateTokens(session.entries.items);
@@ -1351,7 +2123,7 @@ fn compactIfNeeded(session: *Session, force: bool) !bool {
     try session.trace.flush();
     var summary: Io.Writer.Allocating = .init(session.gpa);
     defer summary.deinit();
-    try summary.writer.writeAll("Compacted earlier conversation:\n");
+    try summary.writer.writeAll(compact_summary_prefix);
     const generated = compactWithModel(session, compact_model, session.entries.items[0..keep_start]) catch |err| fallback: {
         // A cancelled summary must not silently fall back and keep
         // working; the caller's loop-top check handles the message.
@@ -1362,13 +2134,16 @@ fn compactIfNeeded(session: *Session, force: bool) !bool {
     if (generated) |text| {
         if (text.len > 0) try summary.writer.writeAll(text);
     }
-    if (generated == null or summary.written().len == "Compacted earlier conversation:\n".len) {
+    if (generated == null or summary.written().len == compact_summary_prefix.len) {
         try session.trace.print("{s}[using local compaction fallback]{s}\n", .{ term.dim(), term.reset() });
         try session.trace.flush();
         for (session.entries.items[0..keep_start]) |entry| {
             if (summary.written().len >= compact_summary_bytes) break;
             switch (entry) {
-                .user => |text| try summarySnippet(&summary.writer, "\nUser: ", text),
+                .user => |user| {
+                    try summarySnippet(&summary.writer, "\nUser: ", user.text);
+                    if (user.images.len > 0) try summary.writer.print(" [{d} image attachment{s}]", .{ user.images.len, if (user.images.len == 1) "" else "s" });
+                },
                 .assistant => |answer| {
                     try summarySnippet(&summary.writer, "\nAssistant: ", answer.text);
                     for (answer.calls) |call| {
@@ -1388,7 +2163,7 @@ fn compactIfNeeded(session: *Session, force: bool) !bool {
     errdefer if (!installed) next_arena.deinit();
     const next_gpa = next_arena.allocator();
     var next_entries: std.ArrayList(Entry) = .empty;
-    try next_entries.append(next_gpa, .{ .user = try next_gpa.dupe(u8, summary.written()) });
+    try next_entries.append(next_gpa, .{ .user = .{ .text = try next_gpa.dupe(u8, summary.written()) } });
     for (session.entries.items[keep_start..]) |entry| try next_entries.append(next_gpa, try cloneEntry(next_gpa, entry));
     session.arena.deinit();
     session.arena = next_arena;
@@ -1484,7 +2259,15 @@ fn summarySnippet(writer: *Io.Writer, prefix: []const u8, value: []const u8) !vo
 
 fn cloneEntry(gpa: std.mem.Allocator, entry: Entry) !Entry {
     return switch (entry) {
-        .user => |text| .{ .user = try gpa.dupe(u8, text) },
+        .user => |user| blk: {
+            const images = try gpa.alloc(Image, user.images.len);
+            for (user.images, 0..) |image, index| images[index] = .{
+                .name = try gpa.dupe(u8, image.name),
+                .media_type = try gpa.dupe(u8, image.media_type),
+                .data = try gpa.dupe(u8, image.data),
+            };
+            break :blk .{ .user = .{ .text = try gpa.dupe(u8, user.text), .images = images } };
+        },
         .assistant => |answer| blk: {
             const calls = try gpa.alloc(ToolCall, answer.calls.len);
             for (answer.calls, 0..) |call, i| calls[i] = .{
@@ -1593,18 +2376,22 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
         var credential_arena: std.heap.ArenaAllocator = .init(session.gpa);
         defer credential_arena.deinit();
         const credential = try auth.credential(credential_arena.allocator(), session.io, session.home, session.provider);
-        var decoder = Decoder.init(session.provider, session.gpa, session.allocator(), output);
+        const compacting = std.mem.eql(u8, kind, "compact");
+        var decoder = Decoder.init(session.provider, session.gpa, session.allocator(), output, if (compacting) null else session.events);
         // A continuously animated placeholder covers the wait; it runs on
         // its own Io task, so it keeps moving even while the provider is
         // silent. Main rounds stop it just before the first visible
         // output; compact rounds stream into a sink, so theirs spins
         // until the round finishes.
-        const compacting = std.mem.eql(u8, kind, "compact");
         decoder.stop_spinner = !compacting;
         try output.flush();
         spin.start(session.io, if (compacting) "compacting" else "thinking");
         const response = requestStream(session.gpa, session.io, session.provider, credential, body, &decoder, fast) catch |err| {
             spin.stop();
+            // Decoder hooks share the transport callback's error channel.
+            // Do not reinterpret a local event/output failure as a retryable
+            // network interruption or a successfully saved partial answer.
+            if (decoder.local_failure) return err;
             if (err == error.Cancelled or err == error.ProviderRequestFailed) {
                 // Close any active markdown style before control returns to
                 // the prompt or an error line is printed.
@@ -1744,13 +2531,16 @@ fn decodeLine(context_ptr: ?*anyopaque, line: []const u8) !void {
 const Decoder = struct {
     core: stream_decoder.Decoder,
     rendered: markdown.Writer,
+    events: ?EventSink,
     stop_spinner: bool = true,
     received: bool = false,
+    local_failure: bool = false,
 
-    fn init(provider: auth.Provider, parse_gpa: std.mem.Allocator, persist: std.mem.Allocator, output: *Io.Writer) Decoder {
+    fn init(provider: auth.Provider, parse_gpa: std.mem.Allocator, persist: std.mem.Allocator, output: *Io.Writer, events: ?EventSink) Decoder {
         return .{
             .core = stream_decoder.Decoder.init(provider, parse_gpa, persist, .{}),
             .rendered = markdown.Writer.init(output),
+            .events = events,
         };
     }
 
@@ -1770,8 +2560,18 @@ const Decoder = struct {
 
     fn onDelta(raw: ?*anyopaque, delta: []const u8) !void {
         const self: *Decoder = @ptrCast(@alignCast(raw.?));
-        try self.rendered.write(delta);
-        try self.rendered.output.flush();
+        if (self.events) |sink| sink.emit(sink.context, .{ .text_delta = delta }) catch |err| {
+            self.local_failure = true;
+            return err;
+        };
+        self.rendered.write(delta) catch |err| {
+            self.local_failure = true;
+            return err;
+        };
+        self.rendered.output.flush() catch |err| {
+            self.local_failure = true;
+            return err;
+        };
     }
 
     fn feed(self: *Decoder, line: []const u8) !void {
@@ -1792,6 +2592,7 @@ const Decoder = struct {
 };
 test "slash command lookup matches names, aliases, and unique prefixes" {
     try std.testing.expectEqual(Command.help, (try findCommand("help")).?);
+    try std.testing.expectEqual(Command.login, (try findCommand("login")).?);
     try std.testing.expectEqual(Command.model, (try findCommand("mod")).?);
     try std.testing.expectEqual(Command.fast, (try findCommand("fast")).?);
     try std.testing.expectEqual(Command.firecrawl, (try findCommand("fire")).?);
@@ -1801,10 +2602,68 @@ test "slash command lookup matches names, aliases, and unique prefixes" {
     try std.testing.expectEqual(Command.settings, (try findCommand("config")).?);
     try std.testing.expectEqual(Command.new, (try findCommand("new")).?);
     try std.testing.expectEqual(Command.resume_thread, (try findCommand("res")).?);
+    try std.testing.expectEqual(Command.rewind, (try findCommand("rew")).?);
+    try std.testing.expectEqual(Command.fork_thread, (try findCommand("fork")).?);
     try std.testing.expectEqual(Command.exit, (try findCommand("quit")).?);
     try std.testing.expectEqual(Command.exit, (try findCommand("q")).?);
     try std.testing.expectEqual(null, try findCommand("bogus"));
     try std.testing.expectEqual(null, try findCommand(""));
+}
+
+test "rewind index removes whole recent user exchanges" {
+    const entries = [_]Entry{
+        .{ .user = .{ .text = "first" } },
+        .{ .assistant = .{ .text = "one", .calls = &.{} } },
+        .{ .user = .{ .text = "second" } },
+        .{ .assistant = .{ .text = "two", .calls = &.{} } },
+        .{ .user = .{ .text = "third" } },
+    };
+    try std.testing.expectEqual(@as(?usize, 4), try rewindIndex(&entries, 1));
+    try std.testing.expectEqual(@as(?usize, 2), try rewindIndex(&entries, 2));
+    try std.testing.expectEqual(@as(?usize, 0), try rewindIndex(&entries, 3));
+    try std.testing.expectEqual(@as(?usize, null), try rewindIndex(&entries, 4));
+    try std.testing.expectEqual(@as(?usize, null), try rewindIndex(&entries, 0));
+}
+
+test "rewind refuses to cross compacted history" {
+    const entries = [_]Entry{
+        .{ .user = .{ .text = compact_summary_prefix ++ "Earlier decisions." } },
+        .{ .user = .{ .text = "recent" } },
+        .{ .assistant = .{ .text = "answer", .calls = &.{} } },
+    };
+    try std.testing.expectEqual(@as(?usize, 1), try rewindIndex(&entries, 1));
+    try std.testing.expectError(error.CompactedHistoryBoundary, rewindIndex(&entries, 2));
+}
+
+test "guided login cancellation is consumed before the next prompt" {
+    cancel.reset();
+    cancel.processToken().request();
+    consumeLoginCancellation();
+    try std.testing.expect(!cancel.requested());
+}
+
+test "resume replay includes every user and assistant message" {
+    term.detect(false, null, null);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    const entries = [_]Entry{
+        .{ .user = .{ .text = "first\x1b[31m" } },
+        .{ .assistant = .{ .text = "answer one", .calls = &.{} } },
+        .{ .results = &.{.{ .id = "call", .text = "internal tool result" }} },
+        .{ .user = .{ .text = "second" } },
+        .{ .assistant = .{ .text = "answer two", .calls = &.{} } },
+    };
+
+    try replayEntries(&output.writer, &entries);
+
+    const replay = output.written();
+    const first = std.mem.indexOf(u8, replay, "first").?;
+    const answer_one = std.mem.indexOf(u8, replay, "answer one").?;
+    const second = std.mem.indexOf(u8, replay, "second").?;
+    const answer_two = std.mem.indexOf(u8, replay, "answer two").?;
+    try std.testing.expect(first < answer_one and answer_one < second and second < answer_two);
+    try std.testing.expect(std.mem.indexOf(u8, replay, "internal tool result") == null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, replay, 0x1b) == null);
 }
 
 test "duration formatting" {
@@ -1820,6 +2679,87 @@ test "duration formatting" {
         try writeDuration(&writer, case[0]);
         try std.testing.expectEqualStrings(case[1], writer.buffered());
     }
+}
+
+test "tool descriptions use semantic verbs and useful arguments" {
+    var search = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"query":"latest Zig release"}
+    , .{});
+    defer search.deinit();
+    var fetch = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"url":"https://ziglang.org/download/"}
+    , .{});
+    defer fetch.deinit();
+
+    var buffer: [256]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buffer);
+    try writeToolDescription(&writer, "web_search", search.value, .running, null);
+    try writer.writeByte('\n');
+    try writeToolDescription(&writer, "web_fetch", fetch.value, .completed, null);
+    try std.testing.expectEqualStrings(
+        "Searching \"latest Zig release\"\nFetched https://ziglang.org/download/",
+        writer.buffered(),
+    );
+}
+
+test "tool completions keep failures and useful metadata visible" {
+    var edit = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"path":"src/tui.zig","edits":[{},{}]}
+    , .{});
+    defer edit.deinit();
+    var search = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"query":"Zig release"}
+    , .{});
+    defer search.deinit();
+
+    var buffer: [512]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buffer);
+    try std.testing.expect(try printToolCompletion(&writer, "edit", edit.value, "applied 2 edit(s)", 400));
+    try std.testing.expect(!try printToolCompletion(&writer, "web_search", search.value, "web_search failed: Firecrawl HTTP 429: rate limit exceeded", 2400));
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "Edited src/tui.zig · 2 edits") != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "Failed to search \"Zig release\" · Firecrawl HTTP 429: rate limit exceeded · 2.4s") != null);
+}
+
+test "tool failures recognize only exact process markers" {
+    try std.testing.expectEqual(@as(?[]const u8, null), toolFailure("installed\n[dependencies]"));
+    try std.testing.expectEqual(@as(?[]const u8, null), toolFailure("all good\n[ok]"));
+    try std.testing.expectEqualStrings("exit 7", toolFailure("output\n[exit 7]").?);
+    try std.testing.expectEqualStrings("signal 15", toolFailure("output\n[signal 15]").?);
+    try std.testing.expectEqualStrings("timeout after 30s", toolFailure("output\n[timeout after 30s]").?);
+    try std.testing.expectEqualStrings("interrupted", toolFailure("output\n[interrupted]").?);
+}
+
+test "routine summaries are compact and naturally pluralized" {
+    var buffer: [256]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buffer);
+    try printRoutineSummary(&writer, .{ .files = 4, .searches = 2, .pages = 1, .duration_ms = 3400 });
+    try std.testing.expectEqualStrings("Explored 4 files · 2 searches · 1 page · 3.4s\n", writer.buffered());
+}
+
+test "only consecutive routine calls are eligible for grouping" {
+    const calls = [_]ToolCall{
+        .{ .id = "1", .name = "read", .arguments = "{}" },
+        .{ .id = "2", .name = "web_search", .arguments = "{}" },
+        .{ .id = "3", .name = "web_fetch", .arguments = "{}" },
+        .{ .id = "4", .name = "bash", .arguments = "{}" },
+        .{ .id = "5", .name = "read", .arguments = "{}" },
+    };
+    try std.testing.expectEqual(@as(usize, 3), routineRunLength(&calls, 0));
+    try std.testing.expectEqual(@as(usize, 0), routineRunLength(&calls, 3));
+    try std.testing.expectEqual(@as(usize, 1), routineRunLength(&calls, 4));
+}
+
+test "tool previews do not split UTF-8" {
+    var buffer: [128]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buffer);
+    var source: [preview_max_bytes + 4]u8 = undefined;
+    @memset(source[0 .. preview_max_bytes - 1], 'a');
+    @memcpy(source[preview_max_bytes - 1 .. preview_max_bytes + 2], "€");
+    source[preview_max_bytes + 2] = 'z';
+    source[preview_max_bytes + 3] = 'z';
+    try writePreview(&writer, &source);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(writer.buffered()));
+    try std.testing.expect(std.mem.endsWith(u8, writer.buffered(), "..."));
 }
 
 test "token count formatting" {
@@ -1846,14 +2786,14 @@ test "provider defaults" {
 }
 
 test "compact requests omit coding tools and use the selected model" {
-    const body = try buildCompactRequest(std.testing.allocator, .claude, "claude-opus-5", .low, false, &.{.{ .user = "keep this decision" }});
+    const body = try buildCompactRequest(std.testing.allocator, .claude, "claude-opus-5", .low, false, &.{.{ .user = .{ .text = "keep this decision" } }});
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "claude-opus-5") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, compact_prompt) != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"effort\":\"low\"") != null);
 
-    const chatgpt = try buildCompactRequest(std.testing.allocator, .chatgpt, "gpt-5.6-sol", .low, false, &.{.{ .user = "keep this decision" }});
+    const chatgpt = try buildCompactRequest(std.testing.allocator, .chatgpt, "gpt-5.6-sol", .low, false, &.{.{ .user = .{ .text = "keep this decision" } }});
     defer std.testing.allocator.free(chatgpt);
     try std.testing.expect(std.mem.indexOf(u8, chatgpt, "max_output_tokens") == null);
 }
@@ -1893,7 +2833,7 @@ test "decode Responses SSE" {
     defer arena.deinit();
     var buffer: [128]u8 = undefined;
     var writer: Io.Writer = .fixed(&buffer);
-    var decoder = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), &writer);
+    var decoder = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), &writer, null);
     try decoder.feed("data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}");
     try decoder.feed("data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}");
     try decoder.feed("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":3},\"output_tokens\":5}}}");
@@ -1911,7 +2851,7 @@ test "decode Anthropic SSE" {
     defer arena.deinit();
     var buffer: [128]u8 = undefined;
     var writer: Io.Writer = .fixed(&buffer);
-    var decoder = Decoder.init(.claude, std.testing.allocator, arena.allocator(), &writer);
+    var decoder = Decoder.init(.claude, std.testing.allocator, arena.allocator(), &writer, null);
     try decoder.feed("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}");
     try decoder.feed("data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"bash\",\"input\":{}}}");
     try decoder.feed("data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"pwd\\\"}\"}}");
@@ -1931,11 +2871,30 @@ test "stream decoder renders each Responses delta immediately" {
     defer arena.deinit();
     var buffer: [128]u8 = undefined;
     var writer: Io.Writer = .fixed(&buffer);
-    var decoder = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), &writer);
+    var decoder = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), &writer, null);
     try decoder.feed("data: {\"type\":\"response.output_text.delta\",\"delta\":\"one\"}");
     try std.testing.expectEqualStrings("one", writer.buffered());
     try decoder.feed("data: {\"type\":\"response.output_text.delta\",\"delta\":\" two\"}");
     try std.testing.expectEqualStrings("one two", writer.buffered());
     const result = try decoder.finish();
     try std.testing.expectEqualStrings("one two", result.text);
+}
+
+fn rejectTextDelta(_: ?*anyopaque, event: Event) !void {
+    if (event == .text_delta) return error.EventRejected;
+}
+
+test "stream decoder identifies event sink failures as local" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buffer: [128]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buffer);
+    var decoder = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), &writer, .{ .emit = rejectTextDelta });
+
+    try std.testing.expectError(
+        error.EventRejected,
+        decoder.feed("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hidden\"}"),
+    );
+    try std.testing.expect(decoder.local_failure);
+    try std.testing.expectEqualStrings("", writer.buffered());
 }

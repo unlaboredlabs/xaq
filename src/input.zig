@@ -1,15 +1,16 @@
-//! Interactive terminal input: a raw-mode line editor with a live
-//! slash-command popup, and a small list picker for choices such as the
-//! model switcher. Inline only—drawing stays at the prompt, never a
-//! fullscreen UI. When stdin is not a terminal every call falls back to
-//! plain line reads, so pipes and scripts behave exactly as before.
+//! Interactive terminal input: a raw-mode line editor with live slash-command
+//! and project-path popups, plus a small list picker for choices such as the
+//! model switcher. The editor can draw inline or in the fullscreen input box.
+//! When stdin is not a terminal every call falls back to plain line reads, so
+//! pipes and scripts behave exactly as before.
 //!
 //! Editing covers insert and delete at a movable cursor (left/right,
 //! home/end, ctrl-a/e, alt-b/f by word), ctrl-u kills to line start,
 //! ctrl-k kills to line end, ctrl-w and alt-backspace delete the
 //! previous word, ctrl-c abandons the line (and pressed twice on an
 //! empty line, ends the session), ctrl-d on an empty line ends the
-//! session. Up/down walk the history, which persists across sessions.
+//! session. Up/down search the persistent history from the current draft,
+//! and Down restores that draft after the newest match.
 //! While the line is a slash command, matching commands render dimmed
 //! below the cursor; up/down selects, tab completes, enter runs.
 //! Arrow keys are recognized in both CSI (`ESC [ A`) and SS3
@@ -17,6 +18,8 @@
 
 const std = @import("std");
 const Io = std.Io;
+const cancel = @import("cancel.zig");
+const image_input = @import("image.zig");
 const term = @import("term.zig");
 const tui = @import("tui.zig");
 
@@ -30,20 +33,52 @@ pub const Suggestion = struct {
     help: []const u8,
 };
 
+pub const PathContext = struct {
+    io: Io,
+    cwd: []const u8,
+};
+
 const popup_line_max = 60;
 /// Column where suggestion and /help descriptions start; wide enough
 /// for the longest name-plus-args (`/firecrawl [status|clear]`).
 pub const help_column = 28;
 const popup_rows_max = 9;
+const file_index_max = 4096;
+const file_index_bytes_max = 512 * 1024;
+const file_index_depth_max = 16;
 pub const max_input_bytes = 4 * 1024 * 1024;
 const full_echo_max = 4 * 1024;
+
+pub const SubmissionKind = enum { steer, follow_up };
+
+pub const Submission = struct {
+    kind: SubmissionKind,
+    text: []u8,
+};
+
+const PhysicalResult = struct {
+    kind: SubmissionKind = .steer,
+    text: []const u8,
+};
+
+const PhysicalOptions = struct {
+    busy: bool = false,
+    stop: ?*const std.atomic.Value(bool) = null,
+    draft: ?*?[]u8 = null,
+};
+
+fn submissionText(text: []const u8, allow_empty: bool) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    return if (trimmed.len == 0 and !allow_empty) null else trimmed;
+}
 
 /// Read one logical line, trimmed and owned by `gpa`. A trailing unescaped
 /// backslash removes itself and continues on the next physical line.
 /// `initial` prefills the editor (for example a cancelled prompt).
-pub fn readLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, suggestions: []const Suggestion, initial: ?[]const u8) !?[]const u8 {
+pub fn readLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, suggestions: []const Suggestion, paths: ?PathContext, initial: ?[]const u8) !?[]const u8 {
     defer continuation_line = false;
-    var first = (try physicalLine(gpa, reader, output, suggestions, initial)) orelse return null;
+    var first_result = (try physicalLine(gpa, reader, output, suggestions, paths, initial, .{})) orelse return null;
+    var first = first_result.text;
     if (!continues(first)) {
         historyPush(gpa, first);
         return first;
@@ -57,15 +92,18 @@ pub fn readLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
         if (!more) break;
         try result.writer.writeByte('\n');
         continuation_line = true;
-        first = (try physicalLine(gpa, reader, output, suggestions, null)) orelse break;
+        first_result = (try physicalLine(gpa, reader, output, suggestions, paths, null, .{})) orelse break;
+        first = first_result.text;
     }
     const line = try result.toOwnedSlice();
-    historyPush(gpa, line);
-    return line;
+    const trimmed_len = std.mem.trimEnd(u8, line, " \t\r\n").len;
+    const trimmed = try gpa.realloc(line, trimmed_len);
+    historyPush(gpa, trimmed);
+    return trimmed;
 }
 
-/// Read a short secret without echoing it or adding it to prompt history.
-/// Bracketed paste works, which is the usual way API keys enter this prompt.
+/// Read a credential without echoing it or adding it to prompt history.
+/// Bracketed paste supports API keys and OAuth callback URLs.
 pub fn readSecret(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, label: []const u8) !?[]const u8 {
     const raw = RawMode.enter() catch {
         if (interactive) return error.SecretInputUnavailable;
@@ -83,7 +121,7 @@ pub fn readSecret(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer
     defer secretPasteMode(output, false) catch {};
 
     while (true) {
-        const byte = switch (try resize_wait.next(reader)) {
+        const byte = switch (try resize_wait.next(reader, null)) {
             .byte => |byte| byte,
             .resize => {
                 try drawSecret(output, label, buffer.items.len);
@@ -93,6 +131,7 @@ pub fn readSecret(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer
                 try finishSecret(output);
                 return null;
             },
+            .stop => unreachable,
         };
         switch (byte) {
             '\r', '\n' => {
@@ -124,11 +163,11 @@ pub fn readSecret(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer
                 }
                 if (final == '~' and parameter == 200) {
                     var cursor = buffer.items.len;
-                    _ = try pasteInto(gpa, &buffer, &cursor, reader);
+                    _ = try pasteInto(gpa, &buffer, &cursor, reader, null);
                     try drawSecret(output, label, buffer.items.len);
                 }
             },
-            else => if (byte >= 0x21 and byte <= 0x7e and buffer.items.len < 1024) {
+            else => if (byte >= 0x21 and byte <= 0x7e and buffer.items.len < 2048) {
                 try buffer.append(gpa, byte);
                 try drawSecret(output, label, buffer.items.len);
             },
@@ -137,7 +176,8 @@ pub fn readSecret(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer
 }
 
 fn secretPasteMode(output: *Io.Writer, enabled: bool) !void {
-    const target = if (tui.active) tui.chromeSink() else output;
+    if (tui.active) return tui.setPasteMode(enabled);
+    const target = output;
     try target.writeAll(if (enabled) "\x1b[?2004h" else "\x1b[?2004l");
     try target.flush();
 }
@@ -171,10 +211,10 @@ fn finishSecret(output: *Io.Writer) !void {
     if (tui.active) {
         _ = tui.checkResize();
         tui.closePopup();
-        _ = try redrawTui(&.{}, "", 0, 0);
+        _ = try redrawTui(&.{}, &.{}, "", 0, 0, "", 0);
         tui.focusRegion();
     } else {
-        try output.writeAll("\r\x1b[J\n");
+        try output.writeAll("\r\x1b[2K\r\n");
         try output.flush();
     }
 }
@@ -186,26 +226,44 @@ fn plainSecret(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, l
     defer line.deinit(gpa);
     while (try takeByteOrNull(reader)) |byte| {
         if (byte == '\r' or byte == '\n') break;
-        if (line.items.len < 1024) try line.append(gpa, byte);
+        if (line.items.len < 2048) try line.append(gpa, byte);
     }
     try output.writeByte('\n');
     try output.flush();
     return try gpa.dupe(u8, std.mem.trim(u8, line.items, " \t\r\n"));
 }
 
-fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, suggestions: []const Suggestion, initial: ?[]const u8) !?[]const u8 {
-    if (!interactive) return plainLine(gpa, reader, output);
-    const raw = RawMode.enter() catch return plainLine(gpa, reader, output);
+fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, suggestions: []const Suggestion, paths: ?PathContext, initial: ?[]const u8, options: PhysicalOptions) !?PhysicalResult {
+    if (!interactive) {
+        const line = (try plainLine(gpa, reader, output)) orelse return null;
+        return .{ .text = line };
+    }
+    const raw = RawMode.enter() catch {
+        const line = (try plainLine(gpa, reader, output)) orelse return null;
+        return .{ .text = line };
+    };
     defer raw.exit();
     if (tui.active) tui.beginInput();
     defer if (tui.active) tui.endInput();
 
     var buffer: std.ArrayList(u8) = .empty;
     defer buffer.deinit(gpa);
+    var files: FileIndex = .{ .gpa = gpa, .context = paths };
+    defer files.deinit();
+    var pasted_image_paths: std.ArrayList([]u8) = .empty;
+    var preserve_clipboard_files = false;
+    defer {
+        for (pasted_image_paths.items) |path| {
+            if (!preserve_clipboard_files) if (files.context) |context| image_input.discardClipboardTemp(context.io, path);
+            gpa.free(path);
+        }
+        pasted_image_paths.deinit(gpa);
+    }
     var cursor: usize = 0;
     var selected: usize = 0;
-    var popup_shown = false;
+    var popup_rows: usize = 0;
     var pending: ?u8 = null;
+    var submission_kind: SubmissionKind = .steer;
     var interrupt_armed = false;
     var hist_pos: ?usize = null;
     var stash: std.ArrayList(u8) = .empty;
@@ -219,6 +277,7 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
     if (initial) |text| {
         input_truncated = !(try load(gpa, &buffer, text));
         cursor = buffer.items.len;
+        try noteClipboardImagePaths(gpa, buffer.items, &pasted_image_paths);
     }
 
     // Bracketed paste keeps multi-line pastes from submitting line by line.
@@ -226,14 +285,19 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
     // editor draws through the chrome sink. Send terminal controls through
     // that same direct sink and flush before reading; otherwise the enable
     // sequence can sit in the tee until the first pasted newline submits.
-    const terminal_output = if (tui.active) tui.chromeSink() else output;
-    try terminal_output.writeAll("\x1b[?2004h");
-    try terminal_output.flush();
-    defer {
-        terminal_output.writeAll("\x1b[?2004l") catch {};
-        terminal_output.flush() catch {};
+    if (tui.active) {
+        try tui.setPasteMode(true);
+    } else {
+        try output.writeAll("\x1b[?2004h");
+        try output.flush();
     }
-    popup_shown = try renderEditor(output, suggestions, buffer.items, selected, cursor);
+    defer if (tui.active) {
+        tui.setPasteMode(false) catch {};
+    } else {
+        output.writeAll("\x1b[?2004l") catch {};
+        output.flush() catch {};
+    };
+    popup_rows = try renderEditor(output, suggestions, &files, pasted_image_paths.items, buffer.items, selected, cursor, popup_rows);
 
     while (true) {
         const byte = blk: {
@@ -241,57 +305,98 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                 pending = null;
                 break :blk p;
             }
-            break :blk switch (try resize_wait.next(reader)) {
+            break :blk switch (try resize_wait.next(reader, options.stop)) {
                 .byte => |byte| byte,
                 .resize => {
-                    popup_shown = try renderEditor(output, suggestions, buffer.items, selected, cursor);
+                    popup_rows = try renderEditor(output, suggestions, &files, pasted_image_paths.items, buffer.items, selected, cursor, popup_rows);
                     continue;
                 },
                 .end => {
-                    try endEditor(output);
+                    try endEditor(output, popup_rows);
+                    return null;
+                },
+                .stop => {
+                    if (options.draft) |draft| {
+                        discardUnusedClipboardImages(gpa, files.context, buffer.items, &pasted_image_paths);
+                        draft.* = try gpa.dupe(u8, buffer.items);
+                        preserve_clipboard_files = true;
+                    }
+                    try endEditor(output, popup_rows);
                     return null;
                 },
             };
         };
+        const dismissed_startup_hint = tui.dismissStartupHint();
         if (interrupt_armed and byte != 0x03) {
             // Any other key withdraws the pending exit and clears the hint.
             interrupt_armed = false;
             dirty_after_hint = true;
         }
-        var dirty = dirty_after_hint;
+        var dirty = dirty_after_hint or dismissed_startup_hint;
         dirty_after_hint = false;
         switch (byte) {
             '\r', '\n' => {
                 const line = buffer.items;
-                const chosen = if (popupActive(line))
+                const chosen = if (slashPopupActive(line))
                     nthMatch(suggestions, line[1..], selected)
                 else
                     null;
                 if (chosen) |suggestion| {
                     try fill(gpa, &buffer, suggestion.name, false);
                     input_truncated = false;
+                } else if (fileQuery(line, cursor)) |query| {
+                    if (query.at) {
+                        if (nthFileMatch(files.items.items, query, selected)) |path| {
+                            try fillPath(gpa, &buffer, &cursor, query, path);
+                            input_truncated = false;
+                            selected = 0;
+                            hist_pos = null;
+                            popup_rows = try renderEditor(output, suggestions, &files, pasted_image_paths.items, buffer.items, selected, cursor, popup_rows);
+                            continue;
+                        }
+                    }
                 }
-                if (tui.active) {
+                const trimmed = submissionText(buffer.items, continuation_line) orelse {
+                    buffer.clearRetainingCapacity();
+                    discardUnusedClipboardImages(gpa, files.context, buffer.items, &pasted_image_paths);
+                    input_truncated = false;
+                    cursor = 0;
+                    selected = 0;
+                    hist_pos = null;
+                    submission_kind = .steer;
+                    popup_rows = try renderEditor(output, suggestions, &files, pasted_image_paths.items, buffer.items, selected, cursor, popup_rows);
+                    continue;
+                };
+                if (options.busy) {
+                    _ = try redrawTui(suggestions, &.{}, "", 0, 0, "", 0);
+                } else if (tui.active) {
                     tui.closePopup();
-                    _ = try redrawTui(suggestions, "", 0, 0);
+                    _ = try redrawTui(suggestions, &.{}, "", 0, 0, "", 0);
                     tui.focusRegion();
                     // The submitted prompt echoes into the transcript as
                     // its own block, blank-line separated on both sides.
+                    var displayed = try image_input.displayPlaceholders(gpa, buffer.items, buffer.items.len, pasted_image_paths.items);
+                    defer displayed.deinit();
                     try output.print("\n{s}> ", .{term.dim()});
-                    try writeSubmittedVisible(output, buffer.items);
+                    try writeSubmittedVisible(output, displayed.text);
                     try output.print("{s}\n\n", .{term.reset()});
                     try output.flush();
                 } else {
-                    try prompt(output, buffer.items);
-                    try output.writeAll("\x1b[J\r\n");
+                    try clearInlinePopup(output, popup_rows);
+                    var displayed = try image_input.displayPlaceholders(gpa, buffer.items, buffer.items.len, pasted_image_paths.items);
+                    defer displayed.deinit();
+                    try prompt(output, displayed.text);
+                    try output.writeAll("\x1b[K\r\n");
                     try output.flush();
                 }
-                if (input_truncated) {
+                if (input_truncated and !options.busy) {
                     try output.print("{s}[input limited to 4 MiB]{s}\n", .{ term.dim(), term.reset() });
                     try output.flush();
                 }
-                const trimmed = std.mem.trim(u8, buffer.items, " \t\r\n");
-                return try gpa.dupe(u8, trimmed);
+                const submitted = try gpa.dupe(u8, trimmed);
+                discardUnusedClipboardImages(gpa, files.context, buffer.items, &pasted_image_paths);
+                preserve_clipboard_files = submitted.len > 0 and submitted[0] != '/' and submitted[0] != '!';
+                return .{ .kind = submission_kind, .text = submitted };
             },
             0x7f, 0x08 => if (cursor > 0) {
                 const previous = prevBoundary(buffer.items, cursor);
@@ -309,8 +414,10 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                 selected = 0;
                 hist_pos = null;
                 dirty = true;
+            } else if (options.busy) {
+                cancel.processToken().request();
             } else if (interrupt_armed) {
-                try endEditor(output);
+                try endEditor(output, popup_rows);
                 return null;
             } else {
                 interrupt_armed = true;
@@ -324,8 +431,10 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                     try chrome.print("\x1b[{d};{d}H", .{ area.row, area.col });
                     try chrome.flush();
                 } else {
+                    try clearInlinePopup(output, popup_rows);
+                    popup_rows = 0;
                     try prompt(output, "");
-                    try output.print("\x1b[J{s}ctrl-c again to exit{s}", .{ term.dim(), term.reset() });
+                    try output.print("\x1b[K{s}ctrl-c again to exit{s}", .{ term.dim(), term.reset() });
                     try output.flush();
                 }
             },
@@ -362,10 +471,32 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                 dirty = true;
             },
             0x04 => if (buffer.items.len == 0) {
-                try endEditor(output);
+                try endEditor(output, popup_rows);
                 return null;
             },
-            '\t' => if (popupActive(buffer.items)) {
+            0x16 => { // ctrl-v: paste a bitmap from the desktop clipboard
+                if (pasted_image_paths.items.len == image_input.max_images_per_prompt) {
+                    try showClipboardHint(output, "at most 4 images");
+                    continue;
+                }
+                const context = files.context orelse {
+                    try showClipboardHint(output, "clipboard image paste unavailable");
+                    continue;
+                };
+                insertClipboardImage(gpa, context, &buffer, &cursor, &pasted_image_paths) catch |err| {
+                    switch (err) {
+                        error.OutOfMemory => return err,
+                        error.ImageTooLarge => try showClipboardHint(output, "clipboard image exceeds 5 MiB"),
+                        error.InputTooLarge => try showClipboardHint(output, "prompt is full"),
+                        else => try showClipboardHint(output, "clipboard has no readable image"),
+                    }
+                    continue;
+                };
+                selected = 0;
+                hist_pos = null;
+                dirty = true;
+            },
+            '\t' => if (slashPopupActive(buffer.items)) {
                 if (nthMatch(suggestions, buffer.items[1..], selected)) |suggestion| {
                     try fill(gpa, &buffer, suggestion.name, suggestion.args.len > 0);
                     input_truncated = false;
@@ -374,14 +505,28 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                     hist_pos = null;
                     dirty = true;
                 }
+            } else if (fileQuery(buffer.items, cursor)) |query| {
+                try files.ensureLoaded();
+                if (nthFileMatch(files.items.items, query, selected)) |path| {
+                    try fillPath(gpa, &buffer, &cursor, query, path);
+                    input_truncated = false;
+                    selected = 0;
+                    hist_pos = null;
+                    dirty = true;
+                }
             },
             0x1b => {
-                const second = (try takeByteOrNull(reader)) orelse continue;
+                const second = (try takeSequenceByte(reader, options.stop)) orelse continue;
+                if (options.busy and (second == '\r' or second == '\n')) {
+                    submission_kind = .follow_up;
+                    pending = '\n';
+                    continue;
+                }
                 var final: u8 = 0;
                 var param: usize = 0;
                 if (second == '[') {
                     var param_done = false;
-                    var next = (try takeByteOrNull(reader)) orelse continue;
+                    var next = (try takeSequenceByte(reader, options.stop)) orelse continue;
                     while (next < 0x40 or next > 0x7e) {
                         if (!param_done and next >= '0' and next <= '9') {
                             // Clamp: an adversarial digit run must not
@@ -391,11 +536,11 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                         } else {
                             param_done = true;
                         }
-                        next = (try takeByteOrNull(reader)) orelse break;
+                        next = (try takeSequenceByte(reader, options.stop)) orelse break;
                     }
                     if (next >= 0x40 and next <= 0x7e) final = next;
                 } else if (second == 'O') {
-                    final = (try takeByteOrNull(reader)) orelse 0;
+                    final = (try takeSequenceByte(reader, options.stop)) orelse 0;
                 } else if (second == 'b') { // alt-b: word left
                     cursor = prevWord(buffer.items, cursor);
                     dirty = true;
@@ -417,36 +562,36 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                     continue;
                 }
                 switch (final) {
-                    'A' => if (popup_shown) {
+                    'A' => if (popupHandlesArrows(popup_rows > 0, hist_pos)) {
                         if (selected > 0) {
                             selected -= 1;
                             dirty = true;
                         }
                     } else if (history_count > 0) {
-                        if (hist_pos == null) {
+                        const before = hist_pos orelse blk: {
                             _ = try load(gpa, &stash, buffer.items);
                             stash_truncated = input_truncated;
-                            hist_pos = history_count;
-                        }
-                        if (hist_pos.? > 0) {
-                            hist_pos = hist_pos.? - 1;
-                            _ = try load(gpa, &buffer, history_items[hist_pos.?]);
+                            break :blk history_count;
+                        };
+                        if (previousHistoryMatch(stash.items, before)) |position| {
+                            hist_pos = position;
+                            _ = try load(gpa, &buffer, history_items[position]);
                             input_truncated = false;
                             cursor = buffer.items.len;
                             selected = 0;
                             dirty = true;
                         }
                     },
-                    'B' => if (popup_shown) {
-                        const rows = countMatches(suggestions, buffer.items[1..]);
+                    'B' => if (popupHandlesArrows(popup_rows > 0, hist_pos)) {
+                        const rows = completionCount(suggestions, files.items.items, buffer.items, cursor);
                         if (rows > 0 and selected + 1 < rows) {
                             selected += 1;
                             dirty = true;
                         }
                     } else if (hist_pos) |position| {
-                        if (position + 1 < history_count) {
-                            hist_pos = position + 1;
-                            _ = try load(gpa, &buffer, history_items[position + 1]);
+                        if (nextHistoryMatch(stash.items, position)) |next| {
+                            hist_pos = next;
+                            _ = try load(gpa, &buffer, history_items[next]);
                             input_truncated = false;
                         } else {
                             hist_pos = null;
@@ -491,7 +636,9 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                             dirty = true;
                         },
                         200 => {
-                            input_truncated = !(try pasteInto(gpa, &buffer, &cursor, reader)) or input_truncated;
+                            const paste_start = cursor;
+                            input_truncated = !(try pasteInto(gpa, &buffer, &cursor, reader, options.stop)) or input_truncated;
+                            try notePastedImagePaths(gpa, paths, buffer.items[paste_start..cursor], &pasted_image_paths);
                             selected = 0;
                             hist_pos = null;
                             dirty = true;
@@ -537,83 +684,115 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
             },
         }
         if (dirty) {
-            popup_shown = try renderEditor(output, suggestions, buffer.items, selected, cursor);
+            popup_rows = try renderEditor(output, suggestions, &files, pasted_image_paths.items, buffer.items, selected, cursor, popup_rows);
         }
     }
 }
 
-fn renderEditor(output: *Io.Writer, suggestions: []const Suggestion, line: []const u8, selected: usize, cursor: usize) !bool {
+fn renderEditor(output: *Io.Writer, suggestions: []const Suggestion, files: *FileIndex, pasted_image_paths: []const []const u8, line: []const u8, selected: usize, cursor: usize, previous_popup_rows: usize) !usize {
+    if (fileQuery(line, cursor) != null) try files.ensureLoaded();
+    var displayed = try image_input.displayPlaceholders(files.gpa, line, cursor, pasted_image_paths);
+    defer displayed.deinit();
     if (tui.active) {
-        _ = tui.checkResize();
-        if (!tui.drawable()) return false;
-        return redrawTui(suggestions, line, selected, cursor);
+        return redrawTui(suggestions, files.items.items, line, selected, cursor, displayed.text, displayed.cursor);
     }
-    return redraw(output, suggestions, line, selected, cursor);
+    return redraw(output, suggestions, files.items.items, line, selected, cursor, displayed.text, displayed.cursor, previous_popup_rows);
 }
 
 /// Leave the editor cleanly on EOF or double ctrl-c.
-fn endEditor(output: *Io.Writer) !void {
+fn endEditor(output: *Io.Writer, popup_rows: usize) !void {
     if (tui.active) {
-        _ = tui.checkResize();
-        if (!tui.drawable()) return;
-        tui.closePopup();
-        _ = try redrawTui(&.{}, "", 0, 0);
+        _ = try redrawTui(&.{}, &.{}, "", 0, 0, "", 0);
         tui.focusRegion();
         return;
     }
-    try output.writeAll("\x1b[J\r\n");
+    try clearInlineBlock(output, popup_rows + 1);
+    try output.writeAll("\r\n");
     try output.flush();
 }
 
 /// Fullscreen editor rendering: the input line lives in the fixed box
 /// row, and the completion popup overlays the bottom of the transcript
 /// region instead of drawing below the prompt.
-fn redrawTui(suggestions: []const Suggestion, line: []const u8, selected: usize, cursor: usize) !bool {
-    if (!tui.drawable()) return false;
+fn redrawTui(suggestions: []const Suggestion, files: []const []const u8, line: []const u8, selected: usize, cursor: usize, displayed_line: []const u8, displayed_cursor: usize) !usize {
+    var cursor_row: usize = 0;
+    var cursor_col: usize = 0;
+    const ready = tui.beginInputFrame();
+    defer tui.endInputFrame(cursor_row, cursor_col);
+    if (!ready) return 0;
     const chrome = tui.chromeSink();
     const area = tui.inputArea();
-    const cursor_cols = columns(line[0..cursor]);
+    const cursor_cols = columns(displayed_line[0..displayed_cursor]);
     const avail = area.width;
     try chrome.print("\x1b[{d};{d}H", .{ area.row, area.col });
-    const window = try writeWindow(chrome, line, cursor_cols, avail);
+    const hint = if (line.len == 0) tui.startupHint() else null;
+    const window = if (hint) |text| hint_window: {
+        try chrome.writeAll(term.dim());
+        const rendered = try writeWindow(chrome, text, 0, avail);
+        try chrome.writeAll(term.reset());
+        break :hint_window WindowRender{ .used = rendered.used, .cursor = 0 };
+    } else try writeWindow(chrome, displayed_line, cursor_cols, avail);
     var used = window.used;
     while (used < area.width) : (used += 1) try chrome.writeByte(' ');
     var shown: usize = 0;
-    if (popupActive(line)) {
-        const word = line[1..];
-        const matched = countMatches(suggestions, word);
+    const matched = completionCount(suggestions, files, line, cursor);
+    if (matched > 0) {
         const granted = tui.beginPopup(matched);
         // Keep the selected row visible when the popup is clamped.
         const first = if (selected >= granted) selected + 1 - granted else 0;
         var index: usize = 0;
         var row: usize = 0;
-        for (suggestions) |suggestion| {
-            if (!matches(suggestion, word)) continue;
-            defer index += 1;
-            if (index < first) continue;
-            if (row == granted) break;
-            var row_buffer: [160]u8 = undefined;
-            var writer: Io.Writer = .fixed(&row_buffer);
-            const is_selected = index == selected;
-            writer.print("{s}{s}/{s}{s}", .{
-                if (is_selected) term.bold() else term.dim(),
-                if (is_selected) "> " else "  ",
-                suggestion.name,
-                suggestion.args,
-            }) catch {};
-            var column = 1 + suggestion.name.len + suggestion.args.len;
-            while (column < help_column) : (column += 1) writer.writeByte(' ') catch {};
-            writer.print("{s}{s}", .{ suggestion.help, term.reset() }) catch {};
-            tui.popupLine(row, writer.buffered());
-            row += 1;
+        if (slashPopupActive(line)) {
+            const word = line[1..];
+            for (suggestions) |suggestion| {
+                if (!matches(suggestion, word)) continue;
+                defer index += 1;
+                if (index < first) continue;
+                if (row == granted) break;
+                var row_buffer: [160]u8 = undefined;
+                var writer: Io.Writer = .fixed(&row_buffer);
+                const is_selected = index == selected;
+                writer.print("{s}{s}/{s}{s}", .{
+                    if (is_selected) term.bold() else term.dim(),
+                    if (is_selected) "> " else "  ",
+                    suggestion.name,
+                    suggestion.args,
+                }) catch {};
+                var column = 1 + suggestion.name.len + suggestion.args.len;
+                while (column < help_column) : (column += 1) writer.writeByte(' ') catch {};
+                writer.print("{s}{s}", .{ suggestion.help, term.reset() }) catch {};
+                tui.popupLine(row, writer.buffered());
+                row += 1;
+            }
+        } else if (fileQuery(line, cursor)) |query| {
+            for (files) |path| {
+                if (!fileMatches(path, query)) continue;
+                defer index += 1;
+                if (index < first) continue;
+                if (row == granted) break;
+                var row_buffer: [160]u8 = undefined;
+                var writer: Io.Writer = .fixed(&row_buffer);
+                const is_selected = index == selected;
+                writer.print("{s}{s}{s}{s}{s}", .{
+                    if (is_selected) term.bold() else term.dim(),
+                    if (is_selected) "> " else "  ",
+                    if (query.at) "@" else "",
+                    path,
+                    term.reset(),
+                }) catch {};
+                tui.popupLine(row, writer.buffered());
+                row += 1;
+            }
         }
         shown = granted;
     } else {
         tui.closePopup();
     }
-    try chrome.print("\x1b[{d};{d}H", .{ area.row, area.col + window.cursor });
+    cursor_row = area.row;
+    cursor_col = area.col + window.cursor;
+    try chrome.print("\x1b[{d};{d}H", .{ cursor_row, cursor_col });
     try chrome.flush();
-    return shown > 0;
+    return shown;
 }
 
 /// Replace the editor contents. False means the source exceeded the input
@@ -631,7 +810,7 @@ fn load(gpa: std.mem.Allocator, buffer: *std.ArrayList(u8), text: []const u8) !b
 /// spaces. The paste is collected and inserted in one operation so inserting
 /// a large block in the middle of a prompt remains linear. False means the
 /// input limit was reached; the rest is still consumed through the terminator.
-fn pasteInto(gpa: std.mem.Allocator, buffer: *std.ArrayList(u8), cursor: *usize, reader: *Io.Reader) !bool {
+fn pasteInto(gpa: std.mem.Allocator, buffer: *std.ArrayList(u8), cursor: *usize, reader: *Io.Reader, stop: ?*const std.atomic.Value(bool)) !bool {
     const terminator = "\x1b[201~";
     var pasted: std.ArrayList(u8) = .empty;
     defer pasted.deinit(gpa);
@@ -640,7 +819,7 @@ fn pasteInto(gpa: std.mem.Allocator, buffer: *std.ArrayList(u8), cursor: *usize,
     var complete = true;
     const available = max_input_bytes - buffer.items.len;
     while (true) {
-        const byte = (try takeByteOrNull(reader)) orelse {
+        const byte = (try takeByteStopping(reader, stop)) orelse {
             for (terminator[0..matched]) |held| try appendPasteByte(gpa, &pasted, held, &previous, available, &complete);
             break;
         };
@@ -671,6 +850,118 @@ fn pasteInto(gpa: std.mem.Allocator, buffer: *std.ArrayList(u8), cursor: *usize,
     return complete;
 }
 
+/// Remember image paths from a bracketed paste so the editor can draw the
+/// same numbered placeholders that the submitted prompt will contain.
+fn notePastedImagePaths(gpa: std.mem.Allocator, paths: ?PathContext, pasted: []const u8, known: *std.ArrayList([]u8)) !void {
+    const context = paths orelse return;
+    if (pasted.len == 0 or known.items.len == image_input.max_images_per_prompt) return;
+    try noteClipboardImagePaths(gpa, pasted, known);
+    var parsed = image_input.inspectPrompt(gpa, context.io, context.cwd, try gpa.dupe(u8, pasted)) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return,
+    };
+    defer parsed.deinit();
+    for (parsed.images) |image| {
+        if (pathKnown(known.items, image.name)) continue;
+        if (known.items.len == image_input.max_images_per_prompt) break;
+        const owned = try gpa.dupe(u8, image.name);
+        errdefer gpa.free(owned);
+        try known.append(gpa, owned);
+    }
+}
+
+fn insertClipboardImage(gpa: std.mem.Allocator, context: PathContext, buffer: *std.ArrayList(u8), cursor: *usize, known: *std.ArrayList([]u8)) !void {
+    const path = try image_input.clipboardToTemp(gpa, context.io);
+    var keep_path = false;
+    defer if (!keep_path) {
+        image_input.discardClipboardTemp(context.io, path);
+        gpa.free(path);
+    };
+
+    var token: Io.Writer.Allocating = .init(gpa);
+    defer token.deinit();
+    if (cursor.* > 0 and !std.ascii.isWhitespace(buffer.items[cursor.* - 1])) try token.writer.writeByte(' ');
+    try token.writer.writeByte('@');
+    try token.writer.writeAll(path);
+    if (cursor.* == buffer.items.len or !std.ascii.isWhitespace(buffer.items[cursor.*])) try token.writer.writeByte(' ');
+    if (buffer.items.len + token.written().len > max_input_bytes) return error.InputTooLarge;
+
+    try known.append(gpa, path);
+    errdefer _ = known.pop();
+    try buffer.insertSlice(gpa, cursor.*, token.written());
+    cursor.* += token.written().len;
+    keep_path = true;
+}
+
+fn showClipboardHint(output: *Io.Writer, message: []const u8) !void {
+    if (tui.active) {
+        tui.showStartupHint(message);
+    } else {
+        try output.writeByte('\x07');
+        try output.flush();
+    }
+}
+
+fn pathKnown(paths: []const []const u8, candidate: []const u8) bool {
+    for (paths) |path| if (std.mem.eql(u8, path, candidate)) return true;
+    return false;
+}
+
+const clipboard_temp_prefix = "/tmp/xaq-clipboard-";
+const clipboard_temp_path_len = clipboard_temp_prefix.len + 24 + ".png".len;
+
+fn nextClipboardImagePath(text: []const u8, offset: *usize) ?[]const u8 {
+    while (std.mem.indexOfPos(u8, text, offset.*, clipboard_temp_prefix)) |start| {
+        offset.* = start + 1;
+        const end = start + clipboard_temp_path_len;
+        if (end > text.len) return null;
+        const path = text[start..end];
+        const before_ok = start == 0 or std.ascii.isWhitespace(text[start - 1]) or text[start - 1] == '@' or text[start - 1] == '\'' or text[start - 1] == '"';
+        const after_ok = end == text.len or std.ascii.isWhitespace(text[end]) or text[end] == '\'' or text[end] == '"';
+        if (before_ok and after_ok and image_input.isClipboardTemp(path)) return path;
+    }
+    return null;
+}
+
+fn noteClipboardImagePaths(gpa: std.mem.Allocator, text: []const u8, known: *std.ArrayList([]u8)) !void {
+    var offset: usize = 0;
+    while (nextClipboardImagePath(text, &offset)) |path| {
+        if (pathKnown(known.items, path)) continue;
+        if (known.items.len == image_input.max_images_per_prompt) break;
+        const owned = try gpa.dupe(u8, path);
+        errdefer gpa.free(owned);
+        try known.append(gpa, owned);
+    }
+}
+
+fn promptContainsClipboardImage(text: []const u8, candidate: []const u8) bool {
+    var offset: usize = 0;
+    while (nextClipboardImagePath(text, &offset)) |path| {
+        if (std.mem.eql(u8, path, candidate)) return true;
+    }
+    return false;
+}
+
+fn discardUnusedClipboardImages(gpa: std.mem.Allocator, context: ?PathContext, text: []const u8, known: *std.ArrayList([]u8)) void {
+    var index: usize = 0;
+    while (index < known.items.len) {
+        const path = known.items[index];
+        if (promptContainsClipboardImage(text, path)) {
+            index += 1;
+            continue;
+        }
+        if (context) |value| image_input.discardClipboardTemp(value.io, path);
+        gpa.free(path);
+        _ = known.orderedRemove(index);
+    }
+}
+
+fn discardClipboardImagesInText(context: ?PathContext, text: []const u8) void {
+    const value = context orelse return;
+    var offset: usize = 0;
+    while (nextClipboardImagePath(text, &offset)) |path| image_input.discardClipboardTemp(value.io, path);
+}
+
 fn appendPasteByte(gpa: std.mem.Allocator, pasted: *std.ArrayList(u8), byte_in: u8, previous: *u8, available: usize, complete: *bool) !void {
     const raw = byte_in;
     defer previous.* = raw;
@@ -694,7 +985,7 @@ fn continues(line: []const u8) bool {
 }
 
 /// Inline single-column picker: up/down or j/k moves, enter confirms,
-/// ctrl-c or q cancels. Returns the chosen index. The drawn list is
+/// escape, ctrl-c, or q cancels. Returns the chosen index. The drawn list is
 /// erased before returning.
 pub fn pick(reader: *Io.Reader, output: *Io.Writer, items: []const []const u8, initial: usize) !?usize {
     if (!interactive or items.len == 0) return null;
@@ -704,42 +995,35 @@ pub fn pick(reader: *Io.Reader, output: *Io.Writer, items: []const []const u8, i
     defer if (tui.active) tui.endInput();
 
     var selected = @min(initial, items.len - 1);
+    var drawn_rows: usize = 0;
     var resize_wait = ResizeWait.init();
     while (true) {
         if (tui.active) {
             _ = tui.checkResize();
             try drawPickOverlay(items, selected);
         } else {
-            const granted = @min(items.len, @min(terminalHeight() -| 1, popup_rows_max));
-            const first = if (selected >= granted and granted > 0) selected + 1 - granted else 0;
-            for (0..granted) |row| {
-                const index = first + row;
-                const style = if (index == selected) term.bold() else term.dim();
-                const marker: []const u8 = if (index == selected) "\u{258c} " else "  ";
-                try output.print("{s}{s}", .{ style, marker });
-                try writePlainClipped(output, items[index], terminalWidth() -| 2);
-                try output.print("{s}\x1b[K\r\n", .{term.reset()});
-            }
-            try output.writeAll("\x1b[J");
-            if (granted > 0) try output.print("\x1b[{d}A\r", .{granted});
-            try output.flush();
+            drawn_rows = try drawPickInline(output, items, selected, drawn_rows);
         }
 
-        const byte = switch (try resize_wait.next(reader)) {
+        const byte = switch (try resize_wait.next(reader, null)) {
             .byte => |byte| byte,
             .resize => continue,
             .end => break,
+            .stop => unreachable,
         };
         switch (byte) {
             '\r', '\n' => {
-                try endPick(output);
+                try endPick(output, drawn_rows);
                 return selected;
             },
             0x03, 0x04, 'q' => break,
             'k' => selected -|= 1,
             'j' => selected = @min(selected + 1, items.len - 1),
             0x1b => {
-                const second = (try takeByteOrNull(reader)) orelse break;
+                // Escape prefixes arrow-key sequences too. Give the rest of
+                // such a sequence a brief chance to arrive; a bare Escape
+                // closes the picker.
+                const second = (try takeByteWithin(reader, escape_sequence_timeout_ms)) orelse break;
                 var final: u8 = 0;
                 if (second == '[') {
                     var next = (try takeByteOrNull(reader)) orelse break;
@@ -749,7 +1033,7 @@ pub fn pick(reader: *Io.Reader, output: *Io.Writer, items: []const []const u8, i
                     if (next >= 0x40 and next <= 0x7e) final = next;
                 } else if (second == 'O') {
                     final = (try takeByteOrNull(reader)) orelse 0;
-                } else continue;
+                } else break;
                 switch (final) {
                     'A' => selected -|= 1,
                     'B' => selected = @min(selected + 1, items.len - 1),
@@ -759,8 +1043,28 @@ pub fn pick(reader: *Io.Reader, output: *Io.Writer, items: []const []const u8, i
             else => {},
         }
     }
-    try endPick(output);
+    try endPick(output, drawn_rows);
     return null;
+}
+
+fn drawPickInline(output: *Io.Writer, items: []const []const u8, selected: usize, previous_rows: usize) !usize {
+    const granted = @min(items.len, @min(terminalHeight() -| 1, popup_rows_max));
+    if (previous_rows > 0) try clearInlineBlock(output, previous_rows);
+    const first = if (selected >= granted and granted > 0) selected + 1 - granted else 0;
+    for (0..granted) |row| {
+        if (row > 0) try output.writeAll("\r\n");
+        try output.writeAll("\r\x1b[2K");
+        const index = first + row;
+        const style = if (index == selected) term.bold() else term.dim();
+        const marker: []const u8 = if (index == selected) "\u{258c} " else "  ";
+        try output.print("{s}{s}", .{ style, marker });
+        try writePlainClipped(output, items[index], terminalWidth() -| 2);
+        try output.writeAll(term.reset());
+    }
+    if (granted > 1) try output.print("\x1b[{d}A", .{granted - 1});
+    if (granted > 0) try output.writeByte('\r');
+    try output.flush();
+    return granted;
 }
 
 /// Fullscreen picker rendering: rows overlay the transcript bottom,
@@ -784,12 +1088,12 @@ fn drawPickOverlay(items: []const []const u8, selected: usize) !void {
     try tui.chromeSink().flush();
 }
 
-fn endPick(output: *Io.Writer) !void {
+fn endPick(output: *Io.Writer, drawn_rows: usize) !void {
     if (tui.active) {
         tui.closePopup();
         return;
     }
-    try output.writeAll("\x1b[J");
+    try clearInlineBlock(output, drawn_rows);
     try output.flush();
 }
 
@@ -857,11 +1161,156 @@ fn writeVisible(output: *Io.Writer, text: []const u8) !void {
     }
 }
 
-/// The popup follows the line while a short slash-command word is being
+const FileQuery = struct {
+    start: usize,
+    end: usize,
+    text: []const u8,
+    at: bool,
+};
+
+const FileIndex = struct {
+    gpa: std.mem.Allocator,
+    context: ?PathContext,
+    items: std.ArrayList([]const u8) = .empty,
+    bytes: usize = 0,
+    loaded: bool = false,
+
+    fn deinit(self: *FileIndex) void {
+        for (self.items.items) |path| self.gpa.free(path);
+        self.items.deinit(self.gpa);
+    }
+
+    fn ensureLoaded(self: *FileIndex) !void {
+        if (self.loaded) return;
+        self.loaded = true;
+        const context_value = self.context orelse return;
+        var root = Io.Dir.cwd().openDir(context_value.io, context_value.cwd, .{ .iterate = true }) catch return;
+        defer root.close(context_value.io);
+        try self.collect(context_value.io, root, "", 0);
+    }
+
+    fn collect(self: *FileIndex, io: Io, dir: Io.Dir, prefix: []const u8, depth: usize) anyerror!void {
+        if (depth >= file_index_depth_max or self.items.items.len >= file_index_max or self.bytes >= file_index_bytes_max) return;
+        var iterator = dir.iterate();
+        while (try iterator.next(io)) |entry| {
+            if (self.items.items.len >= file_index_max or self.bytes >= file_index_bytes_max) return;
+            const path = try std.fs.path.join(self.gpa, &.{ prefix, entry.name });
+            if (entry.kind == .directory) {
+                defer self.gpa.free(path);
+                if (skipIndexedDirectory(entry.name)) continue;
+                var child = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+                defer child.close(io);
+                self.collect(io, child, path, depth + 1) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => {},
+                };
+                continue;
+            }
+            if (entry.kind != .file or path.len > 1024 or !indexablePath(path)) {
+                self.gpa.free(path);
+                continue;
+            }
+            if (self.bytes + path.len > file_index_bytes_max) {
+                self.gpa.free(path);
+                return;
+            }
+            try self.items.append(self.gpa, path);
+            self.bytes += path.len;
+        }
+    }
+};
+
+fn indexablePath(path: []const u8) bool {
+    if (!std.unicode.utf8ValidateSlice(path)) return false;
+    for (path) |byte| if (byte < 0x20 or byte == 0x7f) return false;
+    return true;
+}
+
+fn skipIndexedDirectory(name: []const u8) bool {
+    inline for (.{ ".git", ".zig-cache", "zig-out", "node_modules", "target", ".next" }) |ignored| {
+        if (std.mem.eql(u8, name, ignored)) return true;
+    }
+    return false;
+}
+
+/// Locate a project path token at the cursor. `@word` searches anywhere in a
+/// path. Ordinary tokens complete by prefix once they contain a slash or start
+/// with a dot.
+fn fileQuery(line: []const u8, cursor: usize) ?FileQuery {
+    if (cursor > line.len) return null;
+    var start = cursor;
+    while (start > 0 and !std.ascii.isWhitespace(line[start - 1])) start -= 1;
+    var end = cursor;
+    while (end < line.len and !std.ascii.isWhitespace(line[end])) end += 1;
+    const token = line[start..cursor];
+    if (token.len == 0) return null;
+    if (token[0] == '@') return .{ .start = start, .end = end, .text = token[1..], .at = true };
+    if (token[0] == '/' or std.mem.indexOf(u8, token, "://") != null) return null;
+    if (token[0] != '.' and std.mem.indexOfScalar(u8, token, '/') == null) return null;
+    return .{ .start = start, .end = end, .text = token, .at = false };
+}
+
+fn fileMatches(path: []const u8, query: FileQuery) bool {
+    if (!query.at) return std.mem.startsWith(u8, path, query.text);
+    if (query.text.len == 0) return true;
+    var matched: usize = 0;
+    for (path) |byte| {
+        if (std.ascii.toLower(byte) == std.ascii.toLower(query.text[matched])) {
+            matched += 1;
+            if (matched == query.text.len) return true;
+        }
+    }
+    return false;
+}
+
+fn countFileMatches(files: []const []const u8, query: FileQuery) usize {
+    var count: usize = 0;
+    for (files) |path| if (fileMatches(path, query)) {
+        count += 1;
+    };
+    return count;
+}
+
+fn nthFileMatch(files: []const []const u8, query: FileQuery, wanted: usize) ?[]const u8 {
+    var index: usize = 0;
+    for (files) |path| {
+        if (!fileMatches(path, query)) continue;
+        if (index == wanted) return path;
+        index += 1;
+    }
+    return null;
+}
+
+fn fillPath(gpa: std.mem.Allocator, buffer: *std.ArrayList(u8), cursor: *usize, query: FileQuery, path: []const u8) !void {
+    var replacement: Io.Writer.Allocating = .init(gpa);
+    defer replacement.deinit();
+    if (query.at) try replacement.writer.writeByte('@');
+    for (path) |byte| {
+        if (byte == '\\' or std.ascii.isWhitespace(byte)) try replacement.writer.writeByte('\\');
+        try replacement.writer.writeByte(byte);
+    }
+    try replacement.writer.writeByte(' ');
+    try buffer.replaceRange(gpa, query.start, query.end - query.start, replacement.written());
+    cursor.* = query.start + replacement.written().len;
+}
+
+fn completionCount(suggestions: []const Suggestion, files: []const []const u8, line: []const u8, cursor: usize) usize {
+    if (slashPopupActive(line)) return countMatches(suggestions, line[1..]);
+    if (fileQuery(line, cursor)) |query| return countFileMatches(files, query);
+    return 0;
+}
+
+/// The slash popup follows the line while a short command word is being
 /// typed; a space (arguments) or a long line hides it.
-fn popupActive(line: []const u8) bool {
+fn slashPopupActive(line: []const u8) bool {
     if (line.len == 0 or line[0] != '/' or line.len > popup_line_max) return false;
     return std.mem.findAny(u8, line, " \t\n") == null;
+}
+
+/// A recalled slash command can open the completion popup. Keep its arrow
+/// keys attached to history until Down returns to the saved draft.
+fn popupHandlesArrows(shown: bool, history_position: ?usize) bool {
+    return shown and history_position == null;
 }
 
 fn matches(suggestion: Suggestion, word: []const u8) bool {
@@ -896,50 +1345,88 @@ fn fill(gpa: std.mem.Allocator, buffer: *std.ArrayList(u8), name: []const u8, tr
     if (trailing_space) buffer.appendAssumeCapacity(' ');
 }
 
-/// Reprint the input line, clear below, draw matching commands, and park
-/// the cursor at its position within the line. Lines wider than the
-/// terminal render a scrolling window around the cursor, marked with an
-/// ellipsis on the clipped side. Returns whether popup rows remain.
-fn redraw(output: *Io.Writer, suggestions: []const Suggestion, line: []const u8, selected: usize, cursor: usize) !bool {
-    const cursor_cols = columns(line[0..cursor]);
+/// Reprint the input line, replace only the popup rows owned by the editor,
+/// and park the cursor within the line. Content below that block is untouched.
+/// Lines wider than the terminal use a scrolling window around the cursor.
+fn redraw(output: *Io.Writer, suggestions: []const Suggestion, files: []const []const u8, line: []const u8, selected: usize, cursor: usize, displayed_line: []const u8, displayed_cursor: usize, previous_popup_rows: usize) !usize {
+    const cursor_cols = columns(displayed_line[0..displayed_cursor]);
     const avail = terminalWidth() -| 4;
 
-    try output.print("\r{s}\u{258c}{s}", .{ term.bold(), term.reset() });
-    const window = try writeWindow(output, line, cursor_cols, avail);
-    try output.writeAll("\x1b[J");
+    if (continuation_line) {
+        try output.print("\r\x1b[2K{s}\u{21b3}{s}", .{ term.dim(), term.reset() });
+    } else {
+        try output.print("\r\x1b[2K{s}\u{258c}{s}", .{ term.bold(), term.reset() });
+    }
+    const window = try writeWindow(output, displayed_line, cursor_cols, avail);
     var rows: usize = 0;
-    if (popupActive(line)) {
+    const matched = completionCount(suggestions, files, line, cursor);
+    if (matched > 0) {
         // Clamp the popup so it cannot scroll a short terminal; the
         // window follows the selection like the fullscreen overlay.
-        const word = line[1..];
-        const matched = countMatches(suggestions, word);
         const granted = @min(matched, @min(terminalHeight() -| 2, popup_rows_max));
         const first = if (selected >= granted) selected + 1 - granted else 0;
         var index: usize = 0;
-        for (suggestions) |suggestion| {
-            if (!matches(suggestion, word)) continue;
-            defer index += 1;
-            if (index < first) continue;
-            if (rows == granted) break;
-            const is_selected = index == selected;
-            const style = if (is_selected) term.bold() else term.dim();
-            const marker: []const u8 = if (is_selected) "\u{258c} " else "  ";
-            var row_buffer: [256]u8 = undefined;
-            var row_writer: Io.Writer = .fixed(&row_buffer);
-            row_writer.print("{s}/{s}{s}", .{ marker, suggestion.name, suggestion.args }) catch {};
-            var column = 1 + suggestion.name.len + suggestion.args.len;
-            while (column < help_column) : (column += 1) row_writer.writeByte(' ') catch {};
-            row_writer.writeAll(suggestion.help) catch {};
-            try output.print("\r\n{s}", .{style});
-            try writePlainClipped(output, row_writer.buffered(), terminalWidth());
-            try output.writeAll(term.reset());
-            rows += 1;
+        if (slashPopupActive(line)) {
+            const word = line[1..];
+            for (suggestions) |suggestion| {
+                if (!matches(suggestion, word)) continue;
+                defer index += 1;
+                if (index < first) continue;
+                if (rows == granted) break;
+                const is_selected = index == selected;
+                const style = if (is_selected) term.bold() else term.dim();
+                const marker: []const u8 = if (is_selected) "\u{258c} " else "  ";
+                var row_buffer: [256]u8 = undefined;
+                var row_writer: Io.Writer = .fixed(&row_buffer);
+                row_writer.print("{s}/{s}{s}", .{ marker, suggestion.name, suggestion.args }) catch {};
+                var column = 1 + suggestion.name.len + suggestion.args.len;
+                while (column < help_column) : (column += 1) row_writer.writeByte(' ') catch {};
+                row_writer.writeAll(suggestion.help) catch {};
+                try output.print("\r\n\x1b[2K{s}", .{style});
+                try writePlainClipped(output, row_writer.buffered(), terminalWidth());
+                try output.writeAll(term.reset());
+                rows += 1;
+            }
+        } else if (fileQuery(line, cursor)) |query| {
+            for (files) |path| {
+                if (!fileMatches(path, query)) continue;
+                defer index += 1;
+                if (index < first) continue;
+                if (rows == granted) break;
+                const is_selected = index == selected;
+                const style = if (is_selected) term.bold() else term.dim();
+                const marker: []const u8 = if (is_selected) "\u{258c} " else "  ";
+                try output.print("\r\n\x1b[2K{s}{s}{s}", .{ style, marker, if (query.at) "@" else "" });
+                try writePlainClipped(output, path, terminalWidth() -| 3);
+                try output.writeAll(term.reset());
+                rows += 1;
+            }
         }
-        if (rows > 0) try output.print("\x1b[{d}A", .{rows});
     }
+    var stale = rows;
+    while (stale < previous_popup_rows) : (stale += 1) try output.writeAll("\r\n\x1b[2K");
+    const occupied = @max(rows, previous_popup_rows);
+    if (occupied > 0) try output.print("\x1b[{d}A", .{occupied});
     try output.print("\r\x1b[{d}C", .{1 + window.cursor});
     try output.flush();
-    return rows > 0;
+    return rows;
+}
+
+/// Clear an inline block starting at the cursor's row and return to its first
+/// row. This is used for temporary picker lists and editor shutdown.
+fn clearInlineBlock(output: *Io.Writer, rows: usize) !void {
+    for (0..rows) |row| {
+        if (row > 0) try output.writeAll("\r\n");
+        try output.writeAll("\r\x1b[2K");
+    }
+    if (rows > 1) try output.print("\x1b[{d}A", .{rows - 1});
+    if (rows > 0) try output.writeByte('\r');
+}
+
+/// Clear popup rows below the prompt and return to the prompt row.
+fn clearInlinePopup(output: *Io.Writer, rows: usize) !void {
+    for (0..rows) |_| try output.writeAll("\r\n\x1b[2K");
+    if (rows > 0) try output.print("\x1b[{d}A\r", .{rows});
 }
 
 /// First visible column when the line is wider than the window: keep the
@@ -1030,13 +1517,17 @@ fn byteAtColumn(line: []const u8, column: usize) usize {
 }
 
 fn terminalWidth() usize {
-    if (term.windowSizeRaw()) |size| return size.cols;
+    if (term.windowSizeRaw()) |size| return usableDimension(size.cols, 80);
     return 80;
 }
 
 fn terminalHeight() usize {
-    if (term.windowSizeRaw()) |size| return size.rows;
+    if (term.windowSizeRaw()) |size| return usableDimension(size.rows, 24);
     return 24;
+}
+
+fn usableDimension(measured: u16, fallback: usize) usize {
+    return if (measured == 0) fallback else measured;
 }
 
 /// Display columns of the text, wide- and zero-width-aware.
@@ -1082,6 +1573,23 @@ var history_bytes: usize = 0;
 var history_io: ?Io = null;
 var history_path_buffer: [1024]u8 = undefined;
 var history_path_len: usize = 0;
+
+fn previousHistoryMatch(prefix: []const u8, before: usize) ?usize {
+    var index = @min(before, history_count);
+    while (index > 0) {
+        index -= 1;
+        if (std.mem.startsWith(u8, history_items[index], prefix)) return index;
+    }
+    return null;
+}
+
+fn nextHistoryMatch(prefix: []const u8, after: usize) ?usize {
+    var index = after + 1;
+    while (index < history_count) : (index += 1) {
+        if (std.mem.startsWith(u8, history_items[index], prefix)) return index;
+    }
+    return null;
+}
 
 /// Load persisted prompt history (JSON string per line) and enable
 /// appends for this session. Best-effort: any failure leaves history
@@ -1206,10 +1714,52 @@ fn takeByteOrNull(reader: *Io.Reader) !?u8 {
     }
 }
 
+const escape_sequence_timeout_ms = 40;
+
+fn takeByteWithin(reader: *Io.Reader, timeout_ms: i32) !?u8 {
+    if (reader.bufferedLen() > 0) return try takeByteOrNull(reader);
+    var descriptors = [_]std.posix.pollfd{.{
+        .fd = Io.File.stdin().handle,
+        .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR,
+        .revents = 0,
+    }};
+    if (try std.posix.poll(&descriptors, timeout_ms) == 0) return null;
+    return try takeByteOrNull(reader);
+}
+
+fn takeSequenceByte(reader: *Io.Reader, stop: ?*const std.atomic.Value(bool)) !?u8 {
+    if (stop) |flag| if (flag.load(.acquire)) return null;
+    if (!interactive) return takeByteOrNull(reader);
+    return takeByteWithin(reader, escape_sequence_timeout_ms);
+}
+
+/// Bracketed paste can legitimately arrive in chunks, so it has no short
+/// escape timeout. Polling still gives BusyInput.stop() a bounded wakeup and
+/// distinguishes an open-but-idle terminal from EOF.
+fn takeByteStopping(reader: *Io.Reader, stop: ?*const std.atomic.Value(bool)) !?u8 {
+    const flag = stop orelse return takeByteOrNull(reader);
+    if (!interactive) {
+        if (flag.load(.acquire)) return null;
+        return takeByteOrNull(reader);
+    }
+    while (true) {
+        if (flag.load(.acquire)) return null;
+        if (reader.bufferedLen() > 0) return takeByteOrNull(reader);
+        var descriptors = [_]std.posix.pollfd{.{
+            .fd = Io.File.stdin().handle,
+            .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR,
+            .revents = 0,
+        }};
+        if (try std.posix.poll(&descriptors, 100) == 0) continue;
+        return takeByteOrNull(reader);
+    }
+}
+
 const InputEvent = union(enum) {
     byte: u8,
     resize,
     end,
+    stop,
 };
 
 const ResizeWait = struct {
@@ -1227,9 +1777,10 @@ const ResizeWait = struct {
     /// Polling gives resize-only activity a foreground wakeup without ever
     /// drawing from a signal handler. The SIGWINCH worker handles silent
     /// provider and tool waits; input owns its line contents and redraws here.
-    fn next(self: *ResizeWait, reader: *Io.Reader) !InputEvent {
+    fn next(self: *ResizeWait, reader: *Io.Reader, stop: ?*const std.atomic.Value(bool)) !InputEvent {
         if (!interactive) return if (try takeByteOrNull(reader)) |byte| .{ .byte = byte } else .end;
         while (true) {
+            if (stop) |flag| if (flag.load(.acquire)) return .stop;
             if (reader.bufferedLen() > 0) return .{ .byte = (try takeByteOrNull(reader)).? };
             var descriptors = [_]std.posix.pollfd{.{
                 .fd = Io.File.stdin().handle,
@@ -1239,6 +1790,7 @@ const ResizeWait = struct {
             if (try std.posix.poll(&descriptors, 100) > 0) {
                 return if (try takeByteOrNull(reader)) |byte| .{ .byte = byte } else .end;
             }
+            if (tui.expireStartupHint()) return .resize;
             const next_size = term.windowSizeRaw();
             if (!sameSize(self.size, next_size)) {
                 self.size = next_size;
@@ -1246,6 +1798,168 @@ const ResizeWait = struct {
                 return .resize;
             }
         }
+    }
+};
+
+/// Owns the terminal editor while an interactive exchange is running. The
+/// agent thread only drains completed lines at protocol-safe boundaries; it
+/// never reads a buffer that the editor is still mutating.
+pub const BusyInput = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    reader: *Io.Reader,
+    output: *Io.Writer,
+    suggestions: []const Suggestion,
+    paths: ?PathContext,
+    mutex: Io.Mutex = .init,
+    steering: std.ArrayList([]u8) = .empty,
+    follow_ups: std.ArrayList([]u8) = .empty,
+    draft: ?[]u8 = null,
+    failure: ?anyerror = null,
+    stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    eof_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    future: ?Io.Future(void) = null,
+
+    pub fn init(gpa: std.mem.Allocator, io: Io, reader: *Io.Reader, output: *Io.Writer, suggestions: []const Suggestion, paths: ?PathContext) BusyInput {
+        return .{
+            .gpa = gpa,
+            .io = io,
+            .reader = reader,
+            .output = output,
+            .suggestions = suggestions,
+            .paths = paths,
+        };
+    }
+
+    pub fn deinit(self: *BusyInput) void {
+        self.stop() catch {};
+        for (self.steering.items) |line| {
+            discardClipboardImagesInText(self.paths, line);
+            self.gpa.free(line);
+        }
+        for (self.follow_ups.items) |line| {
+            discardClipboardImagesInText(self.paths, line);
+            self.gpa.free(line);
+        }
+        self.steering.deinit(self.gpa);
+        self.follow_ups.deinit(self.gpa);
+        if (self.draft) |draft| {
+            discardClipboardImagesInText(self.paths, draft);
+            self.gpa.free(draft);
+        }
+        tui.noteQueue(0, 0);
+    }
+
+    pub fn start(self: *BusyInput) !void {
+        if (self.future != null or self.eof_flag.load(.acquire)) return;
+        self.stop_flag.store(false, .release);
+        self.failure = null;
+        self.future = try self.io.concurrent(busyLoop, .{self});
+    }
+
+    pub fn stop(self: *BusyInput) !void {
+        self.stop_flag.store(true, .release);
+        var future = self.future orelse return;
+        self.future = null;
+        future.await(self.io);
+        if (self.failure) |err| {
+            self.failure = null;
+            return err;
+        }
+    }
+
+    pub fn take(self: *BusyInput, kind: SubmissionKind) ?[]u8 {
+        self.mutex.lockUncancelable(self.io);
+        const line = switch (kind) {
+            .steer => if (self.steering.items.len > 0) self.steering.orderedRemove(0) else null,
+            .follow_up => if (self.follow_ups.items.len > 0) self.follow_ups.orderedRemove(0) else null,
+        };
+        const steering_count = self.steering.items.len;
+        const follow_up_count = self.follow_ups.items.len;
+        self.mutex.unlock(self.io);
+        tui.noteQueue(steering_count, follow_up_count);
+        return line;
+    }
+
+    pub fn takeDraft(self: *BusyInput) ?[]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const result = self.draft;
+        self.draft = null;
+        return result;
+    }
+
+    pub fn ended(self: *const BusyInput) bool {
+        return self.eof_flag.load(.acquire);
+    }
+
+    fn busyLoop(self: *BusyInput) void {
+        while (!self.stop_flag.load(.acquire)) {
+            var stopped_draft: ?[]u8 = null;
+            const initial = self.takeDraft();
+            const result = physicalLine(self.gpa, self.reader, self.output, self.suggestions, self.paths, initial, .{
+                .busy = true,
+                .stop = &self.stop_flag,
+                .draft = &stopped_draft,
+            }) catch |err| {
+                if (initial) |draft| self.gpa.free(draft);
+                self.setFailure(err);
+                return;
+            };
+            if (initial) |draft| self.gpa.free(draft);
+            if (result) |submission| {
+                if (submission.text.len == 0) {
+                    self.gpa.free(submission.text);
+                    continue;
+                }
+                historyPush(self.gpa, submission.text);
+                const kind: SubmissionKind = if (submission.text[0] == '/' or submission.text[0] == '!') .follow_up else submission.kind;
+                self.enqueue(kind, @constCast(submission.text)) catch |err| {
+                    discardClipboardImagesInText(self.paths, submission.text);
+                    self.gpa.free(submission.text);
+                    self.setFailure(err);
+                    return;
+                };
+                continue;
+            }
+            if (stopped_draft) |draft| self.setDraft(draft);
+            if (!self.stop_flag.load(.acquire)) self.eof_flag.store(true, .release);
+            return;
+        }
+    }
+
+    fn enqueue(self: *BusyInput, kind: SubmissionKind, line: []u8) !void {
+        self.mutex.lockUncancelable(self.io);
+        switch (kind) {
+            .steer => self.steering.append(self.gpa, line) catch |err| {
+                self.mutex.unlock(self.io);
+                return err;
+            },
+            .follow_up => self.follow_ups.append(self.gpa, line) catch |err| {
+                self.mutex.unlock(self.io);
+                return err;
+            },
+        }
+        const steering_count = self.steering.items.len;
+        const follow_up_count = self.follow_ups.items.len;
+        self.mutex.unlock(self.io);
+        tui.noteQueue(steering_count, follow_up_count);
+    }
+
+    fn setDraft(self: *BusyInput, value: []u8) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (self.draft) |old| {
+            discardClipboardImagesInText(self.paths, old);
+            self.gpa.free(old);
+        }
+        self.draft = value;
+    }
+
+    fn setFailure(self: *BusyInput, err: anyerror) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.failure = err;
     }
 };
 
@@ -1307,12 +2021,18 @@ const RawMode = struct {
 };
 
 test "popup follows a short slash word only" {
-    try std.testing.expect(popupActive("/"));
-    try std.testing.expect(popupActive("/mo"));
-    try std.testing.expect(!popupActive(""));
-    try std.testing.expect(!popupActive("hello"));
-    try std.testing.expect(!popupActive("/model x"));
-    try std.testing.expect(!popupActive("/" ++ "a" ** popup_line_max));
+    try std.testing.expect(slashPopupActive("/"));
+    try std.testing.expect(slashPopupActive("/mo"));
+    try std.testing.expect(!slashPopupActive(""));
+    try std.testing.expect(!slashPopupActive("hello"));
+    try std.testing.expect(!slashPopupActive("/model x"));
+    try std.testing.expect(!slashPopupActive("/" ++ "a" ** popup_line_max));
+}
+
+test "history navigation keeps arrows when recall opens the popup" {
+    try std.testing.expect(popupHandlesArrows(true, null));
+    try std.testing.expect(!popupHandlesArrows(true, 3));
+    try std.testing.expect(!popupHandlesArrows(false, null));
 }
 
 test "suggestion matching walks names and aliases in order" {
@@ -1338,6 +2058,88 @@ test "fill writes the command word" {
     try std.testing.expectEqualStrings("/exit", buffer.items);
 }
 
+test "file queries distinguish at search from path prefixes" {
+    const at = fileQuery("inspect @src/ag", "inspect @src/ag".len).?;
+    try std.testing.expect(at.at);
+    try std.testing.expectEqualStrings("src/ag", at.text);
+
+    const path = fileQuery("read src/agent", "read src/agent".len).?;
+    try std.testing.expect(!path.at);
+    try std.testing.expectEqualStrings("src/agent", path.text);
+    try std.testing.expect(fileQuery("visit https://example.com", "visit https://example.com".len) == null);
+    try std.testing.expect(fileQuery("ordinary", "ordinary".len) == null);
+
+    try std.testing.expect(fileMatches("src/agent.zig", .{ .start = 0, .end = 4, .text = "agz", .at = true }));
+    try std.testing.expect(!fileMatches("src/agent.zig", .{ .start = 0, .end = 3, .text = "za", .at = true }));
+}
+
+test "empty editor input does not submit" {
+    try std.testing.expect(submissionText("", false) == null);
+    try std.testing.expect(submissionText(" \t\r\n", false) == null);
+    try std.testing.expectEqualStrings("hello", submissionText("  hello \n", false).?);
+    try std.testing.expectEqualStrings("", submissionText("", true).?);
+}
+
+test "clipboard temp tracking drops paths removed from a draft" {
+    const kept = "/tmp/xaq-clipboard-0123456789abcdef01234567.png";
+    const removed = "/tmp/xaq-clipboard-fedcba987654321001234567.jpg";
+    var known: std.ArrayList([]u8) = .empty;
+    defer {
+        for (known.items) |path| std.testing.allocator.free(path);
+        known.deinit(std.testing.allocator);
+    }
+
+    try noteClipboardImagePaths(std.testing.allocator, "compare @" ++ kept ++ " @" ++ removed, &known);
+    try std.testing.expectEqual(@as(usize, 2), known.items.len);
+    discardUnusedClipboardImages(std.testing.allocator, null, "compare @" ++ kept, &known);
+    try std.testing.expectEqual(@as(usize, 1), known.items.len);
+    try std.testing.expectEqualStrings(kept, known.items[0]);
+}
+
+test "path completion replaces its token and escapes spaces" {
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(std.testing.allocator);
+    try buffer.appendSlice(std.testing.allocator, "inspect @src/ag");
+    var cursor = buffer.items.len;
+    const query = fileQuery(buffer.items, cursor).?;
+
+    try fillPath(std.testing.allocator, &buffer, &cursor, query, "src/agent notes.zig");
+
+    try std.testing.expectEqualStrings("inspect @src/agent\\ notes.zig ", buffer.items);
+    try std.testing.expectEqual(buffer.items.len, cursor);
+}
+
+test "file index is capped to project files and skips build caches" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path});
+    defer std.testing.allocator.free(root);
+    const source_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "src" });
+    defer std.testing.allocator.free(source_dir);
+    const git_dir = try std.fs.path.join(std.testing.allocator, &.{ root, ".git" });
+    defer std.testing.allocator.free(git_dir);
+    try Io.Dir.cwd().createDirPath(std.testing.io, source_dir);
+    try Io.Dir.cwd().createDirPath(std.testing.io, git_dir);
+    const source_path = try std.fs.path.join(std.testing.allocator, &.{ source_dir, "main.zig" });
+    defer std.testing.allocator.free(source_path);
+    const hidden_path = try std.fs.path.join(std.testing.allocator, &.{ git_dir, "config" });
+    defer std.testing.allocator.free(hidden_path);
+    try Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = source_path, .data = "pub fn main() void {}" });
+    try Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = hidden_path, .data = "secret" });
+
+    var index: FileIndex = .{ .gpa = std.testing.allocator, .context = .{ .io = std.testing.io, .cwd = root } };
+    defer index.deinit();
+    try index.ensureLoaded();
+
+    try std.testing.expect(indexedPath(index.items.items, "src/main.zig"));
+    try std.testing.expect(!indexedPath(index.items.items, ".git/config"));
+}
+
+fn indexedPath(paths: []const []const u8, wanted: []const u8) bool {
+    for (paths) |path| if (std.mem.eql(u8, path, wanted)) return true;
+    return false;
+}
+
 test "bracketed paste grows beyond the old editor buffer and inserts once" {
     const paste_len = 64 * 1024;
     const terminator = "\x1b[201~";
@@ -1351,7 +2153,7 @@ test "bracketed paste grows beyond the old editor buffer and inserts once" {
     try buffer.appendSlice(std.testing.allocator, "tail");
     var cursor: usize = 0;
 
-    try std.testing.expect(try pasteInto(std.testing.allocator, &buffer, &cursor, &reader));
+    try std.testing.expect(try pasteInto(std.testing.allocator, &buffer, &cursor, &reader, null));
     try std.testing.expectEqual(paste_len, cursor);
     try std.testing.expectEqual(paste_len + "tail".len, buffer.items.len);
     try std.testing.expectEqualStrings("tail", buffer.items[paste_len..]);
@@ -1363,7 +2165,7 @@ test "bracketed paste normalizes line endings and control bytes" {
     defer buffer.deinit(std.testing.allocator);
     var cursor: usize = 0;
 
-    try std.testing.expect(try pasteInto(std.testing.allocator, &buffer, &cursor, &reader));
+    try std.testing.expect(try pasteInto(std.testing.allocator, &buffer, &cursor, &reader, null));
     try std.testing.expectEqualStrings("a\nb c", buffer.items);
 }
 
@@ -1376,7 +2178,7 @@ test "bracketed paste consumes excess input and reports the hard limit" {
     @memset(buffer.items, 'z');
     var cursor = buffer.items.len;
 
-    try std.testing.expect(!try pasteInto(std.testing.allocator, &buffer, &cursor, &reader));
+    try std.testing.expect(!try pasteInto(std.testing.allocator, &buffer, &cursor, &reader, null));
     try std.testing.expectEqual(max_input_bytes, buffer.items.len);
     try std.testing.expectEqualStrings("ab", buffer.items[buffer.items.len - 2 ..]);
     try std.testing.expectEqual(source.len, reader.seek);
@@ -1400,6 +2202,12 @@ test "window start keeps the cursor visible" {
     try std.testing.expectEqual(60, windowStart(100, 100, 40));
     try std.testing.expectEqual(10, windowStart(100, 50, 40));
     try std.testing.expectEqual(0, windowStart(100, 50, 0));
+}
+
+test "inline dimensions reject zero-valued tty measurements" {
+    try std.testing.expectEqual(@as(usize, 80), usableDimension(0, 80));
+    try std.testing.expectEqual(@as(usize, 24), usableDimension(0, 24));
+    try std.testing.expectEqual(@as(usize, 132), usableDimension(132, 80));
 }
 
 test "byteAtColumn walks code points" {
@@ -1430,6 +2238,20 @@ test "editor window never exceeds odd budgets with wide text" {
     const hidden = try writeWindow(&zero.writer, text, 0, 0);
     try std.testing.expectEqual(@as(usize, 0), hidden.used);
     try std.testing.expectEqualStrings("", zero.written());
+}
+
+test "inline cleanup erases only its temporary rows" {
+    var block_storage: [64]u8 = undefined;
+    var block: Io.Writer = .fixed(&block_storage);
+    try clearInlineBlock(&block, 3);
+    try std.testing.expectEqualStrings("\r\x1b[2K\r\n\r\x1b[2K\r\n\r\x1b[2K\x1b[2A\r", block.buffered());
+    try std.testing.expect(std.mem.indexOf(u8, block.buffered(), "\x1b[J") == null);
+
+    var popup_storage: [64]u8 = undefined;
+    var popup: Io.Writer = .fixed(&popup_storage);
+    try clearInlinePopup(&popup, 2);
+    try std.testing.expectEqualStrings("\r\n\x1b[2K\r\n\x1b[2K\x1b[2A\r", popup.buffered());
+    try std.testing.expect(std.mem.indexOf(u8, popup.buffered(), "\x1b[J") == null);
 }
 
 test "word boundaries for ctrl-w and alt-b/f" {
@@ -1473,8 +2295,65 @@ test "history stores, dedupes, and caps" {
     try std.testing.expectEqual(history_max, history_count);
 }
 
+test "history navigation filters by draft and moves in both directions" {
+    const gpa = std.testing.allocator;
+    defer historyClear(gpa);
+    historyPush(gpa, "build");
+    historyPush(gpa, "test input");
+    historyPush(gpa, "build release");
+    historyPush(gpa, "status");
+
+    try std.testing.expectEqual(@as(?usize, 2), previousHistoryMatch("build", history_count));
+    try std.testing.expectEqual(@as(?usize, 0), previousHistoryMatch("build", 2));
+    try std.testing.expectEqual(@as(?usize, null), previousHistoryMatch("missing", history_count));
+    try std.testing.expectEqual(@as(?usize, 2), nextHistoryMatch("build", 0));
+    try std.testing.expectEqual(@as(?usize, null), nextHistoryMatch("build", 2));
+    try std.testing.expectEqual(@as(?usize, 1), previousHistoryMatch("", 2));
+}
+
 test "odd trailing backslash continues" {
     try std.testing.expect(continues("one\\"));
     try std.testing.expect(!continues("one\\\\"));
     try std.testing.expect(!continues("one"));
+}
+
+test "busy input keeps steering and follow-ups in separate FIFO queues" {
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var reader = Io.Reader.fixed("");
+    var output_storage: [1]u8 = undefined;
+    var output: Io.Writer = .fixed(&output_storage);
+    var busy = BusyInput.init(gpa, io, &reader, &output, &.{}, null);
+    defer busy.deinit();
+
+    try busy.enqueue(.steer, try gpa.dupe(u8, "first"));
+    try busy.enqueue(.follow_up, try gpa.dupe(u8, "later"));
+    try busy.enqueue(.steer, try gpa.dupe(u8, "second"));
+
+    const first = busy.take(.steer).?;
+    defer gpa.free(first);
+    const second = busy.take(.steer).?;
+    defer gpa.free(second);
+    const later = busy.take(.follow_up).?;
+    defer gpa.free(later);
+    try std.testing.expectEqualStrings("first", first);
+    try std.testing.expectEqualStrings("second", second);
+    try std.testing.expectEqualStrings("later", later);
+    try std.testing.expect(busy.take(.steer) == null);
+    try std.testing.expect(busy.take(.follow_up) == null);
+}
+
+test "busy escape and paste continuations honor stop requests" {
+    var stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(true);
+    var reader = Io.Reader.fixed("unread");
+    try std.testing.expectEqual(@as(?u8, null), try takeSequenceByte(&reader, &stop));
+
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(std.testing.allocator);
+    var cursor: usize = 0;
+    try std.testing.expect(try pasteInto(std.testing.allocator, &buffer, &cursor, &reader, &stop));
+    try std.testing.expectEqual(@as(usize, 0), buffer.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cursor);
 }

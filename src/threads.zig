@@ -15,6 +15,14 @@ pub const Thread = struct {
         self.* = undefined;
     }
 
+    /// Remove a newly created thread that was never installed into a live
+    /// session. Deletion is best-effort because the original operation's
+    /// failure must remain the reported error.
+    pub fn discard(self: *Thread) void {
+        Io.Dir.cwd().deleteFile(self.io, self.path) catch {};
+        self.deinit();
+    }
+
     pub fn appendEntry(self: *Thread, entry: types.Entry) !void {
         var out: Io.Writer.Allocating = .init(self.gpa);
         defer out.deinit();
@@ -64,9 +72,13 @@ pub const Thread = struct {
     fn writeEntryLine(js: *std.json.Stringify, writer: *Io.Writer, entry: types.Entry) !void {
         try js.beginObject();
         switch (entry) {
-            .user => |text| {
+            .user => |user| {
                 try field(js, "type", "user");
-                try field(js, "text", text);
+                try field(js, "text", user.text);
+                if (user.images.len > 0) {
+                    try js.objectField("images");
+                    try js.write(user.images);
+                }
             },
             .assistant => |answer| {
                 try field(js, "type", "assistant");
@@ -198,6 +210,7 @@ fn listDir(gpa: std.mem.Allocator, io: Io, dir_path: []const u8, exclude_id: ?[]
 // but typically far smaller) still yields a parseable preview line.
 const preview_scan_bytes = 64 * 1024;
 const preview_max_bytes = 48;
+const max_thread_line_bytes = 64 * 1024 * 1024;
 
 fn firstUserPreview(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, id: []const u8) ![]u8 {
     var name_buffer: [64]u8 = undefined;
@@ -217,6 +230,7 @@ fn firstUserPreview(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, id: []const u8)
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
+        if (previewFromUserLine(gpa, line)) |preview| return preview;
         var parsed = std.json.parseFromSlice(std.json.Value, gpa, line, .{}) catch continue;
         defer parsed.deinit();
         const kind = objectString(parsed.value, "type") orelse continue;
@@ -230,6 +244,60 @@ fn firstUserPreview(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, id: []const u8)
         return out;
     }
     return gpa.alloc(u8, 0);
+}
+
+/// User text is serialized before image payloads, so a bounded prefix can
+/// produce the picker preview without reading or parsing a multi-megabyte
+/// attachment line.
+fn previewFromUserLine(gpa: std.mem.Allocator, line: []const u8) ?[]u8 {
+    const prefix = "{\"type\":\"user\",\"text\":\"";
+    if (!std.mem.startsWith(u8, line, prefix)) return null;
+    var out = gpa.alloc(u8, preview_max_bytes) catch return null;
+    var source = prefix.len;
+    var destination: usize = 0;
+    while (source < line.len and destination < out.len) {
+        var byte = line[source];
+        source += 1;
+        if (byte == '"') break;
+        if (byte == '\\') {
+            if (source >= line.len) break;
+            byte = line[source];
+            source += 1;
+            byte = switch (byte) {
+                '"', '\\', '/' => byte,
+                'b', 'f', 'n', 'r', 't' => ' ',
+                // Non-ASCII JSON escapes are rare in persisted prompts; a
+                // replacement keeps the preview valid without consuming a
+                // partial surrogate pair from the bounded prefix.
+                'u' => blk: {
+                    source = @min(source + 4, line.len);
+                    break :blk '?';
+                },
+                else => '?',
+            };
+        }
+        if (byte == '\n' or byte == '\r') break;
+        out[destination] = if (byte < 0x20 or byte == 0x7f) ' ' else byte;
+        destination += 1;
+    }
+    while (destination > 0 and !std.unicode.utf8ValidateSlice(out[0..destination])) destination -= 1;
+    const result = gpa.dupe(u8, out[0..destination]) catch {
+        gpa.free(out);
+        return null;
+    };
+    gpa.free(out);
+    return result;
+}
+
+fn nextThreadLine(reader: *Io.Reader, out: *Io.Writer.Allocating) !?[]const u8 {
+    out.clearRetainingCapacity();
+    const count = try reader.streamDelimiterLimit(&out.writer, '\n', .limited(max_thread_line_bytes + 1));
+    const separator = reader.takeByte() catch |err| switch (err) {
+        error.EndOfStream => return if (count == 0) null else out.written(),
+        else => return err,
+    };
+    std.debug.assert(separator == '\n');
+    return out.written();
 }
 
 fn newestFirst(_: void, a: Summary, b: Summary) bool {
@@ -290,8 +358,12 @@ pub fn load(gpa: std.mem.Allocator, entry_gpa: std.mem.Allocator, io: Io, home: 
     defer gpa.free(filename);
     const path = try std.fs.path.join(gpa, &.{ dir_path, filename });
     errdefer gpa.free(path);
-    const bytes = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024 * 1024));
-    defer gpa.free(bytes);
+    var file = try Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var read_buffer: [16 * 1024]u8 = undefined;
+    var file_reader: Io.File.Reader = .init(file, io, &read_buffer);
+    var line_buffer: Io.Writer.Allocating = .init(gpa);
+    defer line_buffer.deinit();
 
     var provider: ?auth.Provider = null;
     var model: ?[]const u8 = null;
@@ -299,18 +371,14 @@ pub fn load(gpa: std.mem.Allocator, entry_gpa: std.mem.Allocator, io: Io, home: 
     var fast = false;
     var entries: std.ArrayList(types.Entry) = .empty;
     errdefer entries.deinit(entry_gpa);
-    var last_reset_offset: usize = 0;
-    var scan_offset: usize = 0;
-    var scan = std.mem.splitScalar(u8, bytes, '\n');
-    while (scan.next()) |line| {
-        scan_offset += line.len + @intFromBool(scan_offset + line.len < bytes.len);
-        if (std.mem.eql(u8, line, "{\"type\":\"reset\"}")) last_reset_offset = scan_offset;
+    var last_reset_offset: u64 = 0;
+    while (try nextThreadLine(&file_reader.interface, &line_buffer)) |line| {
+        if (std.mem.eql(u8, line, "{\"type\":\"reset\"}")) last_reset_offset = file_reader.logicalPos();
     }
-    var line_offset: usize = 0;
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |line| {
-        const this_offset = line_offset;
-        line_offset += line.len + @intFromBool(line_offset + line.len < bytes.len);
+    try file_reader.seekTo(0);
+    while (true) {
+        const this_offset = file_reader.logicalPos();
+        const line = (try nextThreadLine(&file_reader.interface, &line_buffer)) orelse break;
         if (line.len == 0) continue;
         var parsed = std.json.parseFromSlice(std.json.Value, gpa, line, .{}) catch continue;
         defer parsed.deinit();
@@ -330,7 +398,10 @@ pub fn load(gpa: std.mem.Allocator, entry_gpa: std.mem.Allocator, io: Io, home: 
             entries.clearRetainingCapacity();
         } else if (std.mem.eql(u8, kind, "user")) {
             if (this_offset < last_reset_offset) continue;
-            try entries.append(entry_gpa, .{ .user = try entry_gpa.dupe(u8, objectString(parsed.value, "text") orelse "") });
+            try entries.append(entry_gpa, .{ .user = .{
+                .text = try entry_gpa.dupe(u8, objectString(parsed.value, "text") orelse ""),
+                .images = try parseImages(entry_gpa, parsed.value),
+            } });
         } else if (std.mem.eql(u8, kind, "assistant")) {
             if (this_offset < last_reset_offset) continue;
             try entries.append(entry_gpa, .{ .assistant = try parseAssistant(entry_gpa, parsed.value) });
@@ -394,6 +465,21 @@ fn parseAssistant(gpa: std.mem.Allocator, value: std.json.Value) !types.Assistan
         .raw_items = raw_items,
         .usage = usage,
     };
+}
+
+fn parseImages(gpa: std.mem.Allocator, value: std.json.Value) ![]const types.Image {
+    const images_value = objectValue(value, "images") orelse return &.{};
+    const items = switch (images_value) {
+        .array => |array| array.items,
+        else => return error.InvalidThread,
+    };
+    const images = try gpa.alloc(types.Image, items.len);
+    for (items, 0..) |image, index| images[index] = .{
+        .name = try gpa.dupe(u8, objectString(image, "name") orelse "image"),
+        .media_type = try gpa.dupe(u8, objectString(image, "media_type") orelse return error.InvalidThread),
+        .data = try gpa.dupe(u8, objectString(image, "data") orelse return error.InvalidThread),
+    };
+    return images;
 }
 
 fn parseResults(gpa: std.mem.Allocator, value: std.json.Value) ![]const types.ToolResult {
@@ -529,6 +615,19 @@ test "thread IDs cannot escape their directory" {
     try std.testing.expect(!validId("too-short"));
 }
 
+test "discard removes an uninstalled thread file" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const home = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path});
+    defer std.testing.allocator.free(home);
+    var thread = try create(std.testing.allocator, std.testing.io, home, "/work/discard", .chatgpt, "model-a", null, false);
+    const path = try std.testing.allocator.dupe(u8, thread.path);
+    defer std.testing.allocator.free(path);
+
+    thread.discard();
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().openFile(std.testing.io, path, .{}));
+}
+
 test "thread JSONL resumes state after the last reset" {
     var temporary = std.testing.tmpDir(.{});
     defer temporary.cleanup();
@@ -544,9 +643,9 @@ test "thread JSONL resumes state after the last reset" {
         defer initial.thread.deinit();
         try std.testing.expect(initial.fast);
     }
-    try thread.appendEntry(.{ .user = "old" });
+    try thread.appendEntry(.{ .user = .{ .text = "old" } });
     try thread.appendReset();
-    try thread.appendEntry(.{ .user = "new" });
+    try thread.appendEntry(.{ .user = .{ .text = "new" } });
     try thread.appendFast(false);
     const summaries = try list(std.testing.allocator, std.testing.io, home, "/work/project", null, 8);
     defer freeSummaries(std.testing.allocator, summaries);
@@ -567,5 +666,57 @@ test "thread JSONL resumes state after the last reset" {
     try std.testing.expectEqualStrings("high", loaded.effort.?);
     try std.testing.expect(!loaded.fast);
     try std.testing.expectEqual(@as(usize, 1), loaded.entries.items.len);
-    try std.testing.expectEqualStrings("new", loaded.entries.items[0].user);
+    try std.testing.expectEqualStrings("new", loaded.entries.items[0].user.text);
+}
+
+test "thread JSONL persists image content" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const home = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path});
+    defer std.testing.allocator.free(home);
+    var thread = try create(std.testing.allocator, std.testing.io, home, "/work/images", .chatgpt, "model-a", null, false);
+    defer thread.deinit();
+    const id = try std.testing.allocator.dupe(u8, thread.id);
+    defer std.testing.allocator.free(id);
+    const image_data = try std.testing.allocator.alloc(u8, preview_scan_bytes + 1024);
+    defer std.testing.allocator.free(image_data);
+    @memset(image_data, 'A');
+    const image: types.Image = .{ .name = "shot.png", .media_type = "image/png", .data = image_data };
+    try thread.appendEntry(.{ .user = .{ .text = "look", .images = &.{image} } });
+
+    const summaries = try list(std.testing.allocator, std.testing.io, home, "/work/images", null, 8);
+    defer freeSummaries(std.testing.allocator, summaries);
+    try std.testing.expectEqualStrings("look", summaries[0].preview);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var loaded = try load(std.testing.allocator, arena.allocator(), std.testing.io, home, "/work/images", id, null);
+    defer loaded.thread.deinit();
+    const user = loaded.entries.items[0].user;
+    try std.testing.expectEqualStrings("look", user.text);
+    try std.testing.expectEqual(@as(usize, 1), user.images.len);
+    try std.testing.expectEqualStrings("image/png", user.images[0].media_type);
+    try std.testing.expectEqualStrings(image_data, user.images[0].data);
+}
+
+test "thread loader streams files larger than the former aggregate cap" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const home = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path});
+    defer std.testing.allocator.free(home);
+    var thread = try create(std.testing.allocator, std.testing.io, home, "/work/large-thread", .chatgpt, "model-a", null, false);
+    defer thread.deinit();
+    const padding = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(padding);
+    @memset(padding, ' ');
+    padding[padding.len - 1] = '\n';
+    for (0..65) |_| try append(std.testing.io, thread.path, padding);
+    try thread.appendEntry(.{ .user = .{ .text = "still resumable" } });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var loaded = try load(std.testing.allocator, arena.allocator(), std.testing.io, home, "/work/large-thread", thread.id, null);
+    defer loaded.thread.deinit();
+    try std.testing.expectEqual(@as(usize, 1), loaded.entries.items.len);
+    try std.testing.expectEqualStrings("still resumable", loaded.entries.items[0].user.text);
 }

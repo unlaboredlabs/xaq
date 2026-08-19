@@ -17,6 +17,18 @@ pub const Usage = struct {
     output: u64 = 0,
 };
 
+pub const Image = struct {
+    name: []const u8,
+    media_type: []const u8,
+    /// Standard base64 without a data-URL prefix.
+    data: []const u8,
+};
+
+pub const User = struct {
+    text: []const u8,
+    images: []const Image = &.{},
+};
+
 pub const Assistant = struct {
     text: []const u8,
     calls: []const ToolCall,
@@ -25,7 +37,7 @@ pub const Assistant = struct {
 };
 
 pub const Entry = union(enum) {
-    user: []const u8,
+    user: User,
     assistant: Assistant,
     results: []const ToolResult,
 };
@@ -33,7 +45,10 @@ pub const Entry = union(enum) {
 pub fn approximateBytes(entries: []const Entry) usize {
     var total: usize = 0;
     for (entries) |entry| switch (entry) {
-        .user => |text| total += text.len,
+        .user => |user| {
+            total += user.text.len;
+            for (user.images) |image| total += image.name.len + image.media_type.len + image.data.len;
+        },
         .assistant => |answer| {
             total += answer.text.len;
             for (answer.calls) |call| total += call.id.len + call.name.len + call.arguments.len;
@@ -52,7 +67,13 @@ pub fn approximateBytes(entries: []const Entry) usize {
 pub fn approximateTokens(entries: []const Entry) usize {
     var total: usize = 0;
     for (entries) |entry| switch (entry) {
-        .user => |text| total += tokenEstimate(text.len, 4),
+        .user => |user| {
+            total += tokenEstimate(user.text.len, 4);
+            // Exact vision token use depends on provider-side resizing and
+            // tiling. Count a conservative fixed amount without treating
+            // base64 transport bytes as prompt text.
+            total += user.images.len * 2048;
+        },
         .assistant => |answer| {
             if (answer.raw_items.len > 0) {
                 for (answer.raw_items) |raw| total += tokenEstimate(raw.len, 2);
@@ -74,7 +95,7 @@ fn tokenEstimate(bytes: usize, divisor: usize) usize {
 
 test "approximate conversation size includes nested values" {
     const entries = [_]Entry{
-        .{ .user = "abc" },
+        .{ .user = .{ .text = "abc" } },
         .{ .assistant = .{ .text = "de", .calls = &.{.{ .id = "f", .name = "g", .arguments = "{}" }} } },
         .{ .results = &.{.{ .id = "f", .text = "h" }} },
     };

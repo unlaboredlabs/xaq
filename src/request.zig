@@ -91,7 +91,7 @@ pub fn build(gpa: std.mem.Allocator, provider: auth.Provider, model: []const u8,
             try js.endObject();
         }
         try js.objectField("input");
-        try writeResponsesInput(&js, entries, if (provider == .grok) system else null, null);
+        try writeResponsesInput(gpa, &js, entries, if (provider == .grok) system else null, null);
         try js.objectField("tools");
         try tools.schemasWithOptions(&js, tool_options);
         try js.objectField("tool_choice");
@@ -172,13 +172,13 @@ pub fn buildCompact(gpa: std.mem.Allocator, provider: auth.Provider, model: []co
             try js.endObject();
         }
         try js.objectField("input");
-        try writeResponsesInput(&js, entries, if (provider == .grok) compact_system else null, compact_prompt);
+        try writeResponsesInput(gpa, &js, entries, if (provider == .grok) compact_system else null, compact_prompt);
     }
     try js.endObject();
     return out.toOwnedSlice();
 }
 
-fn writeResponsesInput(js: *std.json.Stringify, entries: []const types.Entry, system: ?[]const u8, final_user: ?[]const u8) !void {
+fn writeResponsesInput(gpa: std.mem.Allocator, js: *std.json.Stringify, entries: []const types.Entry, system: ?[]const u8, final_user: ?[]const u8) !void {
     try js.beginArray();
     if (system) |text| {
         try js.beginObject();
@@ -189,18 +189,32 @@ fn writeResponsesInput(js: *std.json.Stringify, entries: []const types.Entry, sy
         try js.endObject();
     }
     for (entries) |entry| switch (entry) {
-        .user => |text| {
+        .user => |user| {
             try js.beginObject();
             try js.objectField("role");
             try js.write("user");
             try js.objectField("content");
             try js.beginArray();
-            try js.beginObject();
-            try js.objectField("type");
-            try js.write("input_text");
-            try js.objectField("text");
-            try js.write(text);
-            try js.endObject();
+            for (user.images) |image| {
+                try js.beginObject();
+                try js.objectField("type");
+                try js.write("input_image");
+                try js.objectField("image_url");
+                const data_url = try std.fmt.allocPrint(gpa, "data:{s};base64,{s}", .{ image.media_type, image.data });
+                defer gpa.free(data_url);
+                try js.write(data_url);
+                try js.objectField("detail");
+                try js.write("auto");
+                try js.endObject();
+            }
+            if (user.text.len > 0 or user.images.len == 0) {
+                try js.beginObject();
+                try js.objectField("type");
+                try js.write("input_text");
+                try js.objectField("text");
+                try js.write(user.text);
+                try js.endObject();
+            }
             try js.endArray();
             try js.endObject();
         },
@@ -269,12 +283,40 @@ fn writeResponsesInput(js: *std.json.Stringify, entries: []const types.Entry, sy
 fn writeClaudeMessages(js: *std.json.Stringify, entries: []const types.Entry, final_user: ?[]const u8) !void {
     try js.beginArray();
     for (entries) |entry| switch (entry) {
-        .user => |text| {
+        .user => |user| {
             try js.beginObject();
             try js.objectField("role");
             try js.write("user");
             try js.objectField("content");
-            try js.write(text);
+            if (user.images.len == 0) {
+                try js.write(user.text);
+            } else {
+                try js.beginArray();
+                for (user.images) |image| {
+                    try js.beginObject();
+                    try js.objectField("type");
+                    try js.write("image");
+                    try js.objectField("source");
+                    try js.beginObject();
+                    try js.objectField("type");
+                    try js.write("base64");
+                    try js.objectField("media_type");
+                    try js.write(image.media_type);
+                    try js.objectField("data");
+                    try js.write(image.data);
+                    try js.endObject();
+                    try js.endObject();
+                }
+                if (user.text.len > 0) {
+                    try js.beginObject();
+                    try js.objectField("type");
+                    try js.write("text");
+                    try js.objectField("text");
+                    try js.write(user.text);
+                    try js.endObject();
+                }
+                try js.endArray();
+            }
             try js.endObject();
         },
         .assistant => |answer| {
@@ -357,4 +399,23 @@ test "custom tools are serialized for both provider contracts" {
     const claude = try build(std.testing.allocator, .claude, "claude-opus-5", null, false, .{ .include_builtin = false, .custom = definitions }, "/work", "", &.{});
     defer std.testing.allocator.free(claude);
     try std.testing.expect(std.mem.indexOf(u8, claude, "\"name\":\"lookup\"") != null);
+}
+
+test "images use each provider's multimodal content blocks" {
+    const image: types.Image = .{ .name = "shot.png", .media_type = "image/png", .data = "aGVsbG8=" };
+    const entries = &.{types.Entry{ .user = .{ .text = "inspect this", .images = &.{image} } }};
+
+    const responses = try build(std.testing.allocator, .chatgpt, "gpt-5.6-sol", null, false, .{ .include_builtin = false }, "/work", "", entries);
+    defer std.testing.allocator.free(responses);
+    try std.testing.expect(std.mem.indexOf(u8, responses, "\"type\":\"input_image\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, responses, "\"image_url\":\"data:image/png;base64,aGVsbG8=\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, responses, "\"text\":\"inspect this\"") != null);
+
+    const grok = try build(std.testing.allocator, .grok, "grok-4.6", null, false, .{ .include_builtin = false }, "/work", "", entries);
+    defer std.testing.allocator.free(grok);
+    try std.testing.expect(std.mem.indexOf(u8, grok, "\"type\":\"input_image\"") != null);
+
+    const claude = try build(std.testing.allocator, .claude, "claude-opus-5", null, false, .{ .include_builtin = false }, "/work", "", entries);
+    defer std.testing.allocator.free(claude);
+    try std.testing.expect(std.mem.indexOf(u8, claude, "\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"aGVsbG8=\"}") != null);
 }

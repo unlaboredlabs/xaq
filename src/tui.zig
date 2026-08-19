@@ -37,6 +37,7 @@ const min_rows = 10;
 const min_cols = 40;
 const edge_margin = 1;
 const status_gap = 1;
+const startup_hint_duration_ns: i96 = 1500 * std.time.ns_per_ms;
 
 var gpa_state: std.mem.Allocator = undefined;
 var sink: *Io.Writer = undefined;
@@ -49,6 +50,9 @@ var resize_future: ?Io.Future(void) = null;
 var old_winch: std.posix.Sigaction = undefined;
 var winch_installed = false;
 var input_active = false;
+var startup_hint_buffer: [48]u8 = undefined;
+var startup_hint_len: usize = 0;
+var startup_hint_deadline_ns: i96 = 0;
 
 var rows: usize = 24;
 var cols: usize = 80;
@@ -81,6 +85,13 @@ var tokens_out: u64 = 0;
 var context_percent: u8 = 0;
 var agents_running: u8 = 0;
 var agents_queued: u8 = 0;
+var steering_queued: u8 = 0;
+var follow_ups_queued: u8 = 0;
+
+// Transcript writes restore this cursor while the concurrent editor owns the
+// fixed input row.
+var input_cursor_row: usize = 0;
+var input_cursor_col: usize = 0;
 
 // Transcript ring of committed lines plus the in-progress partial line.
 // `truncated` marks lines that overflowed the per-line byte budget, so
@@ -148,6 +159,7 @@ fn enterMeasured(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, measured: ?ter
     active = true;
     layout_ready = true;
     layout_dirty = false;
+    startup_hint_len = 0;
     errdefer rollbackEnter();
     try out.writeAll("\x1b[?1049h\x1b[2J");
     try armRegion(out);
@@ -173,18 +185,33 @@ pub fn exit() void {
     // editor's defer and call this cleanup directly.
     sink.writeAll("\x1b[?2004l\x1b[r\x1b[?1049l") catch {};
     sink.flush() catch {};
+    resetTranscriptLocked();
+    activity_len = 0;
+    agents_running = 0;
+    agents_queued = 0;
+    steering_queued = 0;
+    follow_ups_queued = 0;
+    input_active = false;
+    startup_hint_len = 0;
+    layout_ready = false;
+    layout_dirty = false;
+}
+
+fn resetTranscriptLocked() void {
     var i: usize = 0;
     while (i < line_count) : (i += 1) gpa_state.free(lines[(line_start + i) % max_lines]);
     line_start = 0;
     line_count = 0;
     current_len = 0;
     current_truncated = false;
+    cp_pending = 0;
     cp_remaining = 0;
     scroll_offset = 0;
     popup_rows = 0;
     pending_cr = false;
     live_repaint_pending = false;
     esc_state = .text;
+    csi_len = 0;
     display_state = .text;
     display_control_len = 0;
     display_utf8_len = 0;
@@ -192,12 +219,17 @@ pub fn exit() void {
     display_joined = false;
     display_cluster_width = 0;
     display_regional_pending = false;
-    activity_len = 0;
-    agents_running = 0;
-    agents_queued = 0;
-    input_active = false;
-    layout_ready = false;
-    layout_dirty = false;
+}
+
+/// Drop the conversation while keeping the fullscreen chrome and status.
+/// Resume calls this before replaying another thread.
+pub fn clearTranscript() void {
+    if (!active) return;
+    render_mutex.lockUncancelable(io_state);
+    defer render_mutex.unlock(io_state);
+    resetTranscriptLocked();
+    startup_hint_len = 0;
+    if (layout_ready) repaint() catch {};
 }
 
 fn rollbackEnter() void {
@@ -260,6 +292,11 @@ pub fn beginInput() void {
     defer render_mutex.unlock(io_state);
     _ = resizeIfNeededLocked();
     input_active = true;
+    if (layout_ready) {
+        const area = inputArea();
+        input_cursor_row = area.row;
+        input_cursor_col = area.col;
+    }
 }
 
 pub fn endInput() void {
@@ -283,6 +320,23 @@ pub fn drawable() bool {
     return active and layout_ready;
 }
 
+/// Serialize a complete editor repaint with transcript and resize rendering.
+/// The returned value says whether terminal coordinates are currently usable.
+pub fn beginInputFrame() bool {
+    std.debug.assert(active);
+    render_mutex.lockUncancelable(io_state);
+    _ = resizeIfNeededLocked();
+    return layout_ready;
+}
+
+pub fn endInputFrame(row: usize, col: usize) void {
+    if (layout_ready) {
+        input_cursor_row = row;
+        input_cursor_col = col;
+    }
+    render_mutex.unlock(io_state);
+}
+
 /// Editor text area inside the input box: `│ > text │`.
 pub fn inputArea() InputArea {
     std.debug.assert(layout_ready);
@@ -298,10 +352,59 @@ pub fn chromeSink() *Io.Writer {
     return sink;
 }
 
+pub fn setPasteMode(enabled: bool) !void {
+    if (!active) return;
+    render_mutex.lockUncancelable(io_state);
+    defer render_mutex.unlock(io_state);
+    try sink.writeAll(if (enabled) "\x1b[?2004h" else "\x1b[?2004l");
+    try sink.flush();
+}
+
+/// Show a short-lived message where the editor text normally appears.
+/// The foreground editor owns expiry and dismissal once input begins.
+pub fn showStartupHint(text: []const u8) void {
+    if (!active) return;
+    render_mutex.lockUncancelable(io_state);
+    defer render_mutex.unlock(io_state);
+    if (!layout_ready) return;
+    startup_hint_len = copyInto(&startup_hint_buffer, text);
+    startup_hint_deadline_ns = Io.Clock.now(.awake, io_state).nanoseconds + startup_hint_duration_ns;
+    const area = inputArea();
+    sink.print("\x1b7\x1b[{d};{d}H{s}", .{ area.row, area.col, term.dim() }) catch return;
+    writeClipped(sink, startup_hint_buffer[0..startup_hint_len], area.width) catch return;
+    var used = @min(visibleColumns(startup_hint_buffer[0..startup_hint_len]), area.width);
+    while (used < area.width) : (used += 1) sink.writeByte(' ') catch return;
+    sink.print("{s}\x1b8", .{term.reset()}) catch return;
+    sink.flush() catch {};
+}
+
+/// Return the startup message while its display window is open.
+pub fn startupHint() ?[]const u8 {
+    if (expireStartupHint()) return null;
+    return if (startup_hint_len > 0) startup_hint_buffer[0..startup_hint_len] else null;
+}
+
+/// Clear an expired message. True tells the editor to repaint its row.
+pub fn expireStartupHint() bool {
+    if (startup_hint_len == 0) return false;
+    if (Io.Clock.now(.awake, io_state).nanoseconds < startup_hint_deadline_ns) return false;
+    startup_hint_len = 0;
+    return true;
+}
+
+/// Clear the message on the first keypress. The editor repaints afterward.
+pub fn dismissStartupHint() bool {
+    const visible = startup_hint_len > 0;
+    startup_hint_len = 0;
+    return visible;
+}
+
 /// Reposition the physical cursor to the transcript insertion point;
 /// the editor calls this before echoing a submitted prompt.
 pub fn focusRegion() void {
     if (!active or !layout_ready) return;
+    render_mutex.lockUncancelable(io_state);
+    defer render_mutex.unlock(io_state);
     sink.print("\x1b[{d};{d}H", .{ region_row, region_col }) catch {};
     sink.flush() catch {};
 }
@@ -363,6 +466,15 @@ pub fn noteAgents(running: usize, queued: usize) void {
     renderInfoLocked();
 }
 
+pub fn noteQueue(steering: usize, follow_ups: usize) void {
+    if (!active) return;
+    render_mutex.lockUncancelable(io_state);
+    defer render_mutex.unlock(io_state);
+    steering_queued = @intCast(@min(steering, std.math.maxInt(u8)));
+    follow_ups_queued = @intCast(@min(follow_ups, std.math.maxInt(u8)));
+    renderInfoLocked();
+}
+
 /// Static activity label from the spinner facade (`thinking`,
 /// `compacting`, `retrying`, ...); null clears it.
 pub fn setActivity(label: ?[]const u8) void {
@@ -412,7 +524,10 @@ pub fn pageDown() bool {
 }
 
 fn page(up: bool) bool {
-    if (!active or !layout_ready) return false;
+    if (!active) return false;
+    render_mutex.lockUncancelable(io_state);
+    defer render_mutex.unlock(io_state);
+    if (!layout_ready) return false;
     const visible = viewportHeight();
     const step = @max(visible -| 1, 1);
     const max_offset = visualRowCount() -| visible;
@@ -793,14 +908,23 @@ fn renderInfoTo(out: *Io.Writer) !void {
     } else if (agents_queued > 0) {
         writer.print(" \u{b7} {d} agents queued", .{agents_queued}) catch {};
     }
+    if (steering_queued > 0) writer.print(" \u{b7} steer {d}", .{steering_queued}) catch {};
+    if (follow_ups_queued > 0) writer.print(" \u{b7} next {d}", .{follow_ups_queued}) catch {};
     if (activity_len > 0) {
         writer.print(" \u{b7} {s}\u{2026}", .{activity_buffer[0..activity_len]}) catch {};
     } else switch (state) {
         .idle => writer.writeAll(" \u{b7} ready") catch {},
         .thinking => writer.writeAll(" \u{b7} thinking\u{2026}") catch {},
-        .tooling => writer.print(" \u{b7} [{s}]", .{detail_buffer[0..detail_len]}) catch {},
+        .tooling => if (detail_len > 0)
+            writer.print(" \u{b7} {s}\u{2026}", .{detail_buffer[0..detail_len]}) catch {}
+        else
+            writer.writeAll(" \u{b7} working\u{2026}") catch {},
     }
-    writer.writeAll(" \u{b7} pgup/pgdn history \u{b7} ctrl-d exits") catch {};
+    if (state == .idle) {
+        writer.writeAll(" \u{b7} pgup/pgdn history \u{b7} ctrl-d exits") catch {};
+    } else {
+        writer.writeAll(" \u{b7} enter steers \u{b7} alt-enter next \u{b7} ctrl-c stops") catch {};
+    }
     try clearRow(out, infoBarRow() - 1);
     try renderBar(out, infoBarRow(), writer.buffered());
     try clearRow(out, rows);
@@ -920,6 +1044,10 @@ fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!
         consumed += data[data.len - 1].len;
     }
     sink.flush() catch return error.WriteFailed;
+    if (input_active and layout_ready) {
+        sink.print("\x1b[{d};{d}H", .{ input_cursor_row, input_cursor_col }) catch return error.WriteFailed;
+        sink.flush() catch return error.WriteFailed;
+    }
     return consumed;
 }
 
@@ -1244,19 +1372,22 @@ fn commit() void {
 }
 
 test "info bar text shows usage, activity, and hints" {
-    var buffer: [256]u8 = undefined;
-    var writer: Io.Writer = .fixed(&buffer);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
     tokens_in = 12_345;
     tokens_out = 678;
     context_percent = 42;
     state = .tooling;
-    detail_len = copyInto(&detail_buffer, "bash");
+    detail_len = copyInto(&detail_buffer, "Running zig build test");
     activity_len = 0;
-    try writer.print(" ctx {d}% \u{b7} \u{2191}", .{context_percent});
-    try writeCount(&writer, tokens_in);
-    const text = writer.buffered();
+    rows = 24;
+    cols = 120;
+    try renderInfoTo(&output.writer);
+    const text = output.written();
     try std.testing.expect(std.mem.find(u8, text, "ctx 42%") != null);
     try std.testing.expect(std.mem.find(u8, text, "12.3k") != null);
+    try std.testing.expect(std.mem.find(u8, text, "Running zig build test…") != null);
+    try std.testing.expect(std.mem.find(u8, text, "[Running zig build test]") == null);
     state = .idle;
     detail_len = 0;
 }
@@ -1328,6 +1459,33 @@ test "fullscreen layout leaves margins around chrome and status" {
     try std.testing.expectEqual(InputArea{ .row = 20, .col = 6, .width = 72 }, inputArea());
 }
 
+test "startup hint is drawn in the input box and can be dismissed" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    io_state = threaded.io();
+    sink = &output.writer;
+    rows = 24;
+    cols = 80;
+    active = true;
+    layout_ready = true;
+    startup_hint_len = 0;
+    defer {
+        active = false;
+        layout_ready = false;
+        startup_hint_len = 0;
+    }
+
+    showStartupHint("startup 12.34 ms");
+
+    try std.testing.expectEqualStrings("startup 12.34 ms", startupHint().?);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[20;6H") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "startup 12.34 ms") != null);
+    try std.testing.expect(dismissStartupHint());
+    try std.testing.expect(startupHint() == null);
+}
+
 test "fullscreen startup requires a measured minimum size" {
     try std.testing.expectError(error.TerminalSizeUnavailable, initialSize(null));
     try std.testing.expectError(error.TerminalTooSmall, initialSize(.{ .rows = 0, .cols = 80 }));
@@ -1363,6 +1521,34 @@ test "exit restores terminal modes once" {
     exit();
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output.written(), "\x1b[?2004l\x1b[r\x1b[?1049l"));
     try std.testing.expect(!active);
+}
+
+test "clearing a fullscreen transcript releases history and parser state" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    io_state = threaded.io();
+    gpa_state = std.testing.allocator;
+    active = true;
+    layout_ready = false;
+    line_start = 0;
+    line_count = 2;
+    lines[0] = try std.testing.allocator.dupe(u8, "old one");
+    lines[1] = try std.testing.allocator.dupe(u8, "old two");
+    current_len = 3;
+    scroll_offset = 1;
+    popup_rows = 2;
+    esc_state = .csi;
+    display_state = .osc;
+    defer active = false;
+
+    clearTranscript();
+
+    try std.testing.expectEqual(@as(usize, 0), line_count);
+    try std.testing.expectEqual(@as(usize, 0), current_len);
+    try std.testing.expectEqual(@as(usize, 0), scroll_offset);
+    try std.testing.expectEqual(@as(usize, 0), popup_rows);
+    try std.testing.expectEqual(.text, esc_state);
+    try std.testing.expectEqual(.text, display_state);
 }
 
 test "resize reclamps popup and suspends tiny layouts" {
@@ -1464,6 +1650,50 @@ test "growing a paged viewport clamps visual scroll offset" {
     try std.testing.expect(resizeMeasured(.{ .rows = 24, .cols = 80 }));
     try std.testing.expectEqual(visualRowCount() -| viewportHeight(), scroll_offset);
     try std.testing.expectEqual(@as(usize, 5), scroll_offset);
+}
+
+test "paging is serialized with transcript rollover" {
+    const Race = struct {
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn write(self: *@This(), transcript: *Io.Writer) void {
+            for (0..max_lines + 64) |index| {
+                transcript.print("line {d}\n", .{index}) catch {
+                    self.failed.store(true, .release);
+                    break;
+                };
+                transcript.flush() catch {
+                    self.failed.store(true, .release);
+                    break;
+                };
+            }
+            self.done.store(true, .release);
+        }
+
+        fn page(self: *@This()) void {
+            for (0..512) |_| {
+                _ = pageUp();
+                _ = pageDown();
+                if (self.done.load(.acquire)) break;
+            }
+        }
+    };
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    const transcript = try enterMeasured(std.testing.allocator, threaded.io(), &output.writer, .{ .rows = 12, .cols = 40 }, false);
+    defer exit();
+    var race: Race = .{};
+    var writer_future = try threaded.io().concurrent(Race.write, .{ &race, transcript });
+    var pager_future = try threaded.io().concurrent(Race.page, .{&race});
+    writer_future.await(threaded.io());
+    pager_future.await(threaded.io());
+
+    try std.testing.expect(!race.failed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, max_lines), line_count);
 }
 
 test "live renderer wraps at content margins across flushes" {

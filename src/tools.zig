@@ -178,6 +178,12 @@ pub fn executeWithContext(gpa: std.mem.Allocator, io: Io, name: []const u8, args
     return std.fmt.allocPrint(gpa, "unknown tool: {s}", .{name});
 }
 
+/// Run a user-entered shell escape through the same bounded runner as the
+/// model's bash tool.
+pub fn runShell(gpa: std.mem.Allocator, io: Io, command: []const u8, cwd: []const u8) ![]u8 {
+    return runBash(gpa, io, command, 600, cancel.processToken(), cwd);
+}
+
 fn fieldString(args: std.json.Value, key: []const u8) ![]const u8 {
     const value = switch (args) {
         .object => |o| o.get(key) orelse return error.MissingField,
@@ -503,6 +509,10 @@ fn read(gpa: std.mem.Allocator, io: Io, args: std.json.Value, cwd: ?[]const u8) 
 fn bash(gpa: std.mem.Allocator, io: Io, args: std.json.Value, token: *cancel.Token, cwd: ?[]const u8) ![]u8 {
     const command = try fieldString(args, "command");
     const seconds: u64 = @intCast(@min(@max(optionalInt(args, "timeout") orelse 600, 1), 3600));
+    return runBash(gpa, io, command, seconds, token, cwd);
+}
+
+fn runBash(gpa: std.mem.Allocator, io: Io, command: []const u8, seconds: u64, token: *cancel.Token, cwd: ?[]const u8) ![]u8 {
     const script = try std.fmt.allocPrint(gpa, "exec 2>&1\n{s}", .{command});
     defer gpa.free(script);
     var child = try std.process.spawn(io, .{
