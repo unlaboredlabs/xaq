@@ -21,6 +21,7 @@ pub const Profile = struct {
     id: []const u8,
     context_tokens: u32,
     efforts: []const Effort,
+    fast: bool = false,
 };
 
 const standard_efforts = [_]Effort{ .low, .medium, .high, .xhigh };
@@ -31,14 +32,14 @@ const no_efforts = [_]Effort{};
 /// values come from the Codex model catalog fetched on 2026-08-19; its
 /// 272K window intentionally differs from the 1.05M OpenAI API window.
 pub const profiles = [_]Profile{
-    .{ .provider = .chatgpt, .id = "gpt-5.6-sol", .context_tokens = 272_000, .efforts = &full_efforts },
-    .{ .provider = .chatgpt, .id = "gpt-5.6-terra", .context_tokens = 272_000, .efforts = &full_efforts },
-    .{ .provider = .chatgpt, .id = "gpt-5.6-luna", .context_tokens = 272_000, .efforts = &full_efforts },
-    .{ .provider = .chatgpt, .id = "gpt-5.5", .context_tokens = 272_000, .efforts = &standard_efforts },
-    .{ .provider = .chatgpt, .id = "gpt-5.4", .context_tokens = 272_000, .efforts = &standard_efforts },
+    .{ .provider = .chatgpt, .id = "gpt-5.6-sol", .context_tokens = 272_000, .efforts = &full_efforts, .fast = true },
+    .{ .provider = .chatgpt, .id = "gpt-5.6-terra", .context_tokens = 272_000, .efforts = &full_efforts, .fast = true },
+    .{ .provider = .chatgpt, .id = "gpt-5.6-luna", .context_tokens = 272_000, .efforts = &full_efforts, .fast = true },
+    .{ .provider = .chatgpt, .id = "gpt-5.5", .context_tokens = 272_000, .efforts = &standard_efforts, .fast = true },
+    .{ .provider = .chatgpt, .id = "gpt-5.4", .context_tokens = 272_000, .efforts = &standard_efforts, .fast = true },
     .{ .provider = .chatgpt, .id = "gpt-5.4-mini", .context_tokens = 272_000, .efforts = &standard_efforts },
     .{ .provider = .chatgpt, .id = "gpt-5.3-codex-spark", .context_tokens = 128_000, .efforts = &standard_efforts },
-    .{ .provider = .claude, .id = "claude-opus-5", .context_tokens = 1_000_000, .efforts = &full_efforts },
+    .{ .provider = .claude, .id = "claude-opus-5", .context_tokens = 1_000_000, .efforts = &full_efforts, .fast = true },
     .{ .provider = .claude, .id = "claude-sonnet-5", .context_tokens = 1_000_000, .efforts = &full_efforts },
     .{ .provider = .claude, .id = "claude-fable-5", .context_tokens = 1_000_000, .efforts = &full_efforts },
     .{ .provider = .claude, .id = "claude-haiku-4-5", .context_tokens = 200_000, .efforts = &no_efforts },
@@ -104,6 +105,16 @@ pub fn efforts(provider: auth.Provider, id: []const u8) []const Effort {
     return if (find(provider, id)) |profile| profile.efforts else &full_efforts;
 }
 
+/// Fast mode is a billed service tier, so unknown model IDs are rejected
+/// unless they are snapshot IDs in Anthropic's documented Opus families.
+pub fn supportsFast(provider: auth.Provider, id: []const u8) bool {
+    if (find(provider, id)) |profile| return profile.fast;
+    return provider == .claude and
+        (std.mem.startsWith(u8, id, "claude-opus-5-") or
+            std.mem.eql(u8, id, "claude-opus-4-8") or
+            std.mem.startsWith(u8, id, "claude-opus-4-8-"));
+}
+
 test "subscription profiles preserve product-specific context windows" {
     try std.testing.expectEqual(@as(u32, 272_000), contextWindow(.chatgpt, "gpt-5.6-sol"));
     try std.testing.expectEqual(@as(u32, 1_000_000), contextWindow(.claude, "claude-opus-5"));
@@ -112,4 +123,12 @@ test "subscription profiles preserve product-specific context windows" {
     try std.testing.expect(!supportsEffort(.claude, "claude-haiku-4-5", .low));
     try std.testing.expect(!supportsEffort(.grok, "grok-4.6", .max));
     try std.testing.expect(supportsEffort(.chatgpt, "gpt-5.6-sol", .max));
+    try std.testing.expect(supportsFast(.chatgpt, "gpt-5.6-sol"));
+    try std.testing.expect(supportsFast(.chatgpt, "gpt-5.4"));
+    try std.testing.expect(!supportsFast(.chatgpt, "gpt-5.4-mini"));
+    try std.testing.expect(supportsFast(.claude, "claude-opus-5"));
+    try std.testing.expect(supportsFast(.claude, "claude-opus-5-20260801"));
+    try std.testing.expect(supportsFast(.claude, "claude-opus-4-8"));
+    try std.testing.expect(!supportsFast(.claude, "claude-sonnet-5"));
+    try std.testing.expect(!supportsFast(.grok, "grok-4.6"));
 }
