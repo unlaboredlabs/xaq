@@ -73,7 +73,9 @@ xaq --provider claude
 xaq --provider grok
 ```
 
-The session opens with a one-line header (provider, model, working directory) and a `>` prompt. A dim `thinking…` placeholder covers the gap until the first streamed byte, then model text streams as it arrives with terminal control sequences filtered. Each tool call prints one dimmed line with a short argument preview, such as `[bash] zig build test`; failed or slow calls add a dim aftermath line (`↳ exit 2 · 12s`). Empty input re-prompts. `ctrl-c` clears input or interrupts the active provider/tool process tree (an interrupted prompt is prefilled at the next `>` for editing); pressed twice at an empty prompt it exits, as does `ctrl-d`. Bracketed paste is supported, so multi-line pastes land in the input (newlines shown as `⏎`) instead of submitting line by line. Styling is plain ANSI dim and bold, applied only on a terminal and disabled by `NO_COLOR` or `TERM=dumb`.
+On a terminal the session opens in a fullscreen view: an alternate screen with a pinned status bar on the top row and the conversation scrolling beneath it. The bar shows provider/model, the thread ID, context pressure as a percentage of the model window, live token counts, and the current state (`ready`, `thinking…`, or the running tool). `PgUp`/`PgDn` at the prompt page through recent transcript history (unstyled, best-effort); new output snaps back to live. `--plain` or `XAQ_PLAIN=1` keeps the classic inline flow, which is also used automatically for one-shots, pipes, and terminals that are too small—the fullscreen layer is chrome around the same engine, not a separate mode.
+
+The session opens with a `>` prompt (inline mode adds a one-line identity header). A dim `thinking…` placeholder covers the gap until the first streamed byte, then model text streams as it arrives with terminal control sequences filtered. Each tool call prints one dimmed line with a short argument preview, such as `[bash] zig build test`; failed or slow calls add a dim aftermath line (`↳ exit 2 · 12s`). Empty input re-prompts. `ctrl-c` clears input or interrupts the active provider/tool process tree (an interrupted prompt is prefilled at the next `>` for editing); pressed twice at an empty prompt it exits, as does `ctrl-d`. Bracketed paste is supported, so multi-line pastes land in the input (newlines shown as `⏎`) instead of submitting line by line. Styling is plain ANSI dim and bold, applied only on a terminal and disabled by `NO_COLOR` or `TERM=dumb`.
 
 Lines starting with `/` are commands handled locally, never sent to the model:
 
@@ -92,7 +94,7 @@ Lines starting with `/` are commands handled locally, never sent to the model:
 
 Typing `/` opens an inline completion popup that filters as you type: up/down selects, tab completes, enter runs the highlighted command. Unique prefixes also work directly—`/mod gpt-5.6-sol` switches the model, `/q` quits. Argument-less `/model`, `/effort`, `/resume`, and `/settings` open small inline pickers (enter confirms, `q` cancels); explicit model, effort, and thread arguments remain available for scripts and exact IDs.
 
-All interactive drawing stays inline at the prompt—no alternate screen, no fullscreen UI—and requires a terminal on stdin and stdout. End a line with a single `\` to continue a multiline prompt on the next line.
+All interactive drawing stays at the prompt—the fullscreen layer only adds the status bar and paging on top of it—and requires a terminal on stdin and stdout. End a line with a single `\` to continue a multiline prompt on the next line.
 
 Interactive turns are appended to `~/.config/xaq/threads/<cwd-hash>/<thread-id>.jsonl` before the next action. The format is inspectable and crash-tolerant: a partial final line is ignored during replay. Threads are scoped per directory (run xaq from the project root for a stable namespace), and the newest 50 per directory are retained—older ones are pruned when a new thread starts. Resume the latest thread for the current directory with `xaq -c`, or select one with `xaq --resume THREAD`; resuming prints a dim orientation line (thread, provider/model, entry count) and replays the tail of the last exchange. The `/resume` picker lists each thread with its age and first prompt.
 
@@ -176,7 +178,9 @@ Minimalism is a constraint, not a placeholder. Additions should demonstrate meas
 - internal sandboxes, approval policies, and permission profiles
 - plan, “yolo,” or other operating modes
 - session databases, indexes, and comprehensive model-catalog subsystems (threads stay plain JSONL)
-- themes or a full-screen terminal UI
+- themes, mouse support, and cell-grid TUI frameworks; the fullscreen
+  view is one pinned status row plus a terminal-managed scroll region
+  driving the unchanged inline engine, and `--plain` remains first-class
 
 ## Development
 

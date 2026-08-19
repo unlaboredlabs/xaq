@@ -5,6 +5,7 @@ const auth = @import("auth.zig");
 const input_mod = @import("input.zig");
 const log = @import("log.zig");
 const term = @import("term.zig");
+const tui = @import("tui.zig");
 
 const version_string = "0.1.0";
 
@@ -13,7 +14,7 @@ const usage =
     \\
     \\  xaq login <chatgpt|claude|grok>
     \\  xaq logout <chatgpt|claude|grok>
-    \\  xaq [--provider NAME] [--model ID] [--effort LEVEL] [PROMPT]
+    \\  xaq [--provider NAME] [--model ID] [--effort LEVEL] [--plain] [PROMPT]
     \\  xaq --continue | --resume THREAD
     \\  xaq --version
     \\
@@ -67,6 +68,10 @@ pub fn main(init: std.process.Init) !void {
         const provider = auth.Provider.parse(args[2]) orelse
             fatal(io, "unknown provider '{s}' (chatgpt, claude, or grok)", .{args[2]});
         if (std.mem.eql(u8, args[1], "login")) {
+            // Styling detection enables the waiting spinner during device
+            // polling; login otherwise never reaches the interactive setup.
+            const stdout_tty = Io.File.stdout().isTty(io) catch false;
+            term.detect(stdout_tty, init.environ_map.get("NO_COLOR"), init.environ_map.get("TERM"));
             try auth.login(gpa, io, home, provider, input, output);
         } else {
             try output.print("{s}\n", .{if (try auth.logout(gpa, io, home, provider)) "credentials removed" else "not logged in"});
@@ -79,6 +84,7 @@ pub fn main(init: std.process.Init) !void {
     var effort: ?agent.Effort = null;
     var prompt: ?[]const u8 = null;
     var resume_id: ?[]const u8 = null;
+    var plain = init.environ_map.get("XAQ_PLAIN") != null;
     var dash_prompt: ?[]u8 = null;
     defer if (dash_prompt) |value| gpa.free(value);
     var i: usize = 1;
@@ -97,6 +103,8 @@ pub fn main(init: std.process.Init) !void {
             if (i >= args.len) fatal(io, "--effort needs a value", .{});
             effort = agent.Effort.parse(args[i]) orelse
                 fatal(io, "effort must be low, medium, high, xhigh, or max (got '{s}')", .{args[i]});
+        } else if (std.mem.eql(u8, args[i], "--plain")) {
+            plain = true;
         } else if (std.mem.eql(u8, args[i], "-c") or std.mem.eql(u8, args[i], "--continue")) {
             resume_id = "";
         } else if (std.mem.eql(u8, args[i], "--resume")) {
@@ -157,15 +165,29 @@ pub fn main(init: std.process.Init) !void {
     // dimmed consistently; the raw-mode editor still needs both ends.
     const stdout_tty = Io.File.stdout().isTty(io) catch false;
     term.detect(stdout_tty, init.environ_map.get("NO_COLOR"), init.environ_map.get("TERM"));
+    var agent_output: *Io.Writer = output;
     if (interactive) {
         input_mod.interactive = stdout_tty and stdin_tty;
-        try output.print("{s}xaq · {s}/{s} · {s}{s}\n{s}/help for commands · ctrl-d exits{s}\n", .{
-            term.bold(),  @tagName(provider), model orelse agent.defaultModel(provider),
-            cwd,          term.reset(),       term.dim(),
-            term.reset(),
-        });
-        try output.flush();
+        // Fullscreen is the default session view on a terminal; --plain or
+        // XAQ_PLAIN=1 keeps the classic inline flow, and any error falls
+        // back to it silently.
+        if (input_mod.interactive and !plain) {
+            if (tui.enter(gpa, output)) |tee| {
+                agent_output = tee;
+            } else |_| {}
+        }
+        if (tui.active) {
+            try agent_output.print("{s}/help for commands · pgup/pgdn history · ctrl-d exits{s}\n", .{ term.dim(), term.reset() });
+        } else {
+            try agent_output.print("{s}xaq · {s}/{s} · {s}{s}\n{s}/help for commands · ctrl-d exits{s}\n", .{
+                term.bold(),  @tagName(provider), model orelse agent.defaultModel(provider),
+                cwd,          term.reset(),       term.dim(),
+                term.reset(),
+            });
+        }
+        try agent_output.flush();
     }
+    defer tui.exit();
     // Echo stays off for the whole interactive session so type-ahead
     // (arrow keys, stray keystrokes) cannot smear `^[[A`-style junk into
     // streamed output; the editor re-echoes queued input at the next
@@ -180,9 +202,12 @@ pub fn main(init: std.process.Init) !void {
         .effort = effort,
         .first_prompt = prompt,
         .input = if (interactive) input else null,
-        .output = output,
+        .output = agent_output,
         .resume_id = resume_id,
     }) catch |err| {
+        // The catch may end in process.exit, which skips defers; leave
+        // the alternate screen first so messages land on the real one.
+        tui.exit();
         output.flush() catch {};
         switch (err) {
             error.NotLoggedIn => {
@@ -219,9 +244,11 @@ test {
     _ = @import("log.zig");
     _ = @import("models.zig");
     _ = @import("settings.zig");
+    _ = @import("spin.zig");
     _ = @import("term.zig");
     _ = @import("tools.zig");
     _ = @import("transport.zig");
+    _ = @import("tui.zig");
     _ = @import("threads.zig");
     _ = @import("types.zig");
 }

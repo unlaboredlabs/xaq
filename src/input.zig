@@ -16,6 +16,7 @@
 const std = @import("std");
 const Io = std.Io;
 const term = @import("term.zig");
+const tui = @import("tui.zig");
 
 /// Set by main when both stdin and stdout are terminals.
 pub var interactive = false;
@@ -82,6 +83,10 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
         output.writeAll("\x1b[?2004l") catch {};
         output.flush() catch {};
     }
+    // Editor redraw churn (popup rows, hint lines) must not pollute the
+    // fullscreen transcript; only the final submit echo is committed.
+    tui.setSuppress(true);
+    defer tui.setSuppress(false);
     popup_shown = try redraw(output, suggestions, buffer[0..len], selected, cursor);
 
     while (true) {
@@ -113,6 +118,7 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                 if (chosen) |suggestion| {
                     len = fill(&buffer, suggestion.name, false);
                 }
+                tui.setSuppress(false);
                 try prompt(output, buffer[0..len]);
                 try output.writeAll("\x1b[J\r\n");
                 try output.flush();
@@ -274,6 +280,12 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                             hist_pos = null;
                             dirty = true;
                         },
+                        5 => if (tui.pageUp()) {
+                            dirty = true;
+                        },
+                        6 => if (tui.pageDown()) {
+                            dirty = true;
+                        },
                         else => {},
                     },
                     else => {},
@@ -356,6 +368,8 @@ pub fn pick(reader: *Io.Reader, output: *Io.Writer, items: []const []const u8, i
     if (!interactive or items.len == 0) return null;
     const raw = RawMode.enter() catch return null;
     defer raw.exit();
+    tui.setSuppress(true);
+    defer tui.setSuppress(false);
 
     var selected = @min(initial, items.len - 1);
     while (true) {
