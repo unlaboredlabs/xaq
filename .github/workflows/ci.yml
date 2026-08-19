@@ -12,21 +12,19 @@ jobs:
   check:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [blacksmith-2vcpu-ubuntu-2404, blacksmith-6vcpu-macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
-      - run: zig fmt --check build.zig src
+      - run: zig fmt --check build.zig src tools
       - run: zig build test
       - run: zig build -Doptimize=ReleaseSmall
       - name: Size and startup budget
         if: runner.os == 'Linux'
-        run: |
-          test "$(stat -c%s zig-out/bin/xaq)" -le 524288
-          timeout 5s bash -c 'for _ in {1..200}; do ./zig-out/bin/xaq --help >/dev/null; done'
+        run: zig build perf
       - name: Package edge build
         if: github.event_name == 'push'
         shell: bash
@@ -54,7 +52,7 @@ jobs:
   edge:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: check
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     concurrency:
       group: edge
       cancel-in-progress: false
