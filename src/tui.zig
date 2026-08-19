@@ -524,7 +524,10 @@ pub fn pageDown() bool {
 }
 
 fn page(up: bool) bool {
-    if (!active or !layout_ready) return false;
+    if (!active) return false;
+    render_mutex.lockUncancelable(io_state);
+    defer render_mutex.unlock(io_state);
+    if (!layout_ready) return false;
     const visible = viewportHeight();
     const step = @max(visible -| 1, 1);
     const max_offset = visualRowCount() -| visible;
@@ -1647,6 +1650,50 @@ test "growing a paged viewport clamps visual scroll offset" {
     try std.testing.expect(resizeMeasured(.{ .rows = 24, .cols = 80 }));
     try std.testing.expectEqual(visualRowCount() -| viewportHeight(), scroll_offset);
     try std.testing.expectEqual(@as(usize, 5), scroll_offset);
+}
+
+test "paging is serialized with transcript rollover" {
+    const Race = struct {
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn write(self: *@This(), transcript: *Io.Writer) void {
+            for (0..max_lines + 64) |index| {
+                transcript.print("line {d}\n", .{index}) catch {
+                    self.failed.store(true, .release);
+                    break;
+                };
+                transcript.flush() catch {
+                    self.failed.store(true, .release);
+                    break;
+                };
+            }
+            self.done.store(true, .release);
+        }
+
+        fn page(self: *@This()) void {
+            for (0..512) |_| {
+                _ = pageUp();
+                _ = pageDown();
+                if (self.done.load(.acquire)) break;
+            }
+        }
+    };
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    const transcript = try enterMeasured(std.testing.allocator, threaded.io(), &output.writer, .{ .rows = 12, .cols = 40 }, false);
+    defer exit();
+    var race: Race = .{};
+    var writer_future = try threaded.io().concurrent(Race.write, .{ &race, transcript });
+    var pager_future = try threaded.io().concurrent(Race.page, .{&race});
+    writer_future.await(threaded.io());
+    pager_future.await(threaded.io());
+
+    try std.testing.expect(!race.failed.load(.acquire));
+    try std.testing.expectEqual(@as(usize, max_lines), line_count);
 }
 
 test "live renderer wraps at content margins across flushes" {

@@ -220,6 +220,9 @@ pub const Agent = struct {
     events: ?EventSink,
     max_tool_rounds: usize,
     arena: std.heap.ArenaAllocator,
+    /// Each successful prompt owns one arena so a failed/cancelled prompt can
+    /// release all of its copied input payloads transactionally.
+    prompt_arenas: std.ArrayList(std.heap.ArenaAllocator) = .empty,
     entries: std.ArrayList(Entry) = .empty,
     usage_total: Usage = .{},
     cancellation: Cancellation = .{},
@@ -277,6 +280,8 @@ pub const Agent = struct {
     pub fn deinit(self: *Agent) void {
         std.debug.assert(!self.active.load(.acquire));
         self.cancellation.request();
+        for (self.prompt_arenas.items) |arena| arena.deinit();
+        self.prompt_arenas.deinit(self.gpa);
         self.entries.deinit(self.arena.allocator());
         self.arena.deinit();
         freeToolDefinitions(self.gpa, self.tool_definitions);
@@ -294,6 +299,8 @@ pub const Agent = struct {
 
     pub fn reset(self: *Agent) void {
         std.debug.assert(!self.active.load(.acquire));
+        for (self.prompt_arenas.items) |arena| arena.deinit();
+        self.prompt_arenas.clearRetainingCapacity();
         self.entries.deinit(self.arena.allocator());
         self.arena.deinit();
         self.arena = .init(self.gpa);
@@ -353,14 +360,18 @@ pub const Agent = struct {
         errdefer self.entries.items.len = history_checkpoint;
         errdefer self.usage_total = usage_checkpoint;
         try image_input.validateProvider(self.provider, options.images);
-        const images = try self.arena.allocator().alloc(Image, options.images.len);
+        var prompt_arena: std.heap.ArenaAllocator = .init(self.gpa);
+        var prompt_arena_retained = false;
+        defer if (!prompt_arena_retained) prompt_arena.deinit();
+        const prompt_allocator = prompt_arena.allocator();
+        const images = try prompt_allocator.alloc(Image, options.images.len);
         for (options.images, 0..) |image, index| images[index] = .{
-            .name = try self.arena.allocator().dupe(u8, image.name),
-            .media_type = try self.arena.allocator().dupe(u8, image.media_type),
-            .data = try self.arena.allocator().dupe(u8, image.data),
+            .name = try prompt_allocator.dupe(u8, image.name),
+            .media_type = try prompt_allocator.dupe(u8, image.media_type),
+            .data = try prompt_allocator.dupe(u8, image.data),
         };
         try self.entries.append(self.arena.allocator(), .{ .user = .{
-            .text = try self.arena.allocator().dupe(u8, text),
+            .text = try prompt_allocator.dupe(u8, text),
             .images = images,
         } });
 
@@ -390,8 +401,7 @@ pub const Agent = struct {
                     .rounds = round,
                     .stop_reason = .completed,
                 };
-                try self.emit(.{ .completed = turn });
-                return turn;
+                return self.completePrompt(prompt_arena, &prompt_arena_retained, turn);
             }
 
             tool_calls += answer.calls.len;
@@ -412,8 +422,7 @@ pub const Agent = struct {
                     .rounds = round,
                     .stop_reason = .tool_round_limit,
                 };
-                try self.emit(.{ .completed = turn });
-                return turn;
+                return self.completePrompt(prompt_arena, &prompt_arena_retained, turn);
             }
             for (answer.calls, 0..) |call, index| {
                 if (self.cancellation.isRequested()) return self.cancelled();
@@ -427,6 +436,17 @@ pub const Agent = struct {
             try self.entries.append(self.arena.allocator(), .{ .results = results });
         }
         unreachable;
+    }
+
+    fn completePrompt(self: *Agent, prompt_arena: std.heap.ArenaAllocator, retained: *bool, turn: Turn) !Turn {
+        try self.prompt_arenas.append(self.gpa, prompt_arena);
+        retained.* = true;
+        self.emit(.{ .completed = turn }) catch |err| {
+            var rejected = self.prompt_arenas.pop().?;
+            rejected.deinit();
+            return err;
+        };
+        return turn;
     }
 
     fn cancelled(self: *Agent) anyerror {
@@ -948,6 +968,34 @@ test "provider failures preserve diagnostics and roll back the turn" {
     try std.testing.expectEqual(@as(usize, 0), embedded.history().len);
     try std.testing.expectEqualStrings("denied by host", embedded.lastProviderError().?);
     try std.testing.expectEqual(@as(?u16, 403), embedded.last_http_status);
+}
+
+test "failed prompts release copied image payloads" {
+    const Fake = struct {
+        fn post(_: ?*anyopaque, gpa: std.mem.Allocator, _: Io, _: Request, _: ?*anyopaque, _: StreamLineFn) !Response {
+            return .{ .status = 500, .body = try gpa.dupe(u8, "failed") };
+        }
+    };
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var embedded = try Agent.init(std.testing.allocator, .{
+        .io = threaded.io(),
+        .cwd = "/workspace",
+        .credential = .{ .access = "token", .refresh = "", .expires = 0, .account_id = "account" },
+        .transport = .{ .post_stream = Fake.post },
+    });
+    defer embedded.deinit();
+    const payload = try std.testing.allocator.alloc(u8, 1024 * 1024);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 'A');
+    const image: Image = .{ .name = "large.png", .media_type = "image/png", .data = payload };
+    const base_capacity = embedded.arena.queryCapacity();
+
+    try std.testing.expectError(error.ProviderRequestFailed, embedded.prompt("inspect", .{ .images = &.{image} }));
+    try std.testing.expectEqual(@as(usize, 0), embedded.history().len);
+    try std.testing.expectEqual(@as(usize, 0), embedded.prompt_arenas.items.len);
+    try std.testing.expect(embedded.arena.queryCapacity() - base_capacity < payload.len);
 }
 
 test "transport cancellation emits an event and rolls back the turn" {
