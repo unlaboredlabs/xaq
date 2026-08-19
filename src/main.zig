@@ -172,7 +172,7 @@ pub fn main(init: std.process.Init) !void {
         // XAQ_PLAIN=1 keeps the classic inline flow, and any error falls
         // back to it silently.
         if (input_mod.interactive and !plain) {
-            if (tui.enter(gpa, output)) |tee| {
+            if (tui.enter(gpa, io, output)) |tee| {
                 agent_output = tee;
             } else |_| {}
         }
@@ -240,6 +240,7 @@ test {
     _ = @import("agent.zig");
     _ = @import("cancel.zig");
     _ = @import("context.zig");
+    _ = @import("git.zig");
     _ = @import("input.zig");
     _ = @import("log.zig");
     _ = @import("markdown.zig");
