@@ -17,13 +17,17 @@ Install the latest edge build on Linux or macOS:
 curl -fsSL https://xaq.sh/install | sh
 ```
 
-The installer verifies `SHA256SUMS` and writes the binary to `~/.local/bin`. Set `XAQ_INSTALL_DIR` to use another directory. Update it from the same rolling release with:
+The installer verifies the release manifest and SHA-256 checksum, then writes the binary to `~/.local/bin`. Set `XAQ_INSTALL_DIR` to use another directory. Update it from the same rolling release with:
 
 ```sh
 xaq update
 ```
 
-For now, both commands use only the rolling [edge release](https://github.com/unlaboredlabs/xaq/releases/tag/edge). Edge tracks the latest successful `main` build and may change without notice.
+For now, both commands use only the rolling [edge release](https://github.com/unlaboredlabs/xaq/releases/tag/edge). Edge tracks the latest successful `main` build and may change without notice. Keep `curl` on `PATH`; the installed binary uses it for provider HTTPS requests and updates.
+
+## Build
+
+Every successful `main` build updates the rolling [edge prerelease](https://github.com/unlaboredlabs/xaq/releases/tag/edge) with Linux and macOS binaries and archives for x86_64 and aarch64. Asset names include the source commit. The publisher verifies a complete set before it moves the edge manifest, so an interrupted publication leaves clients on the previous build. Edge may change without notice.
 
 To build from source, install Zig 0.16.0 and `curl`, then run:
 

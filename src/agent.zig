@@ -273,7 +273,8 @@ const Session = struct {
         // forking a deliberately resumed old thread cannot prune its source.
         try persistSnapshot(self);
         var fork = try threads.create(self.gpa, self.io, self.home, self.cwd, self.provider, self.model, if (self.effort) |value| @tagName(value) else null, self.fast);
-        errdefer fork.deinit();
+        var installed = false;
+        errdefer if (!installed) fork.discard();
         try fork.rewrite(
             self.provider,
             self.model,
@@ -284,6 +285,7 @@ const Session = struct {
         );
         if (self.thread) |*thread| thread.deinit();
         self.thread = fork;
+        installed = true;
     }
 
     fn resumeThread(self: *Session, requested: ?[]const u8) !void {
@@ -2450,6 +2452,10 @@ fn finishRound(decoder: *Decoder, stop_reason: StopReason) !RoundResult {
 }
 
 fn interruptedRound(decoder: *Decoder, compacting: bool, transport_error: anyerror) !?RoundResult {
+    // Decoder hooks share the transport callback's error channel. A local
+    // event/output failure is neither retryable transport trouble nor a
+    // successfully saved partial provider response.
+    if (decoder.local_failure) return transport_error;
     if (transport_error == error.Cancelled or transport_error == error.ProviderRequestFailed) return transport_error;
     if (!decoder.received or compacting) return null;
     return try finishRound(decoder, .stream_interrupted);
@@ -2525,6 +2531,7 @@ const Decoder = struct {
     events: ?EventSink,
     stop_spinner: bool = true,
     received: bool = false,
+    local_failure: bool = false,
 
     fn init(provider: auth.Provider, parse_gpa: std.mem.Allocator, persist: std.mem.Allocator, output: *Io.Writer, events: ?EventSink) Decoder {
         return .{
@@ -2550,9 +2557,18 @@ const Decoder = struct {
 
     fn onDelta(raw: ?*anyopaque, delta: []const u8) !void {
         const self: *Decoder = @ptrCast(@alignCast(raw.?));
-        if (self.events) |sink| try sink.emit(sink.context, .{ .text_delta = delta });
-        try self.rendered.write(delta);
-        try self.rendered.output.flush();
+        if (self.events) |sink| sink.emit(sink.context, .{ .text_delta = delta }) catch |err| {
+            self.local_failure = true;
+            return err;
+        };
+        self.rendered.write(delta) catch |err| {
+            self.local_failure = true;
+            return err;
+        };
+        self.rendered.output.flush() catch |err| {
+            self.local_failure = true;
+            return err;
+        };
     }
 
     fn feed(self: *Decoder, line: []const u8) !void {
@@ -2847,4 +2863,24 @@ test "interrupted stream keeps partial decoder output and stop reason" {
 
     try std.testing.expectEqualStrings("partial", result.answer.text);
     try std.testing.expectEqual(StopReason.stream_interrupted, result.stop_reason);
+}
+
+fn rejectTextDelta(_: ?*anyopaque, event: Event) !void {
+    if (event == .text_delta) return error.EventRejected;
+}
+
+test "stream decoder identifies event sink failures as local" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var buffer: [128]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buffer);
+    var decoder = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), &writer, .{ .emit = rejectTextDelta });
+
+    try std.testing.expectError(
+        error.EventRejected,
+        decoder.feed("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hidden\"}"),
+    );
+    try std.testing.expect(decoder.local_failure);
+    try std.testing.expectEqualStrings("", writer.buffered());
+    try std.testing.expectError(error.EventRejected, interruptedRound(&decoder, false, error.EventRejected));
 }
