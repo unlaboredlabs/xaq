@@ -29,7 +29,7 @@ The current version is intentionally narrow:
 
 ## Build
 
-Every successful `main` build updates the rolling [edge prerelease](https://github.com/unlaboredlabs/xaq/releases/tag/edge) with tested Linux and macOS archives plus `SHA256SUMS`. Edge is built from the latest commit and may change without notice.
+Every successful `main` build updates the rolling [edge prerelease](https://github.com/unlaboredlabs/xaq/releases/tag/edge) with Linux and macOS binaries and archives for x86_64 and aarch64. Asset names include the source commit. The publisher verifies a complete set before it moves the edge manifest, so an interrupted publication leaves clients on the previous build. Edge may change without notice.
 
 To build from source:
 

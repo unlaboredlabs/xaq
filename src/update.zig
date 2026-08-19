@@ -2,25 +2,28 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 
+const manifest_url = "https://raw.githubusercontent.com/unlaboredlabs/xaq/edge-channel/manifest";
 const release_base = "https://github.com/unlaboredlabs/xaq/releases/download/edge";
 const max_binary_bytes = 16 * 1024 * 1024;
-const max_checksums_bytes = 64 * 1024;
+const max_manifest_bytes = 64 * 1024;
+
+const ManifestAsset = struct {
+    filename: []const u8,
+    checksum: [64]u8,
+};
 
 pub fn run(gpa: std.mem.Allocator, io: Io) !void {
     const asset = platformAsset() orelse return error.UnsupportedPlatform;
-    const checksum_url = try std.fmt.allocPrint(gpa, "{s}/SHA256SUMS", .{release_base});
-    defer gpa.free(checksum_url);
-    const asset_url = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ release_base, asset });
+    const manifest = try download(gpa, io, manifest_url, max_manifest_bytes);
+    defer gpa.free(manifest);
+    const selected = try assetFromManifest(manifest, asset);
+    const asset_url = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ release_base, selected.filename });
     defer gpa.free(asset_url);
-
-    const checksums = try download(gpa, io, checksum_url, max_checksums_bytes);
-    defer gpa.free(checksums);
-    const expected = try checksumFor(checksums, asset);
 
     const binary = try download(gpa, io, asset_url, max_binary_bytes);
     defer gpa.free(binary);
     const actual = sha256(binary);
-    if (!std.mem.eql(u8, &expected, &actual)) return error.ChecksumMismatch;
+    if (!std.mem.eql(u8, &selected.checksum, &actual)) return error.ChecksumMismatch;
 
     const executable = try std.process.executablePathAlloc(io, gpa);
     defer gpa.free(executable);
@@ -88,25 +91,47 @@ fn exitedZero(term: std.process.Child.Term) bool {
     };
 }
 
-fn checksumFor(contents: []const u8, asset: []const u8) ![64]u8 {
+fn assetFromManifest(contents: []const u8, asset: []const u8) !ManifestAsset {
     var lines = std.mem.splitScalar(u8, contents, '\n');
+    const header = lines.next() orelse return error.MalformedManifest;
+    var header_fields = std.mem.tokenizeAny(u8, header, " \t\r");
+    if (!std.mem.eql(u8, header_fields.next() orelse return error.MalformedManifest, "xaq-edge-v1")) {
+        return error.MalformedManifest;
+    }
+    const release_sha = header_fields.next() orelse return error.MalformedManifest;
+    if (release_sha.len != 40 or !allLowerHex(release_sha) or header_fields.next() != null) {
+        return error.MalformedManifest;
+    }
+
+    var selected: ?ManifestAsset = null;
     while (lines.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");
-        if (line.len < 66) continue;
-        const digest = line[0..64];
-        if (!allHex(digest)) continue;
-        var name = std.mem.trimStart(u8, line[64..], " \t");
-        if (name.len > 0 and name[0] == '*') name = name[1..];
-        if (!std.mem.eql(u8, name, asset)) continue;
-        var result: [64]u8 = undefined;
-        for (digest, 0..) |byte, i| result[i] = std.ascii.toLower(byte);
-        return result;
+        if (line.len == 0) continue;
+        var fields = std.mem.tokenizeAny(u8, line, " \t");
+        const logical = fields.next() orelse return error.MalformedManifest;
+        const filename = fields.next() orelse return error.MalformedManifest;
+        const digest = fields.next() orelse return error.MalformedManifest;
+        if (fields.next() != null or digest.len != 64 or !allLowerHex(digest)) {
+            return error.MalformedManifest;
+        }
+        if (!std.mem.eql(u8, logical, asset)) continue;
+        if (selected != null or filename.len != asset.len + 1 + release_sha.len or
+            !std.mem.startsWith(u8, filename, asset) or filename[asset.len] != '-' or
+            !std.mem.eql(u8, filename[asset.len + 1 ..], release_sha))
+        {
+            return error.MalformedManifest;
+        }
+        var checksum: [64]u8 = undefined;
+        @memcpy(&checksum, digest);
+        selected = .{ .filename = filename, .checksum = checksum };
     }
-    return error.MissingChecksum;
+    return selected orelse error.MissingAsset;
 }
 
-fn allHex(value: []const u8) bool {
-    for (value) |byte| if (!std.ascii.isHex(byte)) return false;
+fn allLowerHex(value: []const u8) bool {
+    for (value) |byte| {
+        if (!std.ascii.isDigit(byte) and !(byte >= 'a' and byte <= 'f')) return false;
+    }
     return true;
 }
 
@@ -116,16 +141,38 @@ fn sha256(bytes: []const u8) [64]u8 {
     return std.fmt.bytesToHex(digest, .lower);
 }
 
-test "checksum lookup matches the exact release asset" {
-    const sums =
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  xaq-linux-x86_64.tar.gz\n" ++
-        "ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789 *xaq-linux-x86_64\r\n";
-    const found = try checksumFor(sums, "xaq-linux-x86_64");
-    try std.testing.expectEqualStrings("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", &found);
+test "manifest selects an immutable asset and checksum" {
+    const manifest =
+        "xaq-edge-v1 0123456789abcdef0123456789abcdef01234567\n" ++
+        "xaq-linux-x86_64 xaq-linux-x86_64-0123456789abcdef0123456789abcdef01234567 abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789\n" ++
+        "xaq-linux-x86_64.tar.gz xaq-linux-x86_64-0123456789abcdef0123456789abcdef01234567.tar.gz aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+    const found = try assetFromManifest(manifest, "xaq-linux-x86_64");
+    try std.testing.expectEqualStrings("xaq-linux-x86_64-0123456789abcdef0123456789abcdef01234567", found.filename);
+    try std.testing.expectEqualStrings("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", &found.checksum);
 }
 
-test "checksum lookup rejects missing and malformed entries" {
-    const malformed = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz  xaq-linux-x86_64\n";
-    try std.testing.expectError(error.MissingChecksum, checksumFor(malformed, "xaq-linux-x86_64"));
-    try std.testing.expectError(error.MissingChecksum, checksumFor("", "xaq-linux-x86_64"));
+test "manifest rejects mixed generations and duplicate assets" {
+    const mixed =
+        "xaq-edge-v1 0123456789abcdef0123456789abcdef01234567\n" ++
+        "xaq-linux-x86_64 xaq-linux-x86_64-89abcdef0123456789abcdef0123456789abcdef aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n";
+    try std.testing.expectError(error.MalformedManifest, assetFromManifest(mixed, "xaq-linux-x86_64"));
+
+    const duplicate =
+        "xaq-edge-v1 0123456789abcdef0123456789abcdef01234567\n" ++
+        "xaq-linux-x86_64 xaq-linux-x86_64-0123456789abcdef0123456789abcdef01234567 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n" ++
+        "xaq-linux-x86_64 xaq-linux-x86_64-0123456789abcdef0123456789abcdef01234567 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n";
+    try std.testing.expectError(error.MalformedManifest, assetFromManifest(duplicate, "xaq-linux-x86_64"));
+}
+
+test "manifest rejects malformed and missing asset entries" {
+    const malformed_header = "xaq-edge-v1 not-a-commit\n";
+    try std.testing.expectError(error.MalformedManifest, assetFromManifest(malformed_header, "xaq-linux-x86_64"));
+
+    const malformed_checksum =
+        "xaq-edge-v1 0123456789abcdef0123456789abcdef01234567\n" ++
+        "xaq-linux-x86_64 xaq-linux-x86_64-0123456789abcdef0123456789abcdef01234567 zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\n";
+    try std.testing.expectError(error.MalformedManifest, assetFromManifest(malformed_checksum, "xaq-linux-x86_64"));
+
+    const missing = "xaq-edge-v1 0123456789abcdef0123456789abcdef01234567\n";
+    try std.testing.expectError(error.MissingAsset, assetFromManifest(missing, "xaq-linux-x86_64"));
 }
