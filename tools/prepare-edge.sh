@@ -35,7 +35,8 @@ manifest_tmp=$(mktemp "$dist/.edge-manifest.XXXXXX")
 cleanup() {
     rm -f "$manifest_tmp"
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
 printf 'xaq-edge-v1 %s\n' "$git_sha" > "$manifest_tmp"
 
 for platform in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64; do
@@ -59,5 +60,4 @@ for platform in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64; do
 done
 
 mv "$manifest_tmp" "$manifest"
-trap - EXIT HUP INT TERM
 "$(dirname "$0")/validate-edge-manifest.sh" "$manifest"

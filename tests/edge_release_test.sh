@@ -26,6 +26,19 @@ for platform in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64; do
     tar -czf "$dist/$asset.tar.gz" -C "$scratch" "$asset"
 done
 
+[ "$(find "$dist" -mindepth 1 -maxdepth 1 -type f -name 'xaq-*' | wc -l | tr -d ' ')" -eq 8 ] || \
+    fail 'xaq-* did not select all eight non-archived artifacts'
+workflow="$repo/.github/workflows/ci.yml"
+[ "$(grep -Fc 'archive: false' "$workflow")" -eq 2 ] || fail 'workflow must have two single-file uploads'
+[ "$(grep -Ec '^[[:space:]]+path: dist/xaq-.*matrix\.platform.*github\.sha' "$workflow")" -eq 2 ] || \
+    fail 'workflow upload paths changed'
+grep -Eq '^[[:space:]]+path: dist/xaq-.*github\.sha.*\.tar\.gz$' "$workflow" || \
+    fail 'workflow archive upload path changed'
+grep -Fq 'pattern: xaq-*' "$workflow" || fail 'download pattern does not match archive:false artifact names'
+if grep -Fq 'name: edge-' "$workflow"; then
+    fail 'workflow relies on a custom archive:false artifact name'
+fi
+
 "$repo/tools/prepare-edge.sh" "$dist" "$git_sha"
 manifest="$dist/edge-manifest-$git_sha"
 "$repo/tools/validate-edge-manifest.sh" "$manifest"

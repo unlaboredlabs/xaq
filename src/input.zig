@@ -163,7 +163,7 @@ pub fn readSecret(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer
                 }
                 if (final == '~' and parameter == 200) {
                     var cursor = buffer.items.len;
-                    _ = try pasteInto(gpa, &buffer, &cursor, reader);
+                    _ = try pasteInto(gpa, &buffer, &cursor, reader, null);
                     try drawSecret(output, label, buffer.items.len);
                 }
             },
@@ -516,7 +516,7 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                 }
             },
             0x1b => {
-                const second = (try takeByteOrNull(reader)) orelse continue;
+                const second = (try takeSequenceByte(reader, options.stop)) orelse continue;
                 if (options.busy and (second == '\r' or second == '\n')) {
                     submission_kind = .follow_up;
                     pending = '\n';
@@ -526,7 +526,7 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                 var param: usize = 0;
                 if (second == '[') {
                     var param_done = false;
-                    var next = (try takeByteOrNull(reader)) orelse continue;
+                    var next = (try takeSequenceByte(reader, options.stop)) orelse continue;
                     while (next < 0x40 or next > 0x7e) {
                         if (!param_done and next >= '0' and next <= '9') {
                             // Clamp: an adversarial digit run must not
@@ -536,11 +536,11 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                         } else {
                             param_done = true;
                         }
-                        next = (try takeByteOrNull(reader)) orelse break;
+                        next = (try takeSequenceByte(reader, options.stop)) orelse break;
                     }
                     if (next >= 0x40 and next <= 0x7e) final = next;
                 } else if (second == 'O') {
-                    final = (try takeByteOrNull(reader)) orelse 0;
+                    final = (try takeSequenceByte(reader, options.stop)) orelse 0;
                 } else if (second == 'b') { // alt-b: word left
                     cursor = prevWord(buffer.items, cursor);
                     dirty = true;
@@ -637,7 +637,7 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                         },
                         200 => {
                             const paste_start = cursor;
-                            input_truncated = !(try pasteInto(gpa, &buffer, &cursor, reader)) or input_truncated;
+                            input_truncated = !(try pasteInto(gpa, &buffer, &cursor, reader, options.stop)) or input_truncated;
                             try notePastedImagePaths(gpa, paths, buffer.items[paste_start..cursor], &pasted_image_paths);
                             selected = 0;
                             hist_pos = null;
@@ -810,7 +810,7 @@ fn load(gpa: std.mem.Allocator, buffer: *std.ArrayList(u8), text: []const u8) !b
 /// spaces. The paste is collected and inserted in one operation so inserting
 /// a large block in the middle of a prompt remains linear. False means the
 /// input limit was reached; the rest is still consumed through the terminator.
-fn pasteInto(gpa: std.mem.Allocator, buffer: *std.ArrayList(u8), cursor: *usize, reader: *Io.Reader) !bool {
+fn pasteInto(gpa: std.mem.Allocator, buffer: *std.ArrayList(u8), cursor: *usize, reader: *Io.Reader, stop: ?*const std.atomic.Value(bool)) !bool {
     const terminator = "\x1b[201~";
     var pasted: std.ArrayList(u8) = .empty;
     defer pasted.deinit(gpa);
@@ -819,7 +819,7 @@ fn pasteInto(gpa: std.mem.Allocator, buffer: *std.ArrayList(u8), cursor: *usize,
     var complete = true;
     const available = max_input_bytes - buffer.items.len;
     while (true) {
-        const byte = (try takeByteOrNull(reader)) orelse {
+        const byte = (try takeByteStopping(reader, stop)) orelse {
             for (terminator[0..matched]) |held| try appendPasteByte(gpa, &pasted, held, &previous, available, &complete);
             break;
         };
@@ -1727,6 +1727,34 @@ fn takeByteWithin(reader: *Io.Reader, timeout_ms: i32) !?u8 {
     return try takeByteOrNull(reader);
 }
 
+fn takeSequenceByte(reader: *Io.Reader, stop: ?*const std.atomic.Value(bool)) !?u8 {
+    if (stop) |flag| if (flag.load(.acquire)) return null;
+    if (!interactive) return takeByteOrNull(reader);
+    return takeByteWithin(reader, escape_sequence_timeout_ms);
+}
+
+/// Bracketed paste can legitimately arrive in chunks, so it has no short
+/// escape timeout. Polling still gives BusyInput.stop() a bounded wakeup and
+/// distinguishes an open-but-idle terminal from EOF.
+fn takeByteStopping(reader: *Io.Reader, stop: ?*const std.atomic.Value(bool)) !?u8 {
+    const flag = stop orelse return takeByteOrNull(reader);
+    if (!interactive) {
+        if (flag.load(.acquire)) return null;
+        return takeByteOrNull(reader);
+    }
+    while (true) {
+        if (flag.load(.acquire)) return null;
+        if (reader.bufferedLen() > 0) return takeByteOrNull(reader);
+        var descriptors = [_]std.posix.pollfd{.{
+            .fd = Io.File.stdin().handle,
+            .events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR,
+            .revents = 0,
+        }};
+        if (try std.posix.poll(&descriptors, 100) == 0) continue;
+        return takeByteOrNull(reader);
+    }
+}
+
 const InputEvent = union(enum) {
     byte: u8,
     resize,
@@ -2125,7 +2153,7 @@ test "bracketed paste grows beyond the old editor buffer and inserts once" {
     try buffer.appendSlice(std.testing.allocator, "tail");
     var cursor: usize = 0;
 
-    try std.testing.expect(try pasteInto(std.testing.allocator, &buffer, &cursor, &reader));
+    try std.testing.expect(try pasteInto(std.testing.allocator, &buffer, &cursor, &reader, null));
     try std.testing.expectEqual(paste_len, cursor);
     try std.testing.expectEqual(paste_len + "tail".len, buffer.items.len);
     try std.testing.expectEqualStrings("tail", buffer.items[paste_len..]);
@@ -2137,7 +2165,7 @@ test "bracketed paste normalizes line endings and control bytes" {
     defer buffer.deinit(std.testing.allocator);
     var cursor: usize = 0;
 
-    try std.testing.expect(try pasteInto(std.testing.allocator, &buffer, &cursor, &reader));
+    try std.testing.expect(try pasteInto(std.testing.allocator, &buffer, &cursor, &reader, null));
     try std.testing.expectEqualStrings("a\nb c", buffer.items);
 }
 
@@ -2150,7 +2178,7 @@ test "bracketed paste consumes excess input and reports the hard limit" {
     @memset(buffer.items, 'z');
     var cursor = buffer.items.len;
 
-    try std.testing.expect(!try pasteInto(std.testing.allocator, &buffer, &cursor, &reader));
+    try std.testing.expect(!try pasteInto(std.testing.allocator, &buffer, &cursor, &reader, null));
     try std.testing.expectEqual(max_input_bytes, buffer.items.len);
     try std.testing.expectEqualStrings("ab", buffer.items[buffer.items.len - 2 ..]);
     try std.testing.expectEqual(source.len, reader.seek);
@@ -2315,4 +2343,17 @@ test "busy input keeps steering and follow-ups in separate FIFO queues" {
     try std.testing.expectEqualStrings("later", later);
     try std.testing.expect(busy.take(.steer) == null);
     try std.testing.expect(busy.take(.follow_up) == null);
+}
+
+test "busy escape and paste continuations honor stop requests" {
+    var stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(true);
+    var reader = Io.Reader.fixed("unread");
+    try std.testing.expectEqual(@as(?u8, null), try takeSequenceByte(&reader, &stop));
+
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(std.testing.allocator);
+    var cursor: usize = 0;
+    try std.testing.expect(try pasteInto(std.testing.allocator, &buffer, &cursor, &reader, &stop));
+    try std.testing.expectEqual(@as(usize, 0), buffer.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cursor);
 }

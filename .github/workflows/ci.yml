@@ -62,7 +62,6 @@ jobs:
       - name: Upload edge binary
         uses: actions/upload-artifact@v7
         with:
-          name: edge-${{ matrix.platform }}-binary
           path: dist/xaq-${{ matrix.platform }}-${{ github.sha }}
           archive: false
           if-no-files-found: error
@@ -70,7 +69,6 @@ jobs:
       - name: Upload edge archive
         uses: actions/upload-artifact@v7
         with:
-          name: edge-${{ matrix.platform }}-archive
           path: dist/xaq-${{ matrix.platform }}-${{ github.sha }}.tar.gz
           archive: false
           if-no-files-found: error
@@ -92,7 +90,8 @@ jobs:
       - name: Download edge builds
         uses: actions/download-artifact@v8
         with:
-          pattern: edge-*
+          # upload-artifact v7 names an archive:false artifact after its one file.
+          pattern: xaq-*
           path: dist
           merge-multiple: true
       - name: Prepare edge manifest
