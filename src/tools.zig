@@ -1,8 +1,10 @@
 const std = @import("std");
 const Io = std.Io;
+const cancel = @import("cancel.zig");
 
 pub const names = [_][]const u8{ "read", "bash", "edit", "write" };
 pub const max_output = 50 * 1024;
+const output_payload = max_output - 512;
 
 pub fn schemas(s: *std.json.Stringify) !void {
     try s.beginArray();
@@ -105,6 +107,7 @@ fn read(gpa: std.mem.Allocator, io: Io, args: std.json.Value) ![]u8 {
     const offset: usize = @intCast(@max(optionalInt(args, "offset") orelse 1, 1));
     const limit: usize = @intCast(@max(optionalInt(args, "limit") orelse 2000, 1));
 
+    if (bytes.len == 0) return gpa.dupe(u8, "");
     var line: usize = 1;
     var start: usize = 0;
     while (line < offset and start < bytes.len) : (line += 1) {
@@ -115,35 +118,127 @@ fn read(gpa: std.mem.Allocator, io: Io, args: std.json.Value) ![]u8 {
     while (taken < limit and end < bytes.len) : (taken += 1) {
         end = (std.mem.indexOfScalarPos(u8, bytes, end, '\n') orelse bytes.len - 1) + 1;
     }
-    end = @min(end, @min(bytes.len, start + max_output));
-    return gpa.dupe(u8, bytes[start..end]);
+    const logical_end = @min(end, bytes.len);
+    end = @min(logical_end, @min(bytes.len, start + output_payload));
+    if (end == bytes.len and logical_end == bytes.len) return gpa.dupe(u8, bytes[start..end]);
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try out.writer.writeAll(bytes[start..end]);
+    const next_line = offset + std.mem.count(u8, bytes[start..end], "\n");
+    try out.writer.print("\n[truncated: continue with offset={d}]", .{next_line});
+    return out.toOwnedSlice();
 }
 
 fn bash(gpa: std.mem.Allocator, io: Io, args: std.json.Value) ![]u8 {
     const command = try fieldString(args, "command");
-    const seconds = optionalInt(args, "timeout");
-    const timeout: Io.Timeout = if (seconds) |n| .{ .duration = .{ .raw = .fromSeconds(@min(@max(n, 1), 3600)), .clock = .awake } } else .none;
-    const result = try std.process.run(gpa, io, .{
-        .argv = &.{ "/bin/sh", "-lc", command },
-        .stdout_limit = .limited(16 * 1024 * 1024),
-        .stderr_limit = .limited(16 * 1024 * 1024),
-        .timeout = timeout,
+    const seconds: u64 = @intCast(@min(@max(optionalInt(args, "timeout") orelse 600, 1), 3600));
+    const script = try std.fmt.allocPrint(gpa, "exec 2>&1\n{s}", .{command});
+    defer gpa.free(script);
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "/bin/bash", "-lc", script },
+        .stdout = .pipe,
+        .stderr = .inherit,
+        .pgid = 0,
     });
-    defer gpa.free(result.stdout);
-    defer gpa.free(result.stderr);
+    defer if (child.id != null) child.kill(io);
+    cancel.setChild(child.id.?);
+    defer cancel.clearChild();
+
+    var timed_out = std.atomic.Value(bool).init(false);
+    var timer = Io.async(io, killAfter, .{ io, child.id.?, seconds, &timed_out });
+    defer timer.cancel(io) catch {};
+
+    var capture = Capture.init(gpa, io);
+    defer capture.deinit();
+    var read_buffer: [8192]u8 = undefined;
+    var file_reader: Io.File.Reader = .init(child.stdout.?, io, &read_buffer);
+    var chunk: [8192]u8 = undefined;
+    while (true) {
+        const count = try file_reader.interface.readSliceShort(&chunk);
+        if (count == 0) break;
+        try capture.write(chunk[0..count]);
+    }
+    child.stdout.?.close(io);
+    child.stdout = null;
+    const term = try child.wait(io);
+    timer.cancel(io) catch {};
 
     var out: Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try out.writer.writeAll(result.stdout);
-    try out.writer.writeAll(result.stderr);
-    switch (result.term) {
+    if (capture.spill_path) |path| {
+        try out.writer.print("[output truncated: full output saved at {s}; showing last {d} bytes]\n", .{ path, capture.tail.items.len });
+    }
+    try out.writer.writeAll(capture.tail.items);
+    if (timed_out.load(.seq_cst)) {
+        try out.writer.print("\n[timeout after {d}s]", .{seconds});
+    } else if (cancel.requested()) {
+        try out.writer.writeAll("\n[interrupted]");
+    }
+    switch (term) {
         .exited => |code| if (code != 0) try out.writer.print("\n[exit {d}]", .{code}),
         .signal => |sig| try out.writer.print("\n[signal {d}]", .{@intFromEnum(sig)}),
         else => try out.writer.writeAll("\n[process terminated]"),
     }
-    const all = out.written();
-    return gpa.dupe(u8, if (all.len > max_output) all[all.len - max_output ..] else all);
+    return out.toOwnedSlice();
 }
+
+fn killAfter(io: Io, pid: std.posix.pid_t, seconds: u64, timed_out: *std.atomic.Value(bool)) Io.Cancelable!void {
+    try io.sleep(.fromSeconds(@intCast(seconds)), .awake);
+    timed_out.store(true, .seq_cst);
+    std.posix.kill(-pid, .TERM) catch return;
+    try io.sleep(.fromSeconds(2), .awake);
+    std.posix.kill(-pid, .KILL) catch {};
+}
+
+const Capture = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    tail: std.ArrayList(u8) = .empty,
+    spill: ?Io.File = null,
+    spill_path: ?[]u8 = null,
+
+    fn init(gpa: std.mem.Allocator, io: Io) Capture {
+        return .{ .gpa = gpa, .io = io };
+    }
+
+    fn deinit(self: *Capture) void {
+        if (self.spill) |file| file.close(self.io);
+        self.tail.deinit(self.gpa);
+        if (self.spill_path) |path| self.gpa.free(path);
+    }
+
+    fn write(self: *Capture, bytes: []const u8) !void {
+        if (self.spill == null and self.tail.items.len + bytes.len > output_payload) try self.startSpill();
+        if (self.spill) |file| try file.writeStreamingAll(self.io, bytes);
+        if (bytes.len >= output_payload) {
+            self.tail.clearRetainingCapacity();
+            try self.tail.appendSlice(self.gpa, bytes[bytes.len - output_payload ..]);
+            return;
+        }
+        const overflow = (self.tail.items.len + bytes.len) -| output_payload;
+        if (overflow > 0) {
+            std.mem.copyForwards(u8, self.tail.items[0 .. self.tail.items.len - overflow], self.tail.items[overflow..]);
+            self.tail.items.len -= overflow;
+        }
+        try self.tail.appendSlice(self.gpa, bytes);
+    }
+
+    fn startSpill(self: *Capture) !void {
+        var random: [8]u8 = undefined;
+        try self.io.randomSecure(&random);
+        const hex = std.fmt.bytesToHex(random, .lower);
+        const path = try std.fmt.allocPrint(self.gpa, "/tmp/xaq-tool-output-{s}.log", .{&hex});
+        errdefer self.gpa.free(path);
+        const file = try Io.Dir.cwd().createFile(self.io, path, .{
+            .exclusive = true,
+            .permissions = @enumFromInt(0o600),
+        });
+        errdefer file.close(self.io);
+        try file.writeStreamingAll(self.io, self.tail.items);
+        self.spill = file;
+        self.spill_path = path;
+    }
+};
 
 fn ensureParent(io: Io, path: []const u8) !void {
     if (std.fs.path.dirname(path)) |parent| {
@@ -211,4 +306,14 @@ test "tool names match pi defaults" {
     try std.testing.expectEqualStrings("bash", names[1]);
     try std.testing.expectEqualStrings("edit", names[2]);
     try std.testing.expectEqualStrings("write", names[3]);
+}
+
+test "bash combines stdout and stderr in production order" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"command":"printf 'one\\n'; printf 'two\\n' >&2","timeout":5}
+    , .{});
+    defer parsed.deinit();
+    const result = try execute(std.testing.allocator, std.testing.io, "bash", parsed.value);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("one\ntwo\n", result);
 }

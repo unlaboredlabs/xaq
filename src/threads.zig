@@ -1,0 +1,483 @@
+const std = @import("std");
+const Io = std.Io;
+const auth = @import("auth.zig");
+const types = @import("types.zig");
+
+pub const Thread = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    id: []u8,
+    path: []u8,
+
+    pub fn deinit(self: *Thread) void {
+        self.gpa.free(self.id);
+        self.gpa.free(self.path);
+        self.* = undefined;
+    }
+
+    pub fn appendEntry(self: *Thread, entry: types.Entry) !void {
+        var out: Io.Writer.Allocating = .init(self.gpa);
+        defer out.deinit();
+        var js: std.json.Stringify = .{ .writer = &out.writer };
+        try js.beginObject();
+        switch (entry) {
+            .user => |text| {
+                try field(&js, "type", "user");
+                try field(&js, "text", text);
+            },
+            .assistant => |answer| {
+                try field(&js, "type", "assistant");
+                try field(&js, "text", answer.text);
+                try js.objectField("calls");
+                try js.write(answer.calls);
+                try js.objectField("raw_items");
+                try js.write(answer.raw_items);
+                try js.objectField("usage");
+                try js.write(answer.usage);
+            },
+            .results => |results| {
+                try field(&js, "type", "results");
+                try js.objectField("results");
+                try js.write(results);
+            },
+        }
+        try js.endObject();
+        try out.writer.writeByte('\n');
+        try append(self.io, self.path, out.written());
+    }
+
+    pub fn appendReset(self: *Thread) !void {
+        try append(self.io, self.path, "{\"type\":\"reset\"}\n");
+    }
+
+    pub fn appendModel(self: *Thread, model: []const u8) !void {
+        try self.appendSetting("model", "model", model);
+    }
+
+    pub fn appendEffort(self: *Thread, effort: []const u8) !void {
+        try self.appendSetting("effort", "effort", effort);
+    }
+
+    fn appendSetting(self: *Thread, kind: []const u8, name: []const u8, value: []const u8) !void {
+        var out: Io.Writer.Allocating = .init(self.gpa);
+        defer out.deinit();
+        var js: std.json.Stringify = .{ .writer = &out.writer };
+        try js.beginObject();
+        try field(&js, "type", kind);
+        try field(&js, name, value);
+        try js.endObject();
+        try out.writer.writeByte('\n');
+        try append(self.io, self.path, out.written());
+    }
+};
+
+pub const Loaded = struct {
+    thread: Thread,
+    provider: auth.Provider,
+    model: []const u8,
+    effort: ?[]const u8,
+    entries: std.ArrayList(types.Entry),
+};
+
+pub const Summary = struct {
+    id: []u8,
+    modified: i96,
+    /// First line of the first user prompt in the thread; may be empty.
+    preview: []u8,
+
+    pub fn deinit(self: Summary, gpa: std.mem.Allocator) void {
+        gpa.free(self.id);
+        gpa.free(self.preview);
+    }
+};
+
+pub fn freeSummaries(gpa: std.mem.Allocator, summaries: []Summary) void {
+    for (summaries) |summary| summary.deinit(gpa);
+    gpa.free(summaries);
+}
+
+/// Newest saved threads for cwd. Free with `freeSummaries`.
+pub fn list(gpa: std.mem.Allocator, io: Io, home: []const u8, cwd: []const u8, exclude_id: ?[]const u8, limit: usize) ![]Summary {
+    const dir_path = try threadDir(gpa, home, cwd);
+    defer gpa.free(dir_path);
+    return listDir(gpa, io, dir_path, exclude_id, limit);
+}
+
+fn listDir(gpa: std.mem.Allocator, io: Io, dir_path: []const u8, exclude_id: ?[]const u8, limit: usize) ![]Summary {
+    var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return gpa.alloc(Summary, 0),
+        else => return err,
+    };
+    defer dir.close(io);
+    var summaries: std.ArrayList(Summary) = .empty;
+    errdefer {
+        for (summaries.items) |summary| summary.deinit(gpa);
+        summaries.deinit(gpa);
+    }
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
+        const id = entry.name[0 .. entry.name.len - ".jsonl".len];
+        if (!validId(id)) continue;
+        if (exclude_id) |excluded| if (std.mem.eql(u8, id, excluded)) continue;
+        const stat = dir.statFile(io, entry.name, .{}) catch continue;
+        try summaries.append(gpa, .{
+            .id = try gpa.dupe(u8, id),
+            .modified = stat.mtime.nanoseconds,
+            .preview = try gpa.alloc(u8, 0),
+        });
+    }
+    std.mem.sort(Summary, summaries.items, {}, newestFirst);
+    while (summaries.items.len > limit) summaries.pop().?.deinit(gpa);
+    // Previews are read only for the survivors to keep listing cheap.
+    for (summaries.items) |*summary| {
+        const preview = firstUserPreview(gpa, io, dir, summary.id) catch continue;
+        gpa.free(summary.preview);
+        summary.preview = preview;
+    }
+    return summaries.toOwnedSlice(gpa);
+}
+
+const preview_scan_bytes = 8 * 1024;
+const preview_max_bytes = 48;
+
+fn firstUserPreview(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, id: []const u8) ![]u8 {
+    var name_buffer: [64]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buffer, "{s}.jsonl", .{id});
+    var file = dir.openFile(io, name, .{}) catch return gpa.alloc(u8, 0);
+    defer file.close(io);
+    var read_buffer: [4096]u8 = undefined;
+    var file_reader: Io.File.Reader = .init(file, io, &read_buffer);
+    var chunk: [preview_scan_bytes]u8 = undefined;
+    var filled: usize = 0;
+    while (filled < chunk.len) {
+        const count = file_reader.interface.readSliceShort(chunk[filled..]) catch break;
+        if (count == 0) break;
+        filled += count;
+    }
+    const bytes = chunk[0..filled];
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, gpa, line, .{}) catch continue;
+        defer parsed.deinit();
+        const kind = objectString(parsed.value, "type") orelse continue;
+        if (!std.mem.eql(u8, kind, "user")) continue;
+        const text = objectString(parsed.value, "text") orelse continue;
+        const first_line = text[0 .. std.mem.findScalar(u8, text, '\n') orelse text.len];
+        const out = try gpa.alloc(u8, @min(first_line.len, preview_max_bytes));
+        for (out, first_line[0..out.len]) |*destination, byte| {
+            destination.* = if (byte < 0x20 or byte == 0x7f) ' ' else byte;
+        }
+        return out;
+    }
+    return gpa.alloc(u8, 0);
+}
+
+fn newestFirst(_: void, a: Summary, b: Summary) bool {
+    if (a.modified != b.modified) return a.modified > b.modified;
+    return std.mem.order(u8, a.id, b.id) == .lt;
+}
+
+/// Threads kept per directory; older ones are pruned on create.
+pub const retained_threads = 50;
+
+pub fn create(gpa: std.mem.Allocator, io: Io, home: []const u8, cwd: []const u8, provider: auth.Provider, model: []const u8, effort: ?[]const u8) !Thread {
+    const dir_path = try threadDir(gpa, home, cwd);
+    defer gpa.free(dir_path);
+    try Io.Dir.cwd().createDirPath(io, dir_path);
+    pruneDir(gpa, io, dir_path, retained_threads - 1) catch {};
+
+    var random: [12]u8 = undefined;
+    try io.randomSecure(&random);
+    var encoded: [16]u8 = undefined;
+    const id = std.base64.url_safe_no_pad.Encoder.encode(&encoded, &random);
+    const path = try std.fs.path.join(gpa, &.{ dir_path, id });
+    defer gpa.free(path);
+    const jsonl_path = try std.fmt.allocPrint(gpa, "{s}.jsonl", .{path});
+    errdefer gpa.free(jsonl_path);
+
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var js: std.json.Stringify = .{ .writer = &out.writer };
+    try js.beginObject();
+    try field(&js, "type", "meta");
+    try field(&js, "id", id);
+    try field(&js, "provider", @tagName(provider));
+    try field(&js, "model", model);
+    if (effort) |value| try field(&js, "effort", value);
+    try field(&js, "cwd", cwd);
+    try js.endObject();
+    try out.writer.writeByte('\n');
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = jsonl_path,
+        .data = out.written(),
+        .flags = .{ .exclusive = true, .permissions = @enumFromInt(0o600) },
+    });
+    return .{ .gpa = gpa, .io = io, .id = try gpa.dupe(u8, id), .path = jsonl_path };
+}
+
+/// Load an explicit thread ID, or the most recently modified thread for cwd.
+pub fn load(gpa: std.mem.Allocator, entry_gpa: std.mem.Allocator, io: Io, home: []const u8, cwd: []const u8, requested_id: ?[]const u8, exclude_id: ?[]const u8) !Loaded {
+    const dir_path = try threadDir(gpa, home, cwd);
+    defer gpa.free(dir_path);
+    const id = if (requested_id) |value|
+        if (validId(value)) try gpa.dupe(u8, value) else return error.InvalidThreadId
+    else
+        try latestId(gpa, io, dir_path, exclude_id);
+    errdefer gpa.free(id);
+    const filename = try std.fmt.allocPrint(gpa, "{s}.jsonl", .{id});
+    defer gpa.free(filename);
+    const path = try std.fs.path.join(gpa, &.{ dir_path, filename });
+    errdefer gpa.free(path);
+    const bytes = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 * 1024 * 1024));
+    defer gpa.free(bytes);
+
+    var provider: ?auth.Provider = null;
+    var model: ?[]const u8 = null;
+    var effort: ?[]const u8 = null;
+    var entries: std.ArrayList(types.Entry) = .empty;
+    errdefer entries.deinit(entry_gpa);
+    var last_reset_offset: usize = 0;
+    var scan_offset: usize = 0;
+    var scan = std.mem.splitScalar(u8, bytes, '\n');
+    while (scan.next()) |line| {
+        scan_offset += line.len + @intFromBool(scan_offset + line.len < bytes.len);
+        if (std.mem.eql(u8, line, "{\"type\":\"reset\"}")) last_reset_offset = scan_offset;
+    }
+    var line_offset: usize = 0;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        const this_offset = line_offset;
+        line_offset += line.len + @intFromBool(line_offset + line.len < bytes.len);
+        if (line.len == 0) continue;
+        var parsed = std.json.parseFromSlice(std.json.Value, gpa, line, .{}) catch continue;
+        defer parsed.deinit();
+        const kind = objectString(parsed.value, "type") orelse continue;
+        if (std.mem.eql(u8, kind, "meta")) {
+            provider = auth.Provider.parse(objectString(parsed.value, "provider") orelse continue);
+            model = try entry_gpa.dupe(u8, objectString(parsed.value, "model") orelse continue);
+            if (objectString(parsed.value, "effort")) |value| effort = try entry_gpa.dupe(u8, value);
+        } else if (std.mem.eql(u8, kind, "model")) {
+            model = try entry_gpa.dupe(u8, objectString(parsed.value, "model") orelse continue);
+        } else if (std.mem.eql(u8, kind, "effort")) {
+            effort = try entry_gpa.dupe(u8, objectString(parsed.value, "effort") orelse continue);
+        } else if (std.mem.eql(u8, kind, "reset")) {
+            entries.clearRetainingCapacity();
+        } else if (std.mem.eql(u8, kind, "user")) {
+            if (this_offset < last_reset_offset) continue;
+            try entries.append(entry_gpa, .{ .user = try entry_gpa.dupe(u8, objectString(parsed.value, "text") orelse "") });
+        } else if (std.mem.eql(u8, kind, "assistant")) {
+            if (this_offset < last_reset_offset) continue;
+            try entries.append(entry_gpa, .{ .assistant = try parseAssistant(entry_gpa, parsed.value) });
+        } else if (std.mem.eql(u8, kind, "results")) {
+            if (this_offset < last_reset_offset) continue;
+            try entries.append(entry_gpa, .{ .results = try parseResults(entry_gpa, parsed.value) });
+        }
+    }
+    return .{
+        .thread = .{ .gpa = gpa, .io = io, .id = id, .path = path },
+        .provider = provider orelse return error.InvalidThread,
+        .model = model orelse return error.InvalidThread,
+        .effort = effort,
+        .entries = entries,
+    };
+}
+
+fn validId(value: []const u8) bool {
+    if (value.len != 16) return false;
+    for (value) |byte| switch (byte) {
+        'A'...'Z', 'a'...'z', '0'...'9', '-', '_' => {},
+        else => return false,
+    };
+    return true;
+}
+
+fn parseAssistant(gpa: std.mem.Allocator, value: std.json.Value) !types.Assistant {
+    const calls_value = objectValue(value, "calls") orelse return error.InvalidThread;
+    const calls_items = switch (calls_value) {
+        .array => |array| array.items,
+        else => return error.InvalidThread,
+    };
+    const calls = try gpa.alloc(types.ToolCall, calls_items.len);
+    for (calls_items, 0..) |call, i| calls[i] = .{
+        .id = try gpa.dupe(u8, objectString(call, "id") orelse return error.InvalidThread),
+        .name = try gpa.dupe(u8, objectString(call, "name") orelse return error.InvalidThread),
+        .arguments = try gpa.dupe(u8, objectString(call, "arguments") orelse "{}"),
+    };
+    const raw_value = objectValue(value, "raw_items");
+    const raw_items = if (raw_value) |raw| switch (raw) {
+        .array => |array| blk: {
+            const items = try gpa.alloc([]const u8, array.items.len);
+            for (array.items, 0..) |item, i| items[i] = try gpa.dupe(u8, switch (item) {
+                .string => |text| text,
+                else => return error.InvalidThread,
+            });
+            break :blk items;
+        },
+        else => return error.InvalidThread,
+    } else &.{};
+    var usage: types.Usage = .{};
+    if (objectValue(value, "usage")) |usage_value| {
+        usage.input = objectUnsigned(usage_value, "input") orelse 0;
+        usage.cached = objectUnsigned(usage_value, "cached") orelse 0;
+        usage.output = objectUnsigned(usage_value, "output") orelse 0;
+    }
+    return .{
+        .text = try gpa.dupe(u8, objectString(value, "text") orelse ""),
+        .calls = calls,
+        .raw_items = raw_items,
+        .usage = usage,
+    };
+}
+
+fn parseResults(gpa: std.mem.Allocator, value: std.json.Value) ![]const types.ToolResult {
+    const results_value = objectValue(value, "results") orelse return error.InvalidThread;
+    const items = switch (results_value) {
+        .array => |array| array.items,
+        else => return error.InvalidThread,
+    };
+    const results = try gpa.alloc(types.ToolResult, items.len);
+    for (items, 0..) |result, i| results[i] = .{
+        .id = try gpa.dupe(u8, objectString(result, "id") orelse return error.InvalidThread),
+        .text = try gpa.dupe(u8, objectString(result, "text") orelse ""),
+    };
+    return results;
+}
+
+/// Best-effort: delete the oldest thread files beyond `keep`.
+fn pruneDir(gpa: std.mem.Allocator, io: Io, dir_path: []const u8, keep: usize) !void {
+    var dir = Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    var summaries: std.ArrayList(Summary) = .empty;
+    defer {
+        for (summaries.items) |summary| summary.deinit(gpa);
+        summaries.deinit(gpa);
+    }
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
+        const id = entry.name[0 .. entry.name.len - ".jsonl".len];
+        if (!validId(id)) continue;
+        const stat = dir.statFile(io, entry.name, .{}) catch continue;
+        try summaries.append(gpa, .{
+            .id = try gpa.dupe(u8, id),
+            .modified = stat.mtime.nanoseconds,
+            .preview = try gpa.alloc(u8, 0),
+        });
+    }
+    if (summaries.items.len <= keep) return;
+    std.mem.sort(Summary, summaries.items, {}, newestFirst);
+    for (summaries.items[keep..]) |summary| {
+        var name_buffer: [64]u8 = undefined;
+        const name = std.fmt.bufPrint(&name_buffer, "{s}.jsonl", .{summary.id}) catch continue;
+        dir.deleteFile(io, name) catch {};
+    }
+}
+
+fn latestId(gpa: std.mem.Allocator, io: Io, dir_path: []const u8, exclude_id: ?[]const u8) ![]u8 {
+    const summaries = try listDir(gpa, io, dir_path, exclude_id, 1);
+    if (summaries.len == 0) {
+        gpa.free(summaries);
+        return error.NoThreads;
+    }
+    const id = summaries[0].id;
+    gpa.free(summaries[0].preview);
+    gpa.free(summaries);
+    return id;
+}
+
+fn threadDir(gpa: std.mem.Allocator, home: []const u8, cwd: []const u8) ![]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(cwd, &digest, .{});
+    const key = std.fmt.bytesToHex(digest[0..8], .lower);
+    return std.fs.path.join(gpa, &.{ home, ".config", "xaq", "threads", &key });
+}
+
+fn append(io: Io, path: []const u8, bytes: []const u8) !void {
+    var file = try Io.Dir.cwd().createFile(io, path, .{
+        .truncate = false,
+        .lock = .exclusive,
+        .permissions = @enumFromInt(0o600),
+    });
+    defer file.close(io);
+    const stat = try file.stat(io);
+    var buffer: [4096]u8 = undefined;
+    var writer: Io.File.Writer = .init(file, io, &buffer);
+    try writer.seekTo(stat.size);
+    try writer.interface.writeAll(bytes);
+    try writer.interface.flush();
+}
+
+fn field(js: *std.json.Stringify, name: []const u8, value: []const u8) !void {
+    try js.objectField(name);
+    try js.write(value);
+}
+
+fn objectValue(value: std.json.Value, key: []const u8) ?std.json.Value {
+    return switch (value) {
+        .object => |object| object.get(key),
+        else => null,
+    };
+}
+
+fn objectString(value: std.json.Value, key: []const u8) ?[]const u8 {
+    return if (objectValue(value, key)) |item| switch (item) {
+        .string => |text| text,
+        else => null,
+    } else null;
+}
+
+fn objectUnsigned(value: std.json.Value, key: []const u8) ?u64 {
+    return if (objectValue(value, key)) |item| switch (item) {
+        .integer => |number| if (number >= 0) @intCast(number) else null,
+        else => null,
+    } else null;
+}
+
+test "thread directory is stable for a working directory" {
+    const a = try threadDir(std.testing.allocator, "/home/test", "/work/a");
+    defer std.testing.allocator.free(a);
+    const b = try threadDir(std.testing.allocator, "/home/test", "/work/a");
+    defer std.testing.allocator.free(b);
+    try std.testing.expectEqualStrings(a, b);
+    try std.testing.expect(std.mem.startsWith(u8, a, "/home/test/.config/xaq/threads/"));
+}
+
+test "thread IDs cannot escape their directory" {
+    try std.testing.expect(validId("Abcdef012345_-xy"));
+    try std.testing.expect(!validId("../../auth.json"));
+    try std.testing.expect(!validId("too-short"));
+}
+
+test "thread JSONL resumes state after the last reset" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const home = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path});
+    defer std.testing.allocator.free(home);
+    var thread = try create(std.testing.allocator, std.testing.io, home, "/work/project", .chatgpt, "model-a", "high");
+    const id = try std.testing.allocator.dupe(u8, thread.id);
+    defer std.testing.allocator.free(id);
+    try thread.appendEntry(.{ .user = "old" });
+    try thread.appendReset();
+    try thread.appendEntry(.{ .user = "new" });
+    const summaries = try list(std.testing.allocator, std.testing.io, home, "/work/project", null, 8);
+    defer freeSummaries(std.testing.allocator, summaries);
+    try std.testing.expectEqual(@as(usize, 1), summaries.len);
+    try std.testing.expectEqualStrings(id, summaries[0].id);
+    try std.testing.expectEqualStrings("old", summaries[0].preview);
+    const excluded = try list(std.testing.allocator, std.testing.io, home, "/work/project", id, 8);
+    defer freeSummaries(std.testing.allocator, excluded);
+    try std.testing.expectEqual(@as(usize, 0), excluded.len);
+    thread.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var loaded = try load(std.testing.allocator, arena.allocator(), std.testing.io, home, "/work/project", id, null);
+    defer loaded.thread.deinit();
+    try std.testing.expectEqual(auth.Provider.chatgpt, loaded.provider);
+    try std.testing.expectEqualStrings("model-a", loaded.model);
+    try std.testing.expectEqualStrings("high", loaded.effort.?);
+    try std.testing.expectEqual(@as(usize, 1), loaded.entries.items.len);
+    try std.testing.expectEqualStrings("new", loaded.entries.items[0].user);
+}
