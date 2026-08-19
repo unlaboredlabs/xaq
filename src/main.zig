@@ -247,6 +247,7 @@ test {
     _ = @import("settings.zig");
     _ = @import("spin.zig");
     _ = @import("stream.zig");
+    _ = @import("subagents.zig");
     _ = @import("term.zig");
     _ = @import("tools.zig");
     _ = @import("transport.zig");
