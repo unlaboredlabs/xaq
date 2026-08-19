@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
+const spin = @import("spin.zig");
 const transport = @import("transport.zig");
 
 pub const Provider = enum {
@@ -394,10 +395,9 @@ fn loginGrok(gpa: std.mem.Allocator, io: Io, output: *Io.Writer) !Credential {
     openBrowser(gpa, io, uri);
     try output.print("Open {s} and enter: {s}\n", .{ uri, user });
     try output.flush();
-    // One dot per poll keeps the wait visibly alive without a raw-mode UI.
+    spin.start(io, "waiting for approval");
+    defer spin.stop();
     while (true) {
-        try output.writeAll(".");
-        try output.flush();
         try io.sleep(.fromSeconds(@max(interval, 1)), .awake);
         const poll_body = try transport.formEncode(gpa, &.{
             .{ "grant_type", "urn:ietf:params:oauth:grant-type:device_code" }, .{ "client_id", xai_client }, .{ "device_code", device },
@@ -405,17 +405,11 @@ fn loginGrok(gpa: std.mem.Allocator, io: Io, output: *Io.Writer) !Credential {
         defer gpa.free(poll_body);
         const poll = try transport.post(gpa, io, "https://auth.x.ai/oauth2/token", "application/x-www-form-urlencoded", &.{}, poll_body);
         defer gpa.free(poll.body);
-        if (poll.status >= 200 and poll.status < 300) {
-            try output.writeByte('\n');
-            try output.flush();
-            return tokenCredential(gpa, io, poll.body, null);
-        }
+        if (poll.status >= 200 and poll.status < 300) return tokenCredential(gpa, io, poll.body, null);
         var problem = parseJson(gpa, poll.body) catch continue;
         defer problem.deinit();
         const kind = string(problem.value, "error") catch continue;
         if (std.mem.eql(u8, kind, "authorization_pending") or std.mem.eql(u8, kind, "slow_down")) continue;
-        try output.writeByte('\n');
-        try output.flush();
         try requireStatus(poll);
     }
 }

@@ -7,10 +7,12 @@ const input_mod = @import("input.zig");
 const log = @import("log.zig");
 const models = @import("models.zig");
 const settings_mod = @import("settings.zig");
+const spin = @import("spin.zig");
 const term = @import("term.zig");
 const threads = @import("threads.zig");
 const tools = @import("tools.zig");
 const transport = @import("transport.zig");
+const tui = @import("tui.zig");
 const types = @import("types.zig");
 
 pub const ToolCall = types.ToolCall;
@@ -204,12 +206,14 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
         try session.appendUser(prompt);
     }
 
+    syncTui(&session);
     var exchange_start = Io.Clock.now(.awake, io);
     var exchange_base = session.usage;
     while (true) {
         try setTitle(&session, true);
         _ = try compactIfNeeded(&session, false);
         session.turn += 1;
+        tui.noteState(.thinking, "");
         const answer = performRound(&session) catch |err| switch (err) {
             error.NotLoggedIn => {
                 try options.output.print("not logged in; run: xaq login {s}\n", .{@tagName(session.provider)});
@@ -230,6 +234,8 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
                 try writeDuration(options.output, interrupted_ms);
                 try options.output.writeByte('\n');
                 try options.output.flush();
+                tui.noteState(.idle, "");
+                syncTui(&session);
                 const reader = options.input orelse return error.Interrupted;
                 const prompt = (try readPrompt(&session, reader, prefill)) orelse return;
                 defer gpa.free(prompt);
@@ -245,7 +251,9 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
         session.usage.output += answer.usage.output;
         log.logf("usage", "event=tokens turn={d} input={d} cached={d} output={d} session_input={d} session_cached={d} session_output={d}", .{ session.turn, answer.usage.input, answer.usage.cached, answer.usage.output, session.usage.input, session.usage.cached, session.usage.output });
         try session.appendEntry(.{ .assistant = answer });
+        syncTui(&session);
         if (answer.calls.len == 0) {
+            tui.noteState(.idle, "");
             log.flush();
             try options.output.writeByte('\n');
             if (options.input != null) {
@@ -268,6 +276,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
 
         const results = try session.allocator().alloc(ToolResult, answer.calls.len);
         for (answer.calls, 0..) |call, i| {
+            tui.noteState(.tooling, call.name);
             const start = Io.Clock.now(.awake, io);
             var scratch: std.heap.ArenaAllocator = .init(gpa);
             defer scratch.deinit();
@@ -316,6 +325,7 @@ fn readPrompt(session: *Session, reader: *Io.Reader, prefill: ?[]const u8) !?[]c
             const keep_going = try runCommand(session, reader, line[1..]);
             session.gpa.free(line);
             if (!keep_going) return null;
+            syncTui(session);
             continue;
         }
         return line;
@@ -907,6 +917,16 @@ fn compactIfNeeded(session: *Session, force: bool) !bool {
     return true;
 }
 
+/// Push identity and usage into the fullscreen status bar; no-op in
+/// plain mode.
+fn syncTui(session: *Session) void {
+    if (!tui.active) return;
+    const window = models.contextWindow(session.provider, session.model);
+    const percent: u8 = @intCast(@min(estimatedContextTokens(session) * 100 / @max(window, 1), 100));
+    tui.noteIdentity(@tagName(session.provider), session.model, if (session.thread) |thread| thread.id else null);
+    tui.noteUsage(session.usage.input, session.usage.output, percent);
+}
+
 fn estimatedContextTokens(session: *const Session) usize {
     const instruction_tokens = (session.instructions.len + 3) / 4;
     return types.approximateTokens(session.entries.items) + instruction_tokens + 2048;
@@ -1340,20 +1360,17 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
         defer credential_arena.deinit();
         const credential = try auth.credential(credential_arena.allocator(), session.io, session.home, session.provider);
         var decoder = Decoder.init(session.provider, session.gpa, session.allocator(), output);
-        // An animated placeholder covers the silent reasoning gap; every
-        // streamed event advances one frame, and it is erased before the
-        // first visible output. Compact rounds stream into a sink, so
-        // their spinner draws on the terminal and spins until finished.
-        if (term.enabled) {
-            if (std.mem.eql(u8, kind, "compact")) {
-                decoder.spinner_output = session.output;
-                decoder.spinner_label = "compacting";
-            }
-            decoder.indicator = true;
-            try decoder.tickSpinner();
-        }
+        // A continuously animated placeholder covers the wait; it runs on
+        // its own Io task, so it keeps moving even while the provider is
+        // silent. Main rounds stop it just before the first visible
+        // output; compact rounds stream into a sink, so theirs spins
+        // until the round finishes.
+        const compacting = std.mem.eql(u8, kind, "compact");
+        decoder.stop_spinner = !compacting;
+        try output.flush();
+        spin.start(session.io, if (compacting) "compacting" else "thinking");
         const response = requestStream(session.gpa, session.io, session.provider, credential, body, &decoder) catch |err| {
-            decoder.clearIndicator() catch {};
+            spin.stop();
             if (err == error.Cancelled or err == error.ProviderRequestFailed) return err;
             if (decoder.received) {
                 try output.writeAll("\n[stream interrupted; partial response saved]\n");
@@ -1361,13 +1378,14 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
                 return decoder.finish();
             }
             if (attempt + 1 < 3 and retryableTransport(err)) {
-                try printRetry(session, attempt + 1);
+                spin.start(session.io, "retrying");
+                defer spin.stop();
                 try session.io.sleep(.fromSeconds(@intCast(attempt + 1)), .awake);
                 continue;
             }
             return err;
         };
-        decoder.clearIndicator() catch {};
+        spin.stop();
         defer session.gpa.free(response.body);
         log.logf("agent", "event=response kind={s} turn={d} status={d} attempt={d}", .{ kind, session.turn, response.status, attempt + 1 });
         if (response.status >= 200 and response.status < 300) return decoder.finish();
@@ -1380,7 +1398,8 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
         }
         if (attempt + 1 < 3 and retryableStatus(response.status)) {
             const delay = @min(response.retry_after_seconds orelse @as(u64, @intCast(attempt + 1)), 30);
-            try printRetry(session, delay);
+            spin.start(session.io, "retrying");
+            defer spin.stop();
             try session.io.sleep(.fromSeconds(@intCast(delay)), .awake);
             continue;
         }
@@ -1397,13 +1416,6 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
         return error.ProviderRequestFailed;
     }
     return error.ProviderRequestFailed;
-}
-
-/// Dim one-liner before a backoff sleep, so retries never look like a hang.
-fn printRetry(session: *Session, seconds: u64) !void {
-    if (!term.enabled) return;
-    try session.output.print("{s}[retrying in {d}s]{s}\n", .{ term.dim(), seconds, term.reset() });
-    try session.output.flush();
 }
 
 /// Extract the human-facing message from a JSON provider error body
@@ -1481,42 +1493,12 @@ const Decoder = struct {
     claude_calls: std.ArrayList(StreamingClaudeCall) = .empty,
     usage: Usage = .{},
     received: bool = false,
-    indicator: bool = false,
-    spinner_frame: usize = 0,
-    spinner_output: ?*Io.Writer = null,
-    spinner_label: []const u8 = "thinking",
+    /// Main rounds stop the shared spinner before the first visible
+    /// output; compact rounds stream into a sink and leave it running.
+    stop_spinner: bool = true,
 
-    const spinner_frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
-
-    fn spinnerTarget(self: *Decoder) *Io.Writer {
-        return self.spinner_output orelse self.safe.output;
-    }
-
-    /// Redraw the animated `⠙ thinking` placeholder in place; each streamed
-    /// event advances one frame, so silent reasoning still shows activity.
-    fn tickSpinner(self: *Decoder) !void {
-        if (!self.indicator) return;
-        const target = self.spinnerTarget();
-        try target.print("\r{s}{s} {s}{s}", .{ term.dim(), spinner_frames[self.spinner_frame], self.spinner_label, term.reset() });
-        try target.flush();
-        self.spinner_frame = (self.spinner_frame + 1) % spinner_frames.len;
-    }
-
-    /// Erase the placeholder line.
-    fn clearIndicator(self: *Decoder) !void {
-        if (!self.indicator) return;
-        self.indicator = false;
-        const target = self.spinnerTarget();
-        try target.writeAll("\r\x1b[K");
-        try target.flush();
-    }
-
-    /// Erase the placeholder before visible output lands on the same
-    /// writer. When the spinner draws elsewhere (compact rounds stream
-    /// into a sink) it keeps spinning until the round finishes.
-    fn clearBeforeOutput(self: *Decoder) !void {
-        if (self.spinner_output != null) return;
-        try self.clearIndicator();
+    fn beforeOutput(self: *Decoder) void {
+        if (self.stop_spinner) spin.stop();
     }
 
     fn init(provider: auth.Provider, parse_gpa: std.mem.Allocator, persist: std.mem.Allocator, output: *Io.Writer) Decoder {
@@ -1537,7 +1519,6 @@ const Decoder = struct {
         var parsed = std.json.parseFromSlice(std.json.Value, self.parse_gpa, data, .{}) catch return;
         defer parsed.deinit();
         self.received = true;
-        try self.tickSpinner();
         if (self.provider == .claude) {
             try self.feedClaude(parsed.value, data);
         } else {
@@ -1549,12 +1530,11 @@ const Decoder = struct {
         const kind = eventString(value, "type") orelse return;
         if (std.mem.eql(u8, kind, "response.output_text.delta")) {
             const delta = eventString(value, "delta") orelse return;
-            try self.clearBeforeOutput();
+            self.beforeOutput();
             try self.text.writer.writeAll(delta);
             try self.safe.write(delta);
             try self.safe.output.flush();
         } else if (std.mem.eql(u8, kind, "response.output_item.done")) {
-            try self.clearBeforeOutput();
             const item = switch (value) {
                 .object => |object| object.get("item") orelse return,
                 else => return,
@@ -1585,7 +1565,6 @@ const Decoder = struct {
     fn feedClaude(self: *Decoder, value: std.json.Value, data: []const u8) !void {
         const kind = eventString(value, "type") orelse return;
         if (std.mem.eql(u8, kind, "content_block_start")) {
-            try self.clearBeforeOutput();
             const index = switch (value.object.get("index") orelse return) {
                 .integer => |number| number,
                 else => return,
@@ -1604,7 +1583,7 @@ const Decoder = struct {
             const delta_type = eventString(delta, "type") orelse return;
             if (std.mem.eql(u8, delta_type, "text_delta")) {
                 const part = eventString(delta, "text") orelse return;
-                try self.clearBeforeOutput();
+                self.beforeOutput();
                 try self.text.writer.writeAll(part);
                 try self.safe.write(part);
                 try self.safe.output.flush();
@@ -1634,7 +1613,6 @@ const Decoder = struct {
     }
 
     fn finish(self: *Decoder) !Assistant {
-        try self.clearIndicator();
         if (self.provider == .claude) {
             for (self.claude_calls.items) |*call| try self.calls.append(self.persist, .{
                 .id = call.id,
@@ -1717,22 +1695,6 @@ test "compact requests omit coding tools and use the selected model" {
     const chatgpt = try buildCompactRequest(std.testing.allocator, .chatgpt, "gpt-5.6-sol", .low, &.{.{ .user = "keep this decision" }});
     defer std.testing.allocator.free(chatgpt);
     try std.testing.expect(std.mem.indexOf(u8, chatgpt, "max_output_tokens") == null);
-}
-
-test "spinner ticks frames in place and clears" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    var buffer: [256]u8 = undefined;
-    var writer: Io.Writer = .fixed(&buffer);
-    var decoder = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), &writer);
-    try decoder.tickSpinner(); // inactive: draws nothing
-    try std.testing.expectEqualStrings("", writer.buffered());
-    decoder.indicator = true;
-    try decoder.tickSpinner();
-    try decoder.tickSpinner();
-    try decoder.clearIndicator();
-    try decoder.clearIndicator(); // idempotent
-    try std.testing.expectEqualStrings("\r⠋ thinking\r⠙ thinking\r\x1b[K", writer.buffered());
 }
 
 test "decode Responses SSE" {
