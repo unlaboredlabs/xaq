@@ -37,14 +37,17 @@ jobs:
             *) echo "unsupported runner: ${RUNNER_OS}/${RUNNER_ARCH}" >&2; exit 1 ;;
           esac
           package="xaq-${platform}"
-          mkdir -p "dist/${package}"
-          cp zig-out/bin/xaq README.md LICENSE "dist/${package}/"
-          tar -czf "dist/${package}.tar.gz" -C dist "${package}"
+          package_dir="${RUNNER_TEMP}/${package}"
+          mkdir -p dist "${package_dir}"
+          cp zig-out/bin/xaq "dist/${package}"
+          cp zig-out/bin/xaq README.md LICENSE "${package_dir}/"
+          tar -czf "dist/${package}.tar.gz" -C "${RUNNER_TEMP}" "${package}"
       - name: Upload edge build
         if: github.event_name == 'push'
         uses: actions/upload-artifact@v7
         with:
-          path: dist/*.tar.gz
+          name: xaq-${{ runner.os }}-${{ runner.arch }}
+          path: dist/xaq-*
           archive: false
           if-no-files-found: error
           retention-days: 1
@@ -62,7 +65,7 @@ jobs:
       - name: Download edge builds
         uses: actions/download-artifact@v8
         with:
-          pattern: xaq-*.tar.gz
+          pattern: xaq-*
           path: dist
           merge-multiple: true
       - name: Publish edge release
@@ -70,7 +73,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd dist
-          sha256sum *.tar.gz > SHA256SUMS
+          sha256sum xaq-* > SHA256SUMS
           cd ..
 
           if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/edge" >/dev/null 2>&1; then
