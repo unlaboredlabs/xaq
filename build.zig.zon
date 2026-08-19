@@ -1,0 +1,7 @@
+.{
+    .name = .xaq,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .fingerprint = 0xfe47fbb6488d8c3a,
+    .paths = .{ "build.zig", "build.zig.zon", "src", "README.md", "LICENSE" },
+}
