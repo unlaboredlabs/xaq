@@ -7,6 +7,7 @@ const log = @import("log.zig");
 const term = @import("term.zig");
 const threads = @import("threads.zig");
 const tui = @import("tui.zig");
+const update = @import("update.zig");
 
 const version_string = "0.1.0";
 
@@ -131,6 +132,27 @@ pub fn main(init: std.process.Init) !void {
             var age_buffer: [24]u8 = undefined;
             try output.print("{s}  {s:<7} {s}\n", .{ summary.id, agent.fmtAge(&age_buffer, now_seconds, summary.modified), summary.preview });
         }
+        return;
+    }
+    if (args.len > 1 and std.mem.eql(u8, args[1], "update")) {
+        if (args.len != 2) fatal(io, "update takes no arguments", .{});
+        update.run(gpa, io) catch |err| {
+            const message: []const u8 = switch (err) {
+                error.UnsupportedPlatform => "no edge build is available for this platform",
+                error.CurlNotFound => "curl is required to download the edge release",
+                error.DownloadFailed => "could not download the edge release",
+                error.ReleaseTooLarge => "the edge release exceeds the download size limit",
+                error.MalformedManifest => "the edge manifest is malformed",
+                error.MissingAsset => "the edge manifest has no entry for this platform",
+                error.ChecksumMismatch => "the downloaded edge binary failed checksum verification",
+                error.PermissionDenied, error.ReadOnlyFileSystem => "cannot replace this executable; check its directory permissions",
+                else => @errorName(err),
+            };
+            errout.print("xaq: update failed: {s}\n", .{message}) catch {};
+            errout.flush() catch {};
+            std.process.exit(1);
+        };
+        try output.writeAll("updated xaq to the latest edge release\n");
         return;
     }
 
