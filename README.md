@@ -31,7 +31,8 @@ To build from source, install Zig 0.16.0 and `curl`, then run:
 git clone https://github.com/unlaboredlabs/xaq.git
 cd xaq
 zig build -Doptimize=ReleaseSmall
-install -Dm755 zig-out/bin/xaq "$HOME/.local/bin/xaq"
+mkdir -p "$HOME/.local/bin"
+install -m 755 zig-out/bin/xaq "$HOME/.local/bin/xaq"
 ```
 
 ## Authenticate
@@ -107,7 +108,7 @@ xaq -i before.png -i after.png 'compare these layouts'
 
 In an interactive session, press `Ctrl-V` to attach an image from the desktop clipboard, or drop an image file into the prompt. Attached paths collapse to numbered markers such as `[Image #1]`. Linux clipboard paste uses `wl-paste` or `xclip`; dropped paths work without either utility. You can also type a path, prefixing a relative path with `@` when it could be mistaken for normal text, such as `@screenshots/error.png`. PNG, JPEG, GIF, and WebP files up to 5 MiB each are supported. Grok accepts PNG and JPEG only. Image attachments are saved in thread history, so resumed conversations keep them.
 
-One-shot stdout contains only the answer, so it pipes cleanly. Tool traces go to stderr. A bare argument and `-p PROMPT` are equivalent; use `--` before a prompt that starts with `-`.
+When plain one-shot stdout is piped or redirected, it contains only the answer and tool traces go to stderr. On a terminal, a plain one-shot writes both to stdout. A bare argument and `-p PROMPT` are equivalent; use `--` before a prompt that starts with `-`.
 
 Use `--output-format json` when a script needs the final answer and run metadata as one JSON object:
 
@@ -115,7 +116,7 @@ Use `--output-format json` when a script needs the final answer and run metadata
 xaq --output-format json 'review the staged changes' | jq -r '.text'
 ```
 
-The object includes `text`, `stop_reason`, `provider`, `model`, `thread_id`, token `usage`, `num_turns`, and `tool_calls`. Use `--output-format streaming-json` for live JSONL events. Its event types are `start`, `turn_start`, `text`, `tool_call`, `tool_result`, `usage`, `end`, and `error`; `end` is the authoritative final result. Structured formats work only on one-shot runs and keep tool traces on stderr.
+The object includes `text`, `stop_reason`, `provider`, `model`, `thread_id`, token `usage`, `num_turns`, and `tool_calls`. `stop_reason` is `completed` unless a transport failure leaves a saved partial answer, which reports `stream_interrupted`. Use `--output-format streaming-json` for live JSONL events. Its event types are `start`, `turn_start`, `text`, `tool_call`, `tool_result`, `usage`, `end`, and `error`; `end` is the authoritative final result. Structured formats work only on one-shot runs and keep tool traces on stderr.
 
 Override model behavior when needed:
 
@@ -130,7 +131,7 @@ Run `xaq --help` for the complete CLI syntax.
 
 ## Threads and context
 
-Interactive turns are saved as cwd-scoped JSONL under `~/.config/xaq/threads/`. Resume the latest thread with `xaq -c`, choose one with `/resume`, or list IDs with `xaq threads`. Resuming replays its user and assistant messages into the transcript. The newest 50 threads per directory are retained. Start with `xaq --no-save` to keep the conversation and its prompt history only in memory.
+Interactive turns are saved as cwd-scoped JSONL under `~/.config/xaq/threads/`. Resume the latest thread with `xaq -c`, choose among the newest eight candidates with `/resume`, or list the newest 50 IDs with `xaq threads`. Resuming replays its user and assistant messages into the transcript. When a new thread starts, `xaq` prunes files beyond the newest 50 only if they have not been modified for 24 hours. Recent or active threads remain on disk, so a directory can temporarily contain more than 50. Start with `xaq --no-save` to keep the conversation and its prompt history only in memory.
 
 `/rewind` removes the latest user turn and everything after it from the transcript without reverting files. Pass a count to remove more turns. `/fork` copies the visible transcript into a new thread and makes that copy active, leaving the original unchanged.
 
