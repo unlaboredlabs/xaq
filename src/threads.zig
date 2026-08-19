@@ -64,9 +64,13 @@ pub const Thread = struct {
     fn writeEntryLine(js: *std.json.Stringify, writer: *Io.Writer, entry: types.Entry) !void {
         try js.beginObject();
         switch (entry) {
-            .user => |text| {
+            .user => |user| {
                 try field(js, "type", "user");
-                try field(js, "text", text);
+                try field(js, "text", user.text);
+                if (user.images.len > 0) {
+                    try js.objectField("images");
+                    try js.write(user.images);
+                }
             },
             .assistant => |answer| {
                 try field(js, "type", "assistant");
@@ -330,7 +334,10 @@ pub fn load(gpa: std.mem.Allocator, entry_gpa: std.mem.Allocator, io: Io, home: 
             entries.clearRetainingCapacity();
         } else if (std.mem.eql(u8, kind, "user")) {
             if (this_offset < last_reset_offset) continue;
-            try entries.append(entry_gpa, .{ .user = try entry_gpa.dupe(u8, objectString(parsed.value, "text") orelse "") });
+            try entries.append(entry_gpa, .{ .user = .{
+                .text = try entry_gpa.dupe(u8, objectString(parsed.value, "text") orelse ""),
+                .images = try parseImages(entry_gpa, parsed.value),
+            } });
         } else if (std.mem.eql(u8, kind, "assistant")) {
             if (this_offset < last_reset_offset) continue;
             try entries.append(entry_gpa, .{ .assistant = try parseAssistant(entry_gpa, parsed.value) });
@@ -394,6 +401,21 @@ fn parseAssistant(gpa: std.mem.Allocator, value: std.json.Value) !types.Assistan
         .raw_items = raw_items,
         .usage = usage,
     };
+}
+
+fn parseImages(gpa: std.mem.Allocator, value: std.json.Value) ![]const types.Image {
+    const images_value = objectValue(value, "images") orelse return &.{};
+    const items = switch (images_value) {
+        .array => |array| array.items,
+        else => return error.InvalidThread,
+    };
+    const images = try gpa.alloc(types.Image, items.len);
+    for (items, 0..) |image, index| images[index] = .{
+        .name = try gpa.dupe(u8, objectString(image, "name") orelse "image"),
+        .media_type = try gpa.dupe(u8, objectString(image, "media_type") orelse return error.InvalidThread),
+        .data = try gpa.dupe(u8, objectString(image, "data") orelse return error.InvalidThread),
+    };
+    return images;
 }
 
 fn parseResults(gpa: std.mem.Allocator, value: std.json.Value) ![]const types.ToolResult {
@@ -544,9 +566,9 @@ test "thread JSONL resumes state after the last reset" {
         defer initial.thread.deinit();
         try std.testing.expect(initial.fast);
     }
-    try thread.appendEntry(.{ .user = "old" });
+    try thread.appendEntry(.{ .user = .{ .text = "old" } });
     try thread.appendReset();
-    try thread.appendEntry(.{ .user = "new" });
+    try thread.appendEntry(.{ .user = .{ .text = "new" } });
     try thread.appendFast(false);
     const summaries = try list(std.testing.allocator, std.testing.io, home, "/work/project", null, 8);
     defer freeSummaries(std.testing.allocator, summaries);
@@ -567,5 +589,28 @@ test "thread JSONL resumes state after the last reset" {
     try std.testing.expectEqualStrings("high", loaded.effort.?);
     try std.testing.expect(!loaded.fast);
     try std.testing.expectEqual(@as(usize, 1), loaded.entries.items.len);
-    try std.testing.expectEqualStrings("new", loaded.entries.items[0].user);
+    try std.testing.expectEqualStrings("new", loaded.entries.items[0].user.text);
+}
+
+test "thread JSONL persists image content" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const home = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path});
+    defer std.testing.allocator.free(home);
+    var thread = try create(std.testing.allocator, std.testing.io, home, "/work/images", .chatgpt, "model-a", null, false);
+    defer thread.deinit();
+    const id = try std.testing.allocator.dupe(u8, thread.id);
+    defer std.testing.allocator.free(id);
+    const image: types.Image = .{ .name = "shot.png", .media_type = "image/png", .data = "aGVsbG8=" };
+    try thread.appendEntry(.{ .user = .{ .text = "look", .images = &.{image} } });
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var loaded = try load(std.testing.allocator, arena.allocator(), std.testing.io, home, "/work/images", id, null);
+    defer loaded.thread.deinit();
+    const user = loaded.entries.items[0].user;
+    try std.testing.expectEqualStrings("look", user.text);
+    try std.testing.expectEqual(@as(usize, 1), user.images.len);
+    try std.testing.expectEqualStrings("image/png", user.images[0].media_type);
+    try std.testing.expectEqualStrings("aGVsbG8=", user.images[0].data);
 }

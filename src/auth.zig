@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
+const input_mod = @import("input.zig");
 const spin = @import("spin.zig");
 const term = @import("term.zig");
 const transport = @import("transport.zig");
@@ -14,6 +15,14 @@ pub const Provider = enum {
             if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
         }
         return null;
+    }
+
+    pub fn label(self: Provider) []const u8 {
+        return switch (self) {
+            .chatgpt => "ChatGPT",
+            .claude => "Claude",
+            .grok => "Grok",
+        };
     }
 };
 
@@ -42,7 +51,15 @@ pub fn login(gpa: std.mem.Allocator, io: Io, home: []const u8, provider: Provide
         .grok => try loginGrok(gpa, io, output),
     };
     try put(gpa, io, home, provider, new_credential);
-    try output.print("saved {s} credentials\n", .{@tagName(provider)});
+    try output.print("{s} connected.\n", .{provider.label()});
+}
+
+/// Check the local credential store without refreshing a token or making a
+/// provider request. Login setup uses this to label its picker.
+pub fn isLoggedIn(gpa: std.mem.Allocator, io: Io, home: []const u8, provider: Provider) !bool {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    return get(try load(arena.allocator(), io, home), provider) != null;
 }
 
 pub fn credential(gpa: std.mem.Allocator, io: Io, home: []const u8, provider: Provider) !Credential {
@@ -240,12 +257,12 @@ fn loginChatGpt(gpa: std.mem.Allocator, io: Io, input: *Io.Reader, output: *Io.W
     const url = try std.fmt.allocPrint(gpa, "https://auth.openai.com/oauth/authorize?{s}", .{query});
     openBrowser(gpa, io, url);
     try output.print(
-        "Open this URL (a browser may already have opened):\n{s}\nAfter login the localhost page will fail to load — that is expected.\nPaste its full address-bar URL or the authorization code here: ",
+        "Open this URL if your browser did not open:\n{s}\nThe localhost page may fail to load. Copy its full URL from the address bar.\n",
         .{url},
     );
     try output.flush();
-    const line = (try input.takeDelimiter('\n')) orelse return error.EndOfStream;
-    const submitted = std.mem.trim(u8, line, " \r\n");
+    const submitted = (try input_mod.readSecret(gpa, input, output, "Callback URL or code: ")) orelse return error.EndOfStream;
+    defer gpa.free(submitted);
     const returned_state = try authorizationState(gpa, submitted);
     if (returned_state) |actual| {
         if (!std.mem.eql(u8, actual, state)) return error.OAuthStateMismatch;
@@ -333,12 +350,12 @@ fn loginClaude(gpa: std.mem.Allocator, io: Io, input: *Io.Reader, output: *Io.Wr
     const url = try std.fmt.allocPrint(gpa, "https://claude.ai/oauth/authorize?{s}", .{query});
     openBrowser(gpa, io, url);
     try output.print(
-        "Open this URL (a browser may already have opened):\n{s}\nAfter login the localhost page will fail to load — that is expected.\nPaste its full address-bar URL or the authorization code here: ",
+        "Open this URL if your browser did not open:\n{s}\nThe localhost page may fail to load. Copy its full URL from the address bar.\n",
         .{url},
     );
     try output.flush();
-    const line = (try input.takeDelimiter('\n')) orelse return error.EndOfStream;
-    const submitted = std.mem.trim(u8, line, " \r\n");
+    const submitted = (try input_mod.readSecret(gpa, input, output, "Callback URL or code: ")) orelse return error.EndOfStream;
+    defer gpa.free(submitted);
     // The callback state echoes the PKCE verifier; when the paste
     // includes one, a mismatch means a stale or foreign login attempt.
     if (try authorizationState(gpa, submitted)) |actual| {
@@ -474,6 +491,25 @@ fn refresh(gpa: std.mem.Allocator, io: Io, provider: Provider, old: Credential) 
 test "provider parsing" {
     try std.testing.expectEqual(Provider.chatgpt, Provider.parse("chatgpt").?);
     try std.testing.expectEqual(@as(?Provider, null), Provider.parse("openai"));
+    try std.testing.expectEqualStrings("ChatGPT", Provider.chatgpt.label());
+}
+
+test "login status reads the local store without refreshing" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_length = try std.process.currentPath(std.testing.io, &cwd_buffer);
+    const home = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd_buffer[0..cwd_length], temporary.sub_path });
+    defer std.testing.allocator.free(home);
+
+    try std.testing.expect(!try isLoggedIn(std.testing.allocator, std.testing.io, home, .chatgpt));
+    try put(std.testing.allocator, std.testing.io, home, .chatgpt, .{
+        .access = "access",
+        .refresh = "refresh",
+        .expires = 1,
+    });
+    try std.testing.expect(try isLoggedIn(std.testing.allocator, std.testing.io, home, .chatgpt));
+    try std.testing.expect(!try isLoggedIn(std.testing.allocator, std.testing.io, home, .claude));
 }
 
 test "authorization input parses browser callback" {

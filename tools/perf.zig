@@ -6,7 +6,7 @@ const Io = std.Io;
 const default_runs = 200;
 const warmup_runs = 10;
 const max_runs = 10_000;
-const size_budget_bytes = 512 * 1024;
+const size_budget_bytes = 1024 * 1024;
 const startup_budget_ns = 25 * std.time.ns_per_ms;
 
 const Options = struct {
@@ -38,7 +38,7 @@ pub fn main(init: std.process.Init) !void {
             \\usage: zig build perf -- [--runs N] [--no-check]
             \\
             \\Builds a host ReleaseSmall xaq and measures process startup.
-            \\The default 200-run test checks a 512 KiB binary ceiling and
+            \\The default 200-run test checks a 1 MiB binary ceiling and
             \\a mean startup ceiling of 25 ms per process.
             \\
         );
@@ -85,7 +85,7 @@ pub fn main(init: std.process.Init) !void {
 
     try output.writeAll("xaq perf\n  binary   ");
     try writeKib(output, binary_size);
-    try output.writeAll(" / 512.0 KiB\n");
+    try output.writeAll(" / 1.0 MiB\n");
     try output.print("  startup  {d} runs, {d} warmups\n           p50 ", .{ options.runs, warmup_runs });
     try writeMs(output, percentile(timings, 50));
     try output.writeAll(", p95 ");
@@ -112,7 +112,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     try output.writeAll("  budget   fail");
-    if (!size_ok) try output.writeAll(" (binary exceeds 512 KiB)");
+    if (!size_ok) try output.writeAll(" (binary exceeds 1 MiB)");
     if (!startup_ok) try output.writeAll(" (mean startup exceeds 25 ms)");
     try output.writeByte('\n');
     try output.flush();

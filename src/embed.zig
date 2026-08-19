@@ -10,6 +10,7 @@ const std = @import("std");
 const Io = std.Io;
 const auth = @import("auth.zig");
 const cancel_mod = @import("cancel.zig");
+const image_input = @import("image.zig");
 const models = @import("models.zig");
 const request_builder = @import("request.zig");
 const stream = @import("stream.zig");
@@ -17,7 +18,7 @@ const tool_runtime = @import("tools.zig");
 const transport_runtime = @import("transport.zig");
 const types = @import("types.zig");
 
-pub const api_version = 1;
+pub const api_version = 2;
 pub const Provider = auth.Provider;
 pub const Credential = auth.Credential;
 pub const Effort = models.Effort;
@@ -25,6 +26,8 @@ pub const ToolCall = types.ToolCall;
 pub const ToolResult = types.ToolResult;
 pub const Usage = types.Usage;
 pub const Assistant = types.Assistant;
+pub const Image = types.Image;
+pub const User = types.User;
 pub const Entry = types.Entry;
 pub const ToolDefinition = tool_runtime.Definition;
 pub const Header = transport_runtime.Header;
@@ -158,6 +161,8 @@ pub const PromptOptions = struct {
     /// Raw assistant text deltas. No ANSI or Markdown presentation is added.
     /// The writer must remain valid until `prompt` returns.
     output: ?*Io.Writer = null,
+    /// Images are standard base64 payloads without a data-URL prefix.
+    images: []const Image = &.{},
 };
 
 pub const Turn = struct {
@@ -347,7 +352,17 @@ pub const Agent = struct {
         const usage_checkpoint = self.usage_total;
         errdefer self.entries.items.len = history_checkpoint;
         errdefer self.usage_total = usage_checkpoint;
-        try self.entries.append(self.arena.allocator(), .{ .user = try self.arena.allocator().dupe(u8, text) });
+        try image_input.validateProvider(self.provider, options.images);
+        const images = try self.arena.allocator().alloc(Image, options.images.len);
+        for (options.images, 0..) |image, index| images[index] = .{
+            .name = try self.arena.allocator().dupe(u8, image.name),
+            .media_type = try self.arena.allocator().dupe(u8, image.media_type),
+            .data = try self.arena.allocator().dupe(u8, image.data),
+        };
+        try self.entries.append(self.arena.allocator(), .{ .user = .{
+            .text = try self.arena.allocator().dupe(u8, text),
+            .images = images,
+        } });
 
         var discard_buffer: [1024]u8 = undefined;
         var discard: Io.Writer.Discarding = .init(&discard_buffer);
@@ -666,7 +681,15 @@ fn freeToolDefinition(gpa: std.mem.Allocator, definition: ToolDefinition) void {
 
 fn cloneEntry(gpa: std.mem.Allocator, entry: Entry) !Entry {
     return switch (entry) {
-        .user => |text| .{ .user = try gpa.dupe(u8, text) },
+        .user => |user| blk: {
+            const images = try gpa.alloc(Image, user.images.len);
+            for (user.images, 0..) |image, index| images[index] = .{
+                .name = try gpa.dupe(u8, image.name),
+                .media_type = try gpa.dupe(u8, image.media_type),
+                .data = try gpa.dupe(u8, image.data),
+            };
+            break :blk .{ .user = .{ .text = try gpa.dupe(u8, user.text), .images = images } };
+        },
         .assistant => |answer| blk: {
             const calls = try gpa.alloc(ToolCall, answer.calls.len);
             for (answer.calls, 0..) |call, index| calls[index] = .{
