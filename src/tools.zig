@@ -61,10 +61,10 @@ pub fn schemasWithOptions(s: *std.json.Stringify, options: SchemaOptions) !void 
     }
     if (options.include_builtin and options.web_enabled) {
         try schema(s, "web_fetch", "Fetch a public URL and return its main content as Markdown.",
-            \\{"type":"object","properties":{"url":{"type":"string","maxLength":8192}},"required":["url"],"additionalProperties":false}
+            \\{"type":"object","properties":{"url":{"type":"string","minLength":1,"maxLength":8192}},"required":["url"],"additionalProperties":false}
         );
         try schema(s, "web_search", "Search the web and return result titles, URLs, and descriptions.",
-            \\{"type":"object","properties":{"query":{"type":"string","maxLength":500},"limit":{"type":"integer","minimum":1,"maximum":10}},"required":["query"],"additionalProperties":false}
+            \\{"type":"object","properties":{"query":{"type":"string","minLength":1,"maxLength":500},"limit":{"type":"integer","minimum":1,"maximum":10,"description":"Number of results to return; defaults to 5."}},"required":["query"],"additionalProperties":false}
         );
     }
     if (options.include_builtin and options.subagents_enabled) try subagentSchemas(s, false);
@@ -96,10 +96,10 @@ pub fn claudeSchemasWithOptions(s: *std.json.Stringify, options: SchemaOptions) 
     }
     if (options.include_builtin and options.web_enabled) {
         try claudeSchema(s, "web_fetch", "Fetch a public URL and return its main content as Markdown.",
-            \\{"type":"object","properties":{"url":{"type":"string","maxLength":8192}},"required":["url"],"additionalProperties":false}
+            \\{"type":"object","properties":{"url":{"type":"string","minLength":1,"maxLength":8192}},"required":["url"],"additionalProperties":false}
         );
         try claudeSchema(s, "web_search", "Search the web and return result titles, URLs, and descriptions.",
-            \\{"type":"object","properties":{"query":{"type":"string","maxLength":500},"limit":{"type":"integer","minimum":1,"maximum":10}},"required":["query"],"additionalProperties":false}
+            \\{"type":"object","properties":{"query":{"type":"string","minLength":1,"maxLength":500},"limit":{"type":"integer","minimum":1,"maximum":10,"description":"Number of results to return; defaults to 5."}},"required":["query"],"additionalProperties":false}
         );
     }
     if (options.include_builtin and options.subagents_enabled) try subagentSchemas(s, true);
@@ -223,8 +223,49 @@ fn objectBool(value: std.json.Value, key: []const u8) ?bool {
     };
 }
 
+fn boundedUtf8(value: []const u8, limit: usize) []const u8 {
+    const maximum = @min(value.len, limit);
+    var length: usize = 0;
+    while (length < maximum) {
+        const sequence_length = std.unicode.utf8ByteSequenceLength(value[length]) catch break;
+        if (length + sequence_length > maximum) break;
+        _ = std.unicode.utf8Decode(value[length .. length + sequence_length]) catch break;
+        length += sequence_length;
+    }
+    return value[0..length];
+}
+
+fn writeSingleLine(writer: *Io.Writer, value: []const u8, limit: usize) !void {
+    const bounded = boundedUtf8(value, limit);
+    for (bounded) |byte| try writer.writeByte(if (byte < 0x20 or byte == 0x7f) ' ' else byte);
+}
+
+fn validUrlPort(value: []const u8) bool {
+    if (value.len == 0) return false;
+    _ = std.fmt.parseUnsigned(u16, value, 10) catch return false;
+    return true;
+}
+
 fn validPublicUrl(url: []const u8) bool {
-    return std.mem.startsWith(u8, url, "https://") or std.mem.startsWith(u8, url, "http://");
+    for (url) |byte| if (byte <= ' ' or byte == 0x7f) return false;
+    const scheme_end = std.mem.findScalar(u8, url, ':') orelse return false;
+    const scheme = url[0..scheme_end];
+    if (!std.ascii.eqlIgnoreCase(scheme, "https") and !std.ascii.eqlIgnoreCase(scheme, "http")) return false;
+    const rest = url[scheme_end + 1 ..];
+    if (!std.mem.startsWith(u8, rest, "//")) return false;
+    const authority_and_tail = rest[2..];
+    const authority_end = std.mem.findAny(u8, authority_and_tail, "/?#") orelse authority_and_tail.len;
+    var host_and_port = authority_and_tail[0..authority_end];
+    if (std.mem.findScalarLast(u8, host_and_port, '@')) |at| host_and_port = host_and_port[at + 1 ..];
+    if (host_and_port.len == 0) return false;
+    if (host_and_port[0] == '[') {
+        const close = std.mem.findScalar(u8, host_and_port, ']') orelse return false;
+        if (close <= 1) return false;
+        const tail = host_and_port[close + 1 ..];
+        return tail.len == 0 or (tail[0] == ':' and validUrlPort(tail[1..]));
+    }
+    const colon = std.mem.findScalar(u8, host_and_port, ':') orelse return host_and_port.len > 0;
+    return colon > 0 and validUrlPort(host_and_port[colon + 1 ..]);
 }
 
 fn firecrawlPost(gpa: std.mem.Allocator, io: Io, api_key: []const u8, endpoint: []const u8, body: []const u8) !transport.Response {
@@ -235,29 +276,78 @@ fn firecrawlPost(gpa: std.mem.Allocator, io: Io, api_key: []const u8, endpoint: 
     return transport.post(gpa, io, url, "application/json", &.{.{ .name = "Authorization", .value = authorization }}, body);
 }
 
-fn firecrawlFailure(gpa: std.mem.Allocator, status: u16, body: []const u8) ![]u8 {
+fn firecrawlFailure(gpa: std.mem.Allocator, tool_name: []const u8, status: u16, body: []const u8) ![]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch
-        return std.fmt.allocPrint(gpa, "Firecrawl request failed (HTTP {d})", .{status});
+        return if (status >= 200 and status < 300)
+            std.fmt.allocPrint(gpa, "{s} failed: Firecrawl returned an invalid response", .{tool_name})
+        else
+            std.fmt.allocPrint(gpa, "{s} failed: Firecrawl HTTP {d}", .{ tool_name, status });
     defer parsed.deinit();
-    const message = objectString(parsed.value, "error") orelse objectString(parsed.value, "message") orelse "request failed";
-    return std.fmt.allocPrint(gpa, "Firecrawl request failed (HTTP {d}): {s}", .{ status, message[0..@min(message.len, 4096)] });
+    const error_value = objectField(parsed.value, "error");
+    const message = objectString(parsed.value, "error") orelse
+        objectString(parsed.value, "message") orelse
+        if (error_value) |value| objectString(value, "message") else null;
+    if (message) |text| {
+        const bounded = boundedUtf8(text, 4096);
+        return if (status >= 200 and status < 300)
+            std.fmt.allocPrint(gpa, "{s} failed: {s}", .{ tool_name, bounded })
+        else
+            std.fmt.allocPrint(gpa, "{s} failed: Firecrawl HTTP {d}: {s}", .{ tool_name, status, bounded });
+    }
+    return if (status >= 200 and status < 300)
+        std.fmt.allocPrint(gpa, "{s} failed: Firecrawl rejected the request", .{tool_name})
+    else
+        std.fmt.allocPrint(gpa, "{s} failed: Firecrawl HTTP {d}", .{ tool_name, status });
 }
 
-fn boundedDocument(gpa: std.mem.Allocator, title: ?[]const u8, url: []const u8, markdown_text: []const u8) ![]u8 {
+fn boundedDocument(gpa: std.mem.Allocator, title: ?[]const u8, url: []const u8, markdown_text: []const u8, warning: ?[]const u8) ![]u8 {
+    var warning_text: Io.Writer.Allocating = .init(gpa);
+    defer warning_text.deinit();
+    if (warning) |message| if (message.len > 0) {
+        try warning_text.writer.writeAll("[Firecrawl warning: ");
+        try writeSingleLine(&warning_text.writer, message, 4096);
+        try warning_text.writer.writeByte(']');
+    };
+
     var out: Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    if (title) |value| try out.writer.print("Title: {s}\n", .{value[0..@min(value.len, 4096)]});
-    try out.writer.print("URL: {s}\n\n", .{url[0..@min(url.len, 8192)]});
+    if (title) |value| {
+        try out.writer.writeAll("Title: ");
+        try writeSingleLine(&out.writer, value, 4096);
+        try out.writer.writeByte('\n');
+    }
+    try out.writer.writeAll("URL: ");
+    try writeSingleLine(&out.writer, url, 8192);
+    try out.writer.writeAll("\n\n");
     const suffix = "\n\n[content truncated]";
-    const available = output_payload -| out.written().len;
+    const warning_separator = if (warning_text.written().len == 0 or markdown_text.len == 0) "" else "\n\n";
+    const document_budget = output_payload -| warning_separator.len -| warning_text.written().len;
+    const available = document_budget -| out.written().len;
     if (markdown_text.len <= available) {
         try out.writer.writeAll(markdown_text);
     } else {
         const keep = available -| suffix.len;
-        try out.writer.writeAll(markdown_text[0..keep]);
+        try out.writer.writeAll(boundedUtf8(markdown_text, keep));
         try out.writer.writeAll(suffix);
     }
+    try out.writer.writeAll(warning_separator);
+    try out.writer.writeAll(warning_text.written());
     return out.toOwnedSlice();
+}
+
+fn formatFetchedDocument(gpa: std.mem.Allocator, requested_url: []const u8, body: []const u8) ![]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch
+        return firecrawlFailure(gpa, "web_fetch", 200, body);
+    defer parsed.deinit();
+    if (objectBool(parsed.value, "success") != true) return firecrawlFailure(gpa, "web_fetch", 200, body);
+    const data = objectField(parsed.value, "data") orelse return gpa.dupe(u8, "web_fetch failed: Firecrawl response did not contain page data");
+    const metadata = objectField(data, "metadata");
+    if (metadata) |value| if (objectString(value, "error")) |message| if (message.len > 0)
+        return std.fmt.allocPrint(gpa, "web_fetch failed: {s}", .{boundedUtf8(message, 4096)});
+    const markdown_text = objectString(data, "markdown") orelse return gpa.dupe(u8, "web_fetch failed: Firecrawl response did not contain Markdown");
+    const title = if (metadata) |value| objectString(value, "title") else null;
+    const source_url = if (metadata) |value| objectString(value, "sourceURL") orelse objectString(value, "url") orelse requested_url else requested_url;
+    return boundedDocument(gpa, title, source_url, markdown_text, objectString(data, "warning"));
 }
 
 fn webFetch(gpa: std.mem.Allocator, io: Io, api_key: []const u8, args: std.json.Value) ![]u8 {
@@ -280,58 +370,69 @@ fn webFetch(gpa: std.mem.Allocator, io: Io, api_key: []const u8, args: std.json.
 
     const response = try firecrawlPost(gpa, io, api_key, "scrape", request.written());
     defer gpa.free(response.body);
-    if (response.status < 200 or response.status >= 300) return firecrawlFailure(gpa, response.status, response.body);
-    var parsed = std.json.parseFromSlice(std.json.Value, gpa, response.body, .{}) catch return error.InvalidFirecrawlResponse;
-    defer parsed.deinit();
-    if (objectBool(parsed.value, "success") != true) return firecrawlFailure(gpa, response.status, response.body);
-    const data = objectField(parsed.value, "data") orelse return error.InvalidFirecrawlResponse;
-    const markdown_text = objectString(data, "markdown") orelse return error.InvalidFirecrawlResponse;
-    const metadata = objectField(data, "metadata");
-    const title = if (metadata) |value| objectString(value, "title") else null;
-    const source_url = if (metadata) |value| objectString(value, "sourceURL") orelse objectString(value, "url") orelse url else url;
-    return boundedDocument(gpa, title, source_url, markdown_text);
+    if (response.status < 200 or response.status >= 300) return firecrawlFailure(gpa, "web_fetch", response.status, response.body);
+    return formatFetchedDocument(gpa, url, response.body);
 }
 
 fn appendSearchResult(writer: *Io.Writer, index: usize, value: std.json.Value) !bool {
+    const metadata = objectField(value, "metadata");
     var url_value = objectString(value, "url");
     if (url_value == null) {
-        if (objectField(value, "metadata")) |metadata| url_value = objectString(metadata, "sourceURL");
+        if (metadata) |item| url_value = objectString(item, "sourceURL") orelse objectString(item, "url");
     }
     const url = url_value orelse return false;
-    const title = objectString(value, "title") orelse url;
-    const description = objectString(value, "description");
-    try writer.print("{d}. {s}\n   {s}\n", .{ index, title[0..@min(title.len, 4096)], url[0..@min(url.len, 8192)] });
-    if (description) |text| if (text.len > 0) try writer.print("   {s}\n", .{text[0..@min(text.len, 8192)]});
+    const title = objectString(value, "title") orelse if (metadata) |item| objectString(item, "title") orelse url else url;
+    const description = objectString(value, "description") orelse if (metadata) |item| objectString(item, "description") else null;
+    try writer.print("{d}. ", .{index});
+    try writeSingleLine(writer, title, 4096);
+    try writer.writeAll("\n   ");
+    try writeSingleLine(writer, url, 8192);
+    try writer.writeByte('\n');
+    if (description) |text| if (text.len > 0) {
+        try writer.writeAll("   ");
+        try writeSingleLine(writer, text, 8192);
+        try writer.writeByte('\n');
+    };
     return true;
 }
 
 fn formatSearchResults(gpa: std.mem.Allocator, body: []const u8) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch
+        return firecrawlFailure(gpa, "web_search", 200, body);
     defer parsed.deinit();
-    if (objectBool(parsed.value, "success") != true) return error.InvalidFirecrawlResponse;
-    const data = objectField(parsed.value, "data") orelse return error.InvalidFirecrawlResponse;
-    const web = objectField(data, "web") orelse return error.InvalidFirecrawlResponse;
+    if (objectBool(parsed.value, "success") != true) return firecrawlFailure(gpa, "web_search", 200, body);
+    const data = objectField(parsed.value, "data") orelse return gpa.dupe(u8, "web_search failed: Firecrawl response did not contain results");
+    const web = objectField(data, "web") orelse return gpa.dupe(u8, "web_search failed: Firecrawl response did not contain web results");
     const results = switch (web) {
         .array => |array| array.items,
-        else => return error.InvalidFirecrawlResponse,
+        else => return gpa.dupe(u8, "web_search failed: Firecrawl returned malformed web results"),
     };
-    if (results.len == 0) return gpa.dupe(u8, "No web results found.");
 
     var out: Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
+    var warning: Io.Writer.Allocating = .init(gpa);
+    defer warning.deinit();
+    if (objectString(parsed.value, "warning")) |message| if (message.len > 0) {
+        try warning.writer.writeAll("\n[Firecrawl warning: ");
+        try writeSingleLine(&warning.writer, message, 4096);
+        try warning.writer.writeAll("]\n");
+    };
+    const result_budget = output_payload -| warning.written().len;
     var rendered: usize = 0;
     for (results) |result| {
         var item: Io.Writer.Allocating = .init(gpa);
         defer item.deinit();
         if (!try appendSearchResult(&item.writer, rendered + 1, result)) continue;
-        if (out.written().len + item.written().len > output_payload) {
-            try out.writer.writeAll("[results truncated]\n");
+        if (out.written().len + item.written().len > result_budget) {
+            const notice = "[results truncated]\n";
+            if (out.written().len + notice.len <= result_budget) try out.writer.writeAll(notice);
             break;
         }
         try out.writer.writeAll(item.written());
         rendered += 1;
     }
-    if (rendered == 0) return gpa.dupe(u8, "No valid web results found.");
+    if (rendered == 0) try out.writer.writeAll(if (results.len == 0) "No web results found.\n" else "No valid web results found.\n");
+    try out.writer.writeAll(warning.written());
     return out.toOwnedSlice();
 }
 
@@ -352,11 +453,13 @@ fn webSearch(gpa: std.mem.Allocator, io: Io, api_key: []const u8, args: std.json
     try js.beginArray();
     try js.write("web");
     try js.endArray();
+    try js.objectField("ignoreInvalidURLs");
+    try js.write(true);
     try js.endObject();
 
     const response = try firecrawlPost(gpa, io, api_key, "search", request.written());
     defer gpa.free(response.body);
-    if (response.status < 200 or response.status >= 300) return firecrawlFailure(gpa, response.status, response.body);
+    if (response.status < 200 or response.status >= 300) return firecrawlFailure(gpa, "web_search", response.status, response.body);
     return formatSearchResults(gpa, response.body);
 }
 
@@ -693,12 +796,97 @@ test "Firecrawl search results are formatted for the model" {
     try std.testing.expectEqualStrings("1. Example\n   https://example.com\n   A test page.\n", result);
 }
 
+test "Firecrawl fetched documents use response metadata" {
+    const result = try formatFetchedDocument(std.testing.allocator, "https://requested.example",
+        \\{"success":true,"data":{"markdown":"# Page\n\nBody","metadata":{"title":"Fetched title","sourceURL":"https://canonical.example/page"}}}
+    );
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("Title: Fetched title\nURL: https://canonical.example/page\n\n# Page\n\nBody", result);
+
+    const failed = try formatFetchedDocument(std.testing.allocator, "https://requested.example",
+        \\{"success":true,"data":{"markdown":"","metadata":{"error":"Robots denied this page."}}}
+    );
+    defer std.testing.allocator.free(failed);
+    try std.testing.expectEqualStrings("web_fetch failed: Robots denied this page.", failed);
+}
+
+test "Firecrawl fetched documents preserve data warnings" {
+    const result = try formatFetchedDocument(std.testing.allocator, "https://requested.example",
+        \\{"success":true,"data":{"markdown":"Page body","warning":"Cached\ncopy\u007fused."}}
+    );
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "URL: https://requested.example\n\nPage body\n\n[Firecrawl warning: Cached copy used.]",
+        result,
+    );
+}
+
+test "Firecrawl search metadata fallbacks and warnings remain visible" {
+    const result = try formatSearchResults(std.testing.allocator,
+        \\{"success":true,"data":{"web":[{"metadata":{"title":"Metadata title","description":"two\nlines","sourceURL":"https://example.com/from-metadata"}}]},"warning":"Some results timed out."}
+    );
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "1. Metadata title\n   https://example.com/from-metadata\n   two lines\n\n[Firecrawl warning: Some results timed out.]\n",
+        result,
+    );
+}
+
+test "Firecrawl failures preserve useful messages" {
+    const rejected = try formatSearchResults(std.testing.allocator,
+        \\{"success":false,"error":{"message":"Search quota exhausted."}}
+    );
+    defer std.testing.allocator.free(rejected);
+    try std.testing.expectEqualStrings("web_search failed: Search quota exhausted.", rejected);
+
+    const limited = try firecrawlFailure(std.testing.allocator, "web_fetch", 429,
+        \\{"success":false,"error":"Rate limit exceeded."}
+    );
+    defer std.testing.allocator.free(limited);
+    try std.testing.expectEqualStrings("web_fetch failed: Firecrawl HTTP 429: Rate limit exceeded.", limited);
+}
+
+test "web fetch URL validation requires an HTTP host" {
+    try std.testing.expect(validPublicUrl("https://example.com/path?q=1"));
+    try std.testing.expect(validPublicUrl("HTTPS://example.com"));
+    try std.testing.expect(validPublicUrl("http://[::1]:8080/path"));
+    try std.testing.expect(!validPublicUrl("https:///missing-host"));
+    try std.testing.expect(!validPublicUrl("https://"));
+    try std.testing.expect(!validPublicUrl("https://example.com:not-a-port"));
+    try std.testing.expect(!validPublicUrl("https://example.com/path\nnext"));
+    try std.testing.expect(!validPublicUrl("file:///tmp/page.html"));
+}
+
+test "web output bounds preserve UTF-8 boundaries" {
+    try std.testing.expectEqualStrings("a", boundedUtf8("a€", 2));
+    try std.testing.expectEqualStrings("a€", boundedUtf8("a€", 4));
+
+    const markdown_text = try std.testing.allocator.alloc(u8, max_output * 2);
+    defer std.testing.allocator.free(markdown_text);
+    var index: usize = 0;
+    while (index + "€".len <= markdown_text.len) : (index += "€".len) @memcpy(markdown_text[index .. index + "€".len], "€");
+    @memset(markdown_text[index..], 'x');
+    const result = try boundedDocument(std.testing.allocator, "Unicode", "https://example.com", markdown_text, null);
+    defer std.testing.allocator.free(result);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(result));
+    try std.testing.expect(std.mem.endsWith(u8, result, "[content truncated]"));
+}
+
 test "Firecrawl documents are capped to the tool output budget" {
     const markdown_text = try std.testing.allocator.alloc(u8, max_output * 2);
     defer std.testing.allocator.free(markdown_text);
     @memset(markdown_text, 'x');
-    const result = try boundedDocument(std.testing.allocator, "Example", "https://example.com", markdown_text);
+    const result = try boundedDocument(std.testing.allocator, "Example", "https://example.com", markdown_text, null);
     defer std.testing.allocator.free(result);
     try std.testing.expect(result.len <= max_output);
     try std.testing.expect(std.mem.endsWith(u8, result, "[content truncated]"));
+
+    const warning = try std.testing.allocator.alloc(u8, max_output * 2);
+    defer std.testing.allocator.free(warning);
+    @memset(warning, 'w');
+    const warned = try boundedDocument(std.testing.allocator, "Example", "https://example.com", markdown_text, warning);
+    defer std.testing.allocator.free(warned);
+    try std.testing.expect(warned.len <= max_output);
+    try std.testing.expect(std.mem.indexOf(u8, warned, "[content truncated]") != null);
+    try std.testing.expect(std.mem.endsWith(u8, warned, "w]"));
 }

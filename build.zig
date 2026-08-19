@@ -15,6 +15,10 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .strip = optimize != .Debug,
+            // ReleaseSmall has no useful symbolic backtraces after stripping.
+            // Drop unwind metadata so the shipped executable keeps its size
+            // contract as interactive features grow.
+            .unwind_tables = if (optimize == .ReleaseSmall) .none else null,
         }),
     });
     b.installArtifact(exe);
@@ -50,6 +54,7 @@ pub fn build(b: *std.Build) void {
             .target = b.graph.host,
             .optimize = .ReleaseSmall,
             .strip = true,
+            .unwind_tables = .none,
         }),
     });
     const perf_runner = b.addExecutable(.{
