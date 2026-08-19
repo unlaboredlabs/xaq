@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const cancel = @import("cancel.zig");
+const subagents = @import("subagents.zig");
 const transport = @import("transport.zig");
 
 pub const names = [_][]const u8{ "read", "bash", "edit", "write" };
@@ -21,7 +22,6 @@ pub const SchemaOptions = struct {
     include_builtin: bool = true,
     web_enabled: bool = false,
     write_enabled: bool = true,
-    /// Reserved for the process-manager integration added in the next layer.
     subagents_enabled: bool = false,
     custom: []const Definition = &.{},
 };
@@ -32,11 +32,13 @@ pub const ExecuteContext = struct {
     cwd: ?[]const u8 = null,
     firecrawl_api_key: ?[]const u8 = null,
     write_enabled: bool = true,
+    subagent_manager: ?*subagents.Manager = null,
+    subagent_launch: ?subagents.Launch = null,
     cancellation: ?*cancel.Token = null,
 };
 
-pub fn schemas(s: *std.json.Stringify) !void {
-    return schemasWithOptions(s, .{});
+pub fn schemas(s: *std.json.Stringify, web_enabled: bool) !void {
+    return schemasWithOptions(s, .{ .web_enabled = web_enabled });
 }
 
 pub fn schemasWithOptions(s: *std.json.Stringify, options: SchemaOptions) !void {
@@ -65,12 +67,13 @@ pub fn schemasWithOptions(s: *std.json.Stringify, options: SchemaOptions) !void 
             \\{"type":"object","properties":{"query":{"type":"string","maxLength":500},"limit":{"type":"integer","minimum":1,"maximum":10}},"required":["query"],"additionalProperties":false}
         );
     }
+    if (options.include_builtin and options.subagents_enabled) try subagentSchemas(s, false);
     for (options.custom) |definition| try schema(s, definition.name, definition.description, definition.parameters_json);
     try s.endArray();
 }
 
-pub fn claudeSchemas(s: *std.json.Stringify) !void {
-    return claudeSchemasWithOptions(s, .{});
+pub fn claudeSchemas(s: *std.json.Stringify, web_enabled: bool) !void {
+    return claudeSchemasWithOptions(s, .{ .web_enabled = web_enabled });
 }
 
 pub fn claudeSchemasWithOptions(s: *std.json.Stringify, options: SchemaOptions) !void {
@@ -99,8 +102,31 @@ pub fn claudeSchemasWithOptions(s: *std.json.Stringify, options: SchemaOptions) 
             \\{"type":"object","properties":{"query":{"type":"string","maxLength":500},"limit":{"type":"integer","minimum":1,"maximum":10}},"required":["query"],"additionalProperties":false}
         );
     }
+    if (options.include_builtin and options.subagents_enabled) try subagentSchemas(s, true);
     for (options.custom) |definition| try claudeSchema(s, definition.name, definition.description, definition.parameters_json);
     try s.endArray();
+}
+
+fn subagentSchemas(s: *std.json.Stringify, claude: bool) !void {
+    const description = "Launch an autonomous subagent for a self-contained, multi-step task. Background is the default and lets several Agent calls run concurrently. Use get_subagent_result with wait true before relying on a background result. Prompts must contain all context the subagent needs.";
+    const agent_parameters =
+        \\{"type":"object","properties":{"prompt":{"type":"string","maxLength":4193280},"description":{"type":"string","maxLength":120,"description":"Short task label shown in the UI."},"model":{"type":"string","maxLength":256,"description":"Optional model ID for the active provider."},"run_in_background":{"type":"boolean","description":"Defaults to true. Set false only when the next action depends on this result."}},"required":["prompt","description"],"additionalProperties":false}
+    ;
+    const get_parameters =
+        \\{"type":"object","properties":{"agent_id":{"type":"string"},"wait":{"type":"boolean","description":"Wait for completion. Defaults to false."}},"required":["agent_id"],"additionalProperties":false}
+    ;
+    const steer_parameters =
+        \\{"type":"object","properties":{"agent_id":{"type":"string"},"message":{"type":"string","maxLength":65536}},"required":["agent_id","message"],"additionalProperties":false}
+    ;
+    if (claude) {
+        try claudeSchema(s, "Agent", description, agent_parameters);
+        try claudeSchema(s, "get_subagent_result", "Check a background subagent's status and retrieve its result. Use wait true when the result gates your next action.", get_parameters);
+        try claudeSchema(s, "steer_subagent", "Send a message that redirects a running or queued subagent before its next model turn.", steer_parameters);
+    } else {
+        try schema(s, "Agent", description, agent_parameters);
+        try schema(s, "get_subagent_result", "Check a background subagent's status and retrieve its result. Use wait true when the result gates your next action.", get_parameters);
+        try schema(s, "steer_subagent", "Send a message that redirects a running or queued subagent before its next model turn.", steer_parameters);
+    }
 }
 
 fn schema(s: *std.json.Stringify, name: []const u8, description: []const u8, parameters: []const u8) !void {
@@ -133,8 +159,8 @@ fn rawValue(s: *std.json.Stringify, value: []const u8) !void {
     s.endWriteRaw();
 }
 
-pub fn execute(gpa: std.mem.Allocator, io: Io, name: []const u8, args: std.json.Value) ![]u8 {
-    return executeWithContext(gpa, io, name, args, .{});
+pub fn execute(gpa: std.mem.Allocator, io: Io, name: []const u8, args: std.json.Value, firecrawl_api_key: ?[]const u8) ![]u8 {
+    return executeWithContext(gpa, io, name, args, .{ .firecrawl_api_key = firecrawl_api_key });
 }
 
 pub fn executeWithContext(gpa: std.mem.Allocator, io: Io, name: []const u8, args: std.json.Value, context: ExecuteContext) ![]u8 {
@@ -144,6 +170,11 @@ pub fn executeWithContext(gpa: std.mem.Allocator, io: Io, name: []const u8, args
     if (std.mem.eql(u8, name, "write")) return if (context.write_enabled) write(gpa, io, args, context.cwd) else gpa.dupe(u8, "write is disabled");
     if (std.mem.eql(u8, name, "web_fetch")) return webFetch(gpa, io, context.firecrawl_api_key orelse return gpa.dupe(u8, "web_fetch is not configured"), args);
     if (std.mem.eql(u8, name, "web_search")) return webSearch(gpa, io, context.firecrawl_api_key orelse return gpa.dupe(u8, "web_search is not configured"), args);
+    if (std.mem.eql(u8, name, "Agent") or std.mem.eql(u8, name, "get_subagent_result") or std.mem.eql(u8, name, "steer_subagent")) {
+        const manager = context.subagent_manager orelse return gpa.dupe(u8, "subagents are disabled inside subagents");
+        const launch = context.subagent_launch orelse return gpa.dupe(u8, "subagent launch context is unavailable");
+        return manager.execute(gpa, name, args, launch);
+    }
     return std.fmt.allocPrint(gpa, "unknown tool: {s}", .{name});
 }
 
@@ -605,13 +636,23 @@ test "tool names match pi defaults" {
     try std.testing.expectEqualStrings("write", names[3]);
 }
 
-test "write tools can be omitted" {
+test "subagent schemas are parent-only and write tools can be omitted" {
+    var parent: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer parent.deinit();
+    var parent_json: std.json.Stringify = .{ .writer = &parent.writer };
+    try schemasWithOptions(&parent_json, .{ .subagents_enabled = true });
+    try std.testing.expect(std.mem.indexOf(u8, parent.written(), "\"name\":\"Agent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parent.written(), "get_subagent_result") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parent.written(), "steer_subagent") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parent.written(), "subagent_type") == null);
+
     var worker: Io.Writer.Allocating = .init(std.testing.allocator);
     defer worker.deinit();
     var worker_json: std.json.Stringify = .{ .writer = &worker.writer };
     try schemasWithOptions(&worker_json, .{ .write_enabled = false });
     try std.testing.expect(std.mem.indexOf(u8, worker.written(), "\"name\":\"read\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, worker.written(), "\"name\":\"edit\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, worker.written(), "\"name\":\"Agent\"") == null);
 }
 
 test "bash combines stdout and stderr in production order" {
@@ -619,7 +660,7 @@ test "bash combines stdout and stderr in production order" {
         \\{"command":"printf 'one\\n'; printf 'two\\n' >&2","timeout":5}
     , .{});
     defer parsed.deinit();
-    const result = try execute(std.testing.allocator, std.testing.io, "bash", parsed.value);
+    const result = try execute(std.testing.allocator, std.testing.io, "bash", parsed.value, null);
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("one\ntwo\n", result);
 }

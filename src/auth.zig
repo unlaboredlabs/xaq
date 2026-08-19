@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const spin = @import("spin.zig");
+const term = @import("term.zig");
 const transport = @import("transport.zig");
 
 pub const Provider = enum {
@@ -250,6 +251,7 @@ fn loginChatGpt(gpa: std.mem.Allocator, io: Io, input: *Io.Reader, output: *Io.W
         if (!std.mem.eql(u8, actual, state)) return error.OAuthStateMismatch;
     }
     const code = try authorizationCode(gpa, submitted);
+    try requireCodeShape(code);
     return exchangeOpenAi(gpa, io, code, pair.verifier);
 }
 
@@ -336,7 +338,14 @@ fn loginClaude(gpa: std.mem.Allocator, io: Io, input: *Io.Reader, output: *Io.Wr
     );
     try output.flush();
     const line = (try input.takeDelimiter('\n')) orelse return error.EndOfStream;
-    const code = try authorizationCode(gpa, std.mem.trim(u8, line, " \r\n"));
+    const submitted = std.mem.trim(u8, line, " \r\n");
+    // The callback state echoes the PKCE verifier; when the paste
+    // includes one, a mismatch means a stale or foreign login attempt.
+    if (try authorizationState(gpa, submitted)) |actual| {
+        if (!std.mem.eql(u8, actual, pair.verifier)) return error.OAuthStateMismatch;
+    }
+    const code = try authorizationCode(gpa, submitted);
+    try requireCodeShape(code);
 
     var body: Io.Writer.Allocating = .init(gpa);
     defer body.deinit();
@@ -351,6 +360,16 @@ fn loginClaude(gpa: std.mem.Allocator, io: Io, input: *Io.Reader, output: *Io.Wr
     defer gpa.free(response.body);
     try requireStatus(response);
     return tokenCredential(gpa, io, response.body, null);
+}
+
+/// Reject pastes that cannot be an authorization code before they reach
+/// the token endpoint, so the user gets "that doesn't look like a
+/// callback URL or code" instead of a cryptic provider HTTP 400.
+fn requireCodeShape(code: []const u8) error{InvalidAuthorizationInput}!void {
+    if (code.len == 0 or code.len > 2048) return error.InvalidAuthorizationInput;
+    for (code) |byte| {
+        if (byte <= ' ' or byte == 0x7f) return error.InvalidAuthorizationInput;
+    }
 }
 
 fn authorizationCode(gpa: std.mem.Allocator, value: []const u8) ![]const u8 {
@@ -394,6 +413,9 @@ fn loginGrok(gpa: std.mem.Allocator, io: Io, output: *Io.Writer) !Credential {
     const interval = number(parsed.value, "interval", 5);
     openBrowser(gpa, io, uri);
     try output.print("Open {s} and enter: {s}\n", .{ uri, user });
+    // The spinner is a no-op without styling (NO_COLOR, dumb terminals,
+    // pipes); print a static line so the minutes-long poll is not silent.
+    if (!term.enabled) try output.writeAll("waiting for approval...\n");
     try output.flush();
     spin.start(io, "waiting for approval");
     defer spin.stop();

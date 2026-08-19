@@ -8,6 +8,10 @@ pub const Config = struct {
     compact_threshold_percent: u8 = 80,
     compact_models: ProviderModels = .{},
     compact_efforts: ProviderEfforts = .{},
+    subagents_enabled: bool = true,
+    subagent_max_concurrent: u8 = 4,
+    subagent_default_background: bool = true,
+    firecrawl_api_key: ?[]const u8 = null,
 
     pub const ProviderModels = struct {
         chatgpt: []const u8 = "current",
@@ -78,10 +82,20 @@ pub fn load(gpa: std.mem.Allocator, io: Io, home: []const u8) !Loaded {
         .allocate = .alloc_always,
     });
     if (value.compact_threshold_percent < 10 or value.compact_threshold_percent > 95) return error.InvalidSettings;
+    if (value.subagent_max_concurrent < 1 or value.subagent_max_concurrent > 8) return error.InvalidSettings;
     inline for (.{ value.compact_models.chatgpt, value.compact_models.claude, value.compact_models.grok }) |model| {
         if (model.len == 0 or model.len > 128 or std.mem.findAny(u8, model, "\r\n") != null) return error.InvalidSettings;
     }
+    if (value.firecrawl_api_key) |key| {
+        if (!validFirecrawlApiKey(key)) return error.InvalidSettings;
+    }
     return .{ .arena = arena, .value = value };
+}
+
+pub fn validFirecrawlApiKey(key: []const u8) bool {
+    if (key.len == 0 or key.len > 1024) return false;
+    for (key) |byte| if (byte <= ' ' or byte == 0x7f) return false;
+    return true;
 }
 
 pub fn save(gpa: std.mem.Allocator, io: Io, home: []const u8, value: Config) !void {
@@ -127,6 +141,10 @@ test "settings round trip provider-specific compaction choices" {
     value.compact_threshold_percent = 70;
     value.setCompactModel(.claude, "claude-sonnet-5");
     value.setCompactEffort(.claude, .medium);
+    value.subagents_enabled = false;
+    value.subagent_max_concurrent = 2;
+    value.subagent_default_background = false;
+    value.firecrawl_api_key = "fc-test-key";
     try save(std.testing.allocator, std.testing.io, home, value);
     var loaded = try load(std.testing.allocator, std.testing.io, home);
     defer loaded.deinit();
@@ -134,4 +152,15 @@ test "settings round trip provider-specific compaction choices" {
     try std.testing.expectEqual(@as(u8, 70), loaded.value.compact_threshold_percent);
     try std.testing.expectEqualStrings("claude-sonnet-5", loaded.value.compactModel(.claude));
     try std.testing.expectEqual(models.Effort.medium, loaded.value.compactEffort(.claude).?);
+    try std.testing.expect(!loaded.value.subagents_enabled);
+    try std.testing.expectEqual(@as(u8, 2), loaded.value.subagent_max_concurrent);
+    try std.testing.expect(!loaded.value.subagent_default_background);
+    try std.testing.expectEqualStrings("fc-test-key", loaded.value.firecrawl_api_key.?);
+}
+
+test "Firecrawl API keys reject whitespace and empty values" {
+    try std.testing.expect(validFirecrawlApiKey("fc-test-key"));
+    try std.testing.expect(!validFirecrawlApiKey(""));
+    try std.testing.expect(!validFirecrawlApiKey("fc-test key"));
+    try std.testing.expect(!validFirecrawlApiKey("fc-test\nkey"));
 }

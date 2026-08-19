@@ -3,11 +3,16 @@ const Io = std.Io;
 const auth = @import("auth.zig");
 const cancel = @import("cancel.zig");
 const context = @import("context.zig");
+const git = @import("git.zig");
 const input_mod = @import("input.zig");
 const log = @import("log.zig");
+const markdown = @import("markdown.zig");
 const models = @import("models.zig");
+const request = @import("request.zig");
 const settings_mod = @import("settings.zig");
 const spin = @import("spin.zig");
+const stream_decoder = @import("stream.zig");
+const subagents = @import("subagents.zig");
 const term = @import("term.zig");
 const threads = @import("threads.zig");
 const tools = @import("tools.zig");
@@ -29,11 +34,18 @@ pub const Options = struct {
     provider: auth.Provider,
     model: []const u8,
     effort: ?Effort = null,
+    fast: bool = false,
     first_prompt: ?[]const u8 = null,
     input: ?*Io.Reader = null,
     output: *Io.Writer,
+    /// Destination for tool call/aftermath lines and compaction notices.
+    /// Piped one-shots point this at stderr so stdout stays clean answer
+    /// text; null means they share `output`.
+    tool_trace: ?*Io.Writer = null,
     /// Empty means the latest thread for cwd; non-empty is an explicit ID.
     resume_id: ?[]const u8 = null,
+    /// Hidden worker controls used by subagent child processes.
+    subagent_control: ?[]const u8 = null,
 };
 
 pub fn defaultModel(provider: auth.Provider) []const u8 {
@@ -48,7 +60,9 @@ const Session = struct {
     provider: auth.Provider,
     model: []u8,
     effort: ?Effort,
+    fast: bool,
     output: *Io.Writer,
+    trace: *Io.Writer,
     arena: std.heap.ArenaAllocator,
     entries: std.ArrayList(Entry) = .empty,
     instructions: []u8,
@@ -56,12 +70,23 @@ const Session = struct {
     thread: ?threads.Thread = null,
     turn: u64 = 0,
     usage: Usage = .{},
+    git_status: git.Status = .{},
+    /// When on, tool results echo an indented, clamped preview so the
+    /// user can audit what commands actually printed.
+    verbose: bool = false,
+    /// True when a prompt reader exists; failed rounds return to the
+    /// prompt instead of ending the process.
+    interactive: bool = false,
+    subagent_manager: ?subagents.Manager = null,
+    subagent_control: ?[]const u8 = null,
+    subagent_control_seen: usize = 0,
 
     fn allocator(self: *Session) std.mem.Allocator {
         return self.arena.allocator();
     }
 
     fn deinit(self: *Session) void {
+        if (self.subagent_manager) |*manager| manager.deinit();
         if (self.thread) |*thread| thread.deinit();
         self.arena.deinit();
         self.gpa.free(self.model);
@@ -80,11 +105,20 @@ const Session = struct {
                 if (self.thread) |*thread| try thread.appendEffort("default");
             }
         }
+        if (self.fast and !models.supportsFast(self.provider, value)) {
+            self.fast = false;
+            if (self.thread) |*thread| try thread.appendFast(false);
+        }
     }
 
     fn setEffort(self: *Session, value: ?Effort) !void {
         self.effort = value;
         if (self.thread) |*thread| try thread.appendEffort(if (value) |effort| @tagName(effort) else "default");
+    }
+
+    fn setFast(self: *Session, enabled: bool) !void {
+        self.fast = enabled;
+        if (self.thread) |*thread| try thread.appendFast(enabled);
     }
 
     fn appendEntry(self: *Session, entry: Entry) !void {
@@ -104,15 +138,25 @@ const Session = struct {
 
     fn clear(self: *Session) !void {
         self.replaceArena();
+        // Counters describe the visible conversation; a resumed thread
+        // recomputes them from entries, so an empty thread means zero.
+        self.turn = 0;
+        self.usage = .{};
         if (self.thread) |*thread| try thread.appendReset();
     }
 
     fn startThread(self: *Session) !void {
-        if (self.thread) |*thread| thread.deinit();
-        self.thread = try threads.create(self.gpa, self.io, self.home, self.cwd, self.provider, self.model, if (self.effort) |value| @tagName(value) else null);
+        // Null out before deinit: if create fails, teardown must not
+        // deinit the poisoned old payload a second time.
+        if (self.thread) |*thread| {
+            thread.deinit();
+            self.thread = null;
+        }
+        self.thread = try threads.create(self.gpa, self.io, self.home, self.cwd, self.provider, self.model, if (self.effort) |value| @tagName(value) else null, self.fast);
     }
 
     fn newThread(self: *Session) !void {
+        if (self.subagent_manager) |*manager| manager.reset();
         self.replaceArena();
         self.turn = 0;
         self.usage = .{};
@@ -121,13 +165,18 @@ const Session = struct {
 
     fn resumeThread(self: *Session, requested: ?[]const u8) !void {
         var next_arena: std.heap.ArenaAllocator = .init(self.gpa);
-        errdefer next_arena.deinit();
+        // The errdefers must disarm once ownership moves into `self`;
+        // otherwise a late failure frees the live session's arena,
+        // thread, and model while the caller keeps using them.
+        var installed = false;
+        errdefer if (!installed) next_arena.deinit();
         const excluded = if (requested == null) if (self.thread) |thread| thread.id else null else null;
         var loaded = try threads.load(self.gpa, next_arena.allocator(), self.io, self.home, self.cwd, requested, excluded);
-        errdefer loaded.thread.deinit();
+        errdefer if (!installed) loaded.thread.deinit();
         const loaded_model = try self.gpa.dupe(u8, loaded.model);
-        errdefer self.gpa.free(loaded_model);
+        errdefer if (!installed) self.gpa.free(loaded_model);
 
+        if (self.subagent_manager) |*manager| manager.reset();
         if (self.thread) |*thread| thread.deinit();
         self.arena.deinit();
         self.gpa.free(self.model);
@@ -136,7 +185,9 @@ const Session = struct {
         self.thread = loaded.thread;
         self.provider = loaded.provider;
         self.model = loaded_model;
+        installed = true;
         self.effort = if (loaded.effort) |value| Effort.parse(value) else null;
+        self.fast = loaded.fast and models.supportsFast(loaded.provider, loaded.model);
         if (self.effort) |effort| {
             if (!models.supportsEffort(self.provider, self.model, effort)) self.effort = null;
         }
@@ -169,6 +220,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
     if (options.effort) |effort| {
         if (!models.supportsEffort(options.provider, options.model, effort)) return error.InvalidEffortForModel;
     }
+    if (options.fast and options.resume_id == null and !models.supportsFast(options.provider, options.model)) return error.InvalidFastForModel;
     var user_settings = try settings_mod.load(gpa, io, options.home);
     var settings_owned = true;
     errdefer if (settings_owned) user_settings.deinit();
@@ -180,7 +232,16 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
         .provider = options.provider,
         .model = try gpa.dupe(u8, options.model),
         .effort = options.effort,
+        .fast = options.fast,
         .output = options.output,
+        .trace = options.tool_trace orelse options.output,
+        .interactive = options.input != null,
+        .subagent_manager = if (options.subagent_control == null) try subagents.Manager.init(gpa, io, options.cwd, .{
+            .enabled = user_settings.value.subagents_enabled,
+            .max_concurrent = user_settings.value.subagent_max_concurrent,
+            .background_by_default = user_settings.value.subagent_default_background,
+        }) else null,
+        .subagent_control = options.subagent_control,
         .arena = .init(gpa),
         .instructions = try context.load(gpa, io, options.home, options.cwd),
         .settings = user_settings,
@@ -192,11 +253,17 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
 
     if (options.resume_id) |id| {
         try session.resumeThread(if (id.len == 0) null else id);
+        if (options.fast) {
+            if (!models.supportsFast(session.provider, session.model)) return error.InvalidFastForModel;
+            try session.setFast(true);
+        }
         // Orientation matters most interactively; one-shot output stays clean.
         if (options.input != null) try printResumed(&session);
     } else if (options.input != null) {
         try session.startThread();
     }
+    refreshGit(&session);
+    syncTui(&session);
     if (options.first_prompt) |prompt| {
         try session.appendUser(prompt);
     } else {
@@ -206,19 +273,65 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
         try session.appendUser(prompt);
     }
 
-    syncTui(&session);
     var exchange_start = Io.Clock.now(.awake, io);
     var exchange_base = session.usage;
     while (true) {
+        if (session.subagent_manager) |*manager| {
+            if (try manager.takeNotifications(session.allocator())) |notification| {
+                try session.appendEntry(.{ .user = notification });
+                refreshGit(&session);
+            }
+            syncTui(&session);
+        }
+        _ = try consumeSteering(&session);
         try setTitle(&session, true);
         _ = try compactIfNeeded(&session, false);
+        // A cancel that landed outside a round (during compaction or
+        // between spawns) must not silently start the next request.
+        if (cancel.requested()) {
+            cancel.reset();
+            var prefill: ?[]const u8 = null;
+            if (session.entries.items.len > 0 and session.entries.items[session.entries.items.len - 1] == .user) {
+                const popped = session.entries.pop().?;
+                prefill = popped.user;
+                try persistSnapshot(&session);
+            }
+            try options.output.writeAll("\ninterrupted\n");
+            try options.output.flush();
+            tui.noteState(.idle, "");
+            syncTui(&session);
+            const reader = options.input orelse return error.Interrupted;
+            const prompt = (try readPrompt(&session, reader, prefill)) orelse return;
+            defer gpa.free(prompt);
+            try session.appendUser(prompt);
+            exchange_start = Io.Clock.now(.awake, io);
+            exchange_base = session.usage;
+            continue;
+        }
         session.turn += 1;
         tui.noteState(.thinking, "");
         const answer = performRound(&session) catch |err| switch (err) {
-            error.NotLoggedIn => {
-                try options.output.print("not logged in; run: xaq login {s}\n", .{@tagName(session.provider)});
-                try options.output.flush();
-                return;
+            error.ProviderRequestFailed => {
+                // The HTTP error body was already printed to the transcript.
+                // Interactively the session survives: the failed prompt is
+                // prefilled for editing (a /model fix, a retry). One-shots
+                // propagate so the process exits nonzero.
+                session.turn -|= 1;
+                const reader = options.input orelse return err;
+                var prefill: ?[]const u8 = null;
+                if (session.entries.items.len > 0 and session.entries.items[session.entries.items.len - 1] == .user) {
+                    const popped = session.entries.pop().?;
+                    prefill = popped.user; // arena-owned; stays valid until reset
+                    try persistSnapshot(&session);
+                }
+                tui.noteState(.idle, "");
+                syncTui(&session);
+                const prompt = (try readPrompt(&session, reader, prefill)) orelse return;
+                defer gpa.free(prompt);
+                try session.appendUser(prompt);
+                exchange_start = Io.Clock.now(.awake, io);
+                exchange_base = session.usage;
+                continue;
             },
             error.Cancelled => {
                 session.turn -|= 1;
@@ -265,6 +378,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
                 }, contextPercent(&session));
             }
             try options.output.flush();
+            if (options.input == null and try consumeSteering(&session) > 0) continue;
             const reader = options.input orelse return;
             const prompt = (try readPrompt(&session, reader, null)) orelse return;
             defer gpa.free(prompt);
@@ -275,6 +389,16 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
         }
 
         const results = try session.allocator().alloc(ToolResult, answer.calls.len);
+        // Tool blocks are blank-line separated from streamed text: two
+        // breaks close the open text line and leave a gap; pure tool
+        // rounds start at column zero already. The breaks stay on the
+        // answer stream even when tool lines are diverted to stderr, so
+        // piped output keeps rounds separated.
+        const trace = session.trace;
+        if (answer.text.len > 0) {
+            try options.output.writeAll("\n\n");
+            try options.output.flush();
+        }
         for (answer.calls, 0..) |call, i| {
             tui.noteState(.tooling, call.name);
             const start = Io.Clock.now(.awake, io);
@@ -283,29 +407,111 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
             const scratch_gpa = scratch.allocator();
             invoke: {
                 var parsed = std.json.parseFromSlice(std.json.Value, scratch_gpa, call.arguments, .{}) catch |err| {
-                    try printToolCall(options.output, i == 0, call.name, null);
+                    try printToolCall(trace, call.name, null);
                     results[i] = .{ .id = call.id, .text = try std.fmt.allocPrint(session.allocator(), "invalid tool arguments: {s}", .{@errorName(err)}) };
                     break :invoke;
                 };
                 defer parsed.deinit();
-                try printToolCall(options.output, i == 0, call.name, parsed.value);
-                const result = tools.execute(scratch_gpa, io, call.name, parsed.value) catch |err|
+                try printToolCall(trace, call.name, parsed.value);
+                const result = tools.executeWithContext(scratch_gpa, io, call.name, parsed.value, .{
+                    .cwd = session.cwd,
+                    .firecrawl_api_key = session.settings.value.firecrawl_api_key,
+                    .write_enabled = true,
+                    .subagent_manager = if (session.subagent_manager) |*manager| manager else null,
+                    .subagent_launch = .{
+                        .provider = @tagName(session.provider),
+                        .model = session.model,
+                        .effort = if (session.effort) |value| @tagName(value) else null,
+                        .fast = session.fast,
+                    },
+                }) catch |err|
                     try std.fmt.allocPrint(scratch_gpa, "tool error: {s}", .{@errorName(err)});
                 results[i] = .{ .id = call.id, .text = try session.allocator().dupe(u8, result) };
             }
+            if (toolMayChangeWorktree(call.name)) {
+                refreshGit(&session);
+                syncTui(&session);
+            }
             const elapsed_ms: i64 = @intCast(@divTrunc(Io.Clock.now(.awake, io).nanoseconds - start.nanoseconds, std.time.ns_per_ms));
             if (elapsed_ms >= slow_tool_ms) {
-                try options.output.writeAll(" \u{b7} ");
-                try writeDuration(options.output, @intCast(elapsed_ms));
+                try trace.writeAll(" \u{b7} ");
+                try writeDuration(trace, @intCast(elapsed_ms));
             }
-            try options.output.print("{s}\n", .{term.reset()});
-            try options.output.flush();
+            try trace.print("{s}\n", .{term.reset()});
+            try trace.flush();
             log.logf("tool", "event=call turn={d} name={s} args_bytes={d} result_bytes={d} ms={d}", .{ session.turn, call.name, call.arguments.len, results[i].text.len, elapsed_ms });
-            try printToolOutcome(options.output, results[i].text);
+            if (isSubagentTool(call.name)) {
+                try printSubagentOutcome(trace, results[i].text);
+            } else {
+                try printToolOutcome(trace, results[i].text);
+            }
+            if (session.verbose) try printToolVerbose(trace, results[i].text);
+            // A ctrl-c during tool execution ends the whole exchange;
+            // checked here because the next spawn resets the flag.
+            if (cancel.requested()) {
+                var remaining = i + 1;
+                while (remaining < answer.calls.len) : (remaining += 1) {
+                    results[remaining] = .{ .id = answer.calls[remaining].id, .text = "cancelled by the user before execution" };
+                }
+                break;
+            }
         }
+        // A gap after the block keeps the next streamed answer readable.
+        try trace.writeByte('\n');
+        try trace.flush();
         try session.appendEntry(.{ .results = results });
+        syncTui(&session);
         log.flush();
+        if (cancel.requested()) {
+            cancel.reset();
+            const interrupted_ms: u64 = @intCast(@max(0, @divTrunc(Io.Clock.now(.awake, io).nanoseconds - exchange_start.nanoseconds, std.time.ns_per_ms)));
+            try options.output.writeAll("interrupted after ");
+            try writeDuration(options.output, interrupted_ms);
+            try options.output.writeByte('\n');
+            try options.output.flush();
+            tui.noteState(.idle, "");
+            syncTui(&session);
+            const reader = options.input orelse return error.Interrupted;
+            const prompt = (try readPrompt(&session, reader, null)) orelse return;
+            defer gpa.free(prompt);
+            try session.appendUser(prompt);
+            exchange_start = Io.Clock.now(.awake, io);
+            exchange_base = session.usage;
+            continue;
+        }
     }
+}
+
+/// Subagent workers receive steering through an atomically replaced JSONL
+/// file. Each message becomes a normal user entry before the next model turn.
+fn consumeSteering(session: *Session) !usize {
+    const path = session.subagent_control orelse return 0;
+    const bytes = Io.Dir.cwd().readFileAlloc(session.io, path, session.gpa, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        else => return err,
+    };
+    defer session.gpa.free(bytes);
+    var seen: usize = 0;
+    var added: usize = 0;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        if (seen < session.subagent_control_seen) {
+            seen += 1;
+            continue;
+        }
+        var parsed = std.json.parseFromSlice(std.json.Value, session.gpa, line, .{}) catch continue;
+        defer parsed.deinit();
+        const message = switch (parsed.value) {
+            .string => |text| text,
+            else => continue,
+        };
+        try session.appendUser(message);
+        seen += 1;
+        added += 1;
+    }
+    session.subagent_control_seen = seen;
+    return added;
 }
 
 /// Prompt until a non-empty, non-command line arrives. Slash commands run
@@ -332,7 +538,7 @@ fn readPrompt(session: *Session, reader: *Io.Reader, prefill: ?[]const u8) !?[]c
     }
 }
 
-const Command = enum { help, model, effort, settings, status, compact, clear, new, resume_thread, exit };
+const Command = enum { help, model, effort, fast, verbose, firecrawl, agents, settings, status, compact, clear, new, resume_thread, exit };
 
 const CommandSpec = struct {
     command: Command,
@@ -344,8 +550,12 @@ const CommandSpec = struct {
 
 const command_specs = [_]CommandSpec{
     .{ .command = .help, .name = "help", .help = "list commands" },
-    .{ .command = .model, .name = "model", .args = " [ID]", .help = "pick or set the model" },
+    .{ .command = .model, .name = "model", .args = " [ID]", .help = "pick model, effort, and speed" },
     .{ .command = .effort, .name = "effort", .args = " [LEVEL]", .help = "pick or set reasoning effort" },
+    .{ .command = .fast, .name = "fast", .args = " [MODE]", .help = "toggle normal or fast mode" },
+    .{ .command = .verbose, .name = "verbose", .args = " [on|off]", .help = "show tool output inline" },
+    .{ .command = .firecrawl, .name = "firecrawl", .args = " [status|clear]", .help = "configure Firecrawl web tools" },
+    .{ .command = .agents, .name = "agents", .help = "list subagents and their status" },
     .{ .command = .settings, .name = "settings", .alias = "config", .help = "configure context compaction" },
     .{ .command = .status, .name = "status", .help = "show session and token usage" },
     .{ .command = .compact, .name = "compact", .help = "compact older context now" },
@@ -397,7 +607,13 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
     const word = body[0..split];
     const args = std.mem.trim(u8, body[split..], " \t");
     const command = findCommand(word) catch {
-        try output.print("ambiguous command: /{s} (try /help)\n", .{word});
+        try output.print("ambiguous command: /{s} (matches", .{word});
+        for (command_specs) |spec| {
+            var hit = std.mem.startsWith(u8, spec.name, word);
+            if (spec.alias) |alias| hit = hit or std.mem.startsWith(u8, alias, word);
+            if (hit) try output.print(" /{s}", .{spec.name});
+        }
+        try output.writeAll(")\n");
         try output.flush();
         return true;
     } orelse {
@@ -411,12 +627,12 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
             for (command_specs) |spec| {
                 try output.print("  {s}/{s}{s}{s}", .{ term.bold(), spec.name, spec.args, term.reset() });
                 var column = 1 + spec.name.len + spec.args.len;
-                while (column < 18) : (column += 1) try output.writeByte(' ');
+                while (column < input_mod.help_column) : (column += 1) try output.writeByte(' ');
                 try output.print("{s}", .{spec.help});
                 if (spec.alias) |alias| try output.print(" {s}(also /{s}){s}", .{ term.dim(), alias, term.reset() });
                 try output.writeByte('\n');
             }
-            try output.print("{s}  enter sends \u{b7} \\ continues \u{b7} \u{2191}\u{2193} history \u{b7} tab completes \u{b7} ctrl-c ctrl-c or ctrl-d exits{s}\n", .{ term.dim(), term.reset() });
+            try output.print("{s}  enter sends \u{b7} \\ continues \u{b7} \u{2191}\u{2193} history \u{b7} tab completes \u{b7} ctrl-d exits{s}\n", .{ term.dim(), term.reset() });
         },
         .model => if (args.len == 0) {
             if (input_mod.interactive) {
@@ -425,8 +641,10 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
                 try output.print("model {s} (provider default {s})\n", .{ session.model, defaultModel(session.provider) });
             }
         } else {
+            const was_fast = session.fast;
             try session.setModel(args);
             try output.print("model set to {s}\n", .{session.model});
+            if (was_fast and !session.fast) try output.writeAll("fast mode turned off; this model does not support it\n");
         },
         .effort => if (args.len == 0) {
             if (input_mod.interactive) {
@@ -436,7 +654,7 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
             }
         } else {
             const value = if (std.mem.eql(u8, args, "default") or std.mem.eql(u8, args, "provider-default")) null else Effort.parse(args) orelse {
-                try output.writeAll("unknown effort (try /effort)\n");
+                try output.writeAll("unknown effort (low, medium, high, xhigh, max, or default)\n");
                 try output.flush();
                 return true;
             };
@@ -448,6 +666,82 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
             try session.setEffort(value);
             try output.print("effort set to {s}\n", .{if (value) |effort| @tagName(effort) else "provider-default"});
         },
+        .fast => {
+            const enabled = if (args.len == 0)
+                !session.fast
+            else if (std.mem.eql(u8, args, "on"))
+                true
+            else if (std.mem.eql(u8, args, "off"))
+                false
+            else if (std.mem.eql(u8, args, "status")) {
+                try output.print("fast mode {s}\n", .{if (session.fast) "on" else "off"});
+                try output.flush();
+                return true;
+            } else {
+                try output.writeAll("usage: /fast [on|off|status]\n");
+                try output.flush();
+                return true;
+            };
+            if (enabled and !models.supportsFast(session.provider, session.model)) {
+                try output.print("fast mode is not available for {s}\n", .{session.model});
+                try output.flush();
+                return true;
+            }
+            try session.setFast(enabled);
+            try output.print("fast mode {s}\n", .{if (enabled) "on" else "off"});
+        },
+        .verbose => {
+            const enabled = if (args.len == 0)
+                !session.verbose
+            else if (std.mem.eql(u8, args, "on"))
+                true
+            else if (std.mem.eql(u8, args, "off"))
+                false
+            else {
+                try output.writeAll("usage: /verbose [on|off]\n");
+                try output.flush();
+                return true;
+            };
+            session.verbose = enabled;
+            try output.print("verbose tool output {s}\n", .{if (enabled) "on" else "off"});
+        },
+        .firecrawl => {
+            if (std.mem.eql(u8, args, "status")) {
+                try output.print("Firecrawl web tools {s}\n", .{if (session.settings.value.firecrawl_api_key != null) "on" else "off"});
+            } else if (std.mem.eql(u8, args, "clear")) {
+                session.settings.value.firecrawl_api_key = null;
+                try saveSettings(session);
+                try output.writeAll("Firecrawl API key removed; web tools are off\n");
+            } else if (args.len > 0) {
+                try output.writeAll("usage: /firecrawl [status|clear]\nRun /firecrawl with no argument to paste the key into a hidden prompt.\n");
+            } else {
+                try output.print("{s}Paste a Firecrawl API key. The prompt is hidden and the key is stored in ~/.config/xaq/settings.json.{s}\n", .{ term.dim(), term.reset() });
+                try output.flush();
+                const entered = (try input_mod.readSecret(session.gpa, reader, output, "Firecrawl API key: ")) orelse {
+                    try output.writeAll("Firecrawl setup cancelled\n");
+                    try output.flush();
+                    return true;
+                };
+                defer session.gpa.free(entered);
+                if (!settings_mod.validFirecrawlApiKey(entered)) {
+                    try output.writeAll("invalid Firecrawl API key: use a non-empty key with no spaces\n");
+                    try output.flush();
+                    return true;
+                }
+                session.settings.value.firecrawl_api_key = try session.settings.arena.allocator().dupe(u8, entered);
+                try saveSettings(session);
+                try output.writeAll("Firecrawl configured; web_fetch and web_search are now available\n");
+            }
+        },
+        .agents => {
+            if (session.subagent_manager) |*manager| {
+                const list = try manager.formatList(session.gpa);
+                defer session.gpa.free(list);
+                try output.writeAll(list);
+            } else {
+                try output.writeAll("subagents are unavailable inside a subagent\n");
+            }
+        },
         .settings => {
             if (input_mod.interactive) {
                 try pickSettings(session, reader);
@@ -458,8 +752,8 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
         .status => {
             const context_tokens = models.contextWindow(session.provider, session.model);
             try output.print(
-                "  thread    {s}\n  provider  {s}\n  model     {s}\n  effort    {s}\n  cwd       {s}\n  turns     {d}\n  context   ~{d} / {d} tokens\n",
-                .{ if (session.thread) |thread| thread.id else "ephemeral", @tagName(session.provider), session.model, if (session.effort) |value| @tagName(value) else "provider-default", session.cwd, session.turn, estimatedContextTokens(session), context_tokens },
+                "  thread    {s}\n  provider  {s}\n  model     {s}\n  effort    {s}\n  fast      {s}\n  web       {s}\n  cwd       {s}\n  turns     {d}\n  context   ~{d} / {d} tokens\n",
+                .{ if (session.thread) |thread| thread.id else "ephemeral", @tagName(session.provider), session.model, if (session.effort) |value| @tagName(value) else "provider-default", if (session.fast) "on" else "off", if (session.settings.value.firecrawl_api_key != null) "Firecrawl" else "off", session.cwd, session.turn, estimatedContextTokens(session), context_tokens },
             );
             try output.writeAll("  tokens    ");
             try writeTokens(output, session.usage.input);
@@ -490,7 +784,7 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
                 try pickResume(session, reader);
             } else {
                 session.resumeThread(if (args.len == 0) null else args) catch |err| {
-                    try output.print("cannot resume: {s}\n", .{@errorName(err)});
+                    try output.print("cannot resume: {s}\n", .{resumeErrorMessage(err)});
                     try output.flush();
                     return true;
                 };
@@ -534,12 +828,66 @@ fn pickModel(session: *Session, reader: *Io.Reader) !void {
     try output.print("{s}pick a model \u{b7} enter confirms \u{b7} q cancels \u{b7} any ID via /model <id>{s}\r\n", .{ term.dim(), term.reset() });
     try output.flush();
     if (try input_mod.pick(reader, output, labels[0..count], 0)) |index| {
-        if (index != 0) try session.setModel(values[index]);
+        const selected_model = values[index];
+        const preferences = (try pickModelPreferences(session, reader, selected_model)) orelse {
+            try output.print("model {s} (unchanged)\n", .{session.model});
+            return;
+        };
+        if (!std.mem.eql(u8, selected_model, session.model)) try session.setModel(selected_model);
+        if (session.effort != preferences.effort) try session.setEffort(preferences.effort);
+        if (session.fast != preferences.fast) try session.setFast(preferences.fast);
         log.logf("agent", "event=model model={s}", .{session.model});
-        try output.print("model {s}\n", .{session.model});
+        if (models.supportsFast(session.provider, session.model)) {
+            try output.print("model {s} \u{b7} effort {s} \u{b7} {s}\n", .{
+                session.model,
+                if (session.effort) |effort| @tagName(effort) else "provider-default",
+                if (session.fast) "fast" else "normal",
+            });
+        } else if (models.efforts(session.provider, session.model).len > 0) {
+            try output.print("model {s} \u{b7} effort {s}\n", .{
+                session.model,
+                if (session.effort) |effort| @tagName(effort) else "provider-default",
+            });
+        } else {
+            try output.print("model {s}\n", .{session.model});
+        }
     } else {
         try output.print("model {s} (unchanged)\n", .{session.model});
     }
+}
+
+const ModelPreferences = struct {
+    effort: ?Effort,
+    fast: bool,
+};
+
+/// Follow model selection with the controls that model supports. Nothing is
+/// applied until every visible stage has been confirmed.
+fn pickModelPreferences(session: *Session, reader: *Io.Reader, model: []const u8) !?ModelPreferences {
+    var selected: ModelPreferences = .{
+        .effort = null,
+        // Match fx's staged picker: supported models start on Fast, while
+        // Normal remains one arrow key away.
+        .fast = models.supportsFast(session.provider, model),
+    };
+    const available_efforts = models.efforts(session.provider, model);
+    if (available_efforts.len > 0) {
+        var labels: [6][]const u8 = undefined;
+        labels[0] = "provider-default";
+        for (available_efforts, 1..) |effort, index| labels[index] = @tagName(effort);
+        try session.output.print("{s}effort for {s} \u{b7} enter confirms \u{b7} q cancels{s}\r\n", .{ term.dim(), model, term.reset() });
+        try session.output.flush();
+        const index = (try input_mod.pick(reader, session.output, labels[0 .. available_efforts.len + 1], 0)) orelse return null;
+        selected.effort = if (index == 0) null else available_efforts[index - 1];
+    }
+    if (models.supportsFast(session.provider, model)) {
+        const labels = [_][]const u8{ "normal", "fast" };
+        try session.output.print("{s}speed for {s} \u{b7} fast uses more credits \u{b7} enter confirms \u{b7} q cancels{s}\r\n", .{ term.dim(), model, term.reset() });
+        try session.output.flush();
+        const index = (try input_mod.pick(reader, session.output, &labels, 1)) orelse return null;
+        selected.fast = index == 1;
+    }
+    return selected;
 }
 
 fn pickEffort(session: *Session, reader: *Io.Reader) !void {
@@ -582,12 +930,15 @@ fn effectiveCompactEffort(session: *const Session) ?Effort {
 fn printSettings(session: *Session) !void {
     const configured_model = configuredCompactModel(session);
     try session.output.print(
-        "  auto compact       {s}\n  threshold          {d}%\n  compaction model   {s}\n  compaction effort  {s}\n",
+        "  auto compact       {s}\n  threshold          {d}%\n  compaction model   {s}\n  compaction effort  {s}\n  subagents          {s}\n  agent concurrency  {d}\n  agent default      {s}\n",
         .{
             if (session.settings.value.auto_compact) "on" else "off",
             session.settings.value.compact_threshold_percent,
             configured_model,
             if (session.settings.value.compactEffort(session.provider)) |effort| @tagName(effort) else "provider-default",
+            if (session.settings.value.subagents_enabled) "on" else "off",
+            session.settings.value.subagent_max_concurrent,
+            if (session.settings.value.subagent_default_background) "background" else "foreground",
         },
     );
 }
@@ -598,12 +949,15 @@ fn saveSettings(session: *Session) !void {
 
 fn pickSettings(session: *Session, reader: *Io.Reader) !void {
     while (true) {
-        var storage: [4][160]u8 = undefined;
+        var storage: [7][160]u8 = undefined;
         const items = [_][]const u8{
             try std.fmt.bufPrint(&storage[0], "auto compact       {s}", .{if (session.settings.value.auto_compact) "on" else "off"}),
             try std.fmt.bufPrint(&storage[1], "threshold          {d}%", .{session.settings.value.compact_threshold_percent}),
             try std.fmt.bufPrint(&storage[2], "compaction model   {s}", .{configuredCompactModel(session)}),
             try std.fmt.bufPrint(&storage[3], "compaction effort  {s}", .{if (session.settings.value.compactEffort(session.provider)) |effort| @tagName(effort) else "provider-default"}),
+            try std.fmt.bufPrint(&storage[4], "subagents          {s}", .{if (session.settings.value.subagents_enabled) "on" else "off"}),
+            try std.fmt.bufPrint(&storage[5], "agent concurrency  {d}", .{session.settings.value.subagent_max_concurrent}),
+            try std.fmt.bufPrint(&storage[6], "agent default      {s}", .{if (session.settings.value.subagent_default_background) "background" else "foreground"}),
         };
         try session.output.print("{s}settings for {s} \u{b7} enter edits \u{b7} q closes{s}\r\n", .{ term.dim(), @tagName(session.provider), term.reset() });
         try session.output.flush();
@@ -669,9 +1023,50 @@ fn pickSettings(session: *Session, reader: *Io.Reader) !void {
                     try saveSettings(session);
                 }
             },
+            4 => {
+                const labels = [_][]const u8{ "on", "off" };
+                const initial: usize = if (session.settings.value.subagents_enabled) 0 else 1;
+                try session.output.print("{s}make subagent tools available to the model{s}\r\n", .{ term.dim(), term.reset() });
+                try session.output.flush();
+                if (try input_mod.pick(reader, session.output, &labels, initial)) |index| {
+                    session.settings.value.subagents_enabled = index == 0;
+                    try saveSettings(session);
+                    try applySubagentSettings(session);
+                }
+            },
+            5 => {
+                const labels = [_][]const u8{ "1", "2", "3", "4", "5", "6", "7", "8" };
+                const initial = session.settings.value.subagent_max_concurrent - 1;
+                try session.output.print("{s}maximum subagent processes running at once{s}\r\n", .{ term.dim(), term.reset() });
+                try session.output.flush();
+                if (try input_mod.pick(reader, session.output, &labels, initial)) |index| {
+                    session.settings.value.subagent_max_concurrent = @intCast(index + 1);
+                    try saveSettings(session);
+                    try applySubagentSettings(session);
+                }
+            },
+            6 => {
+                const labels = [_][]const u8{ "background", "foreground" };
+                const initial: usize = if (session.settings.value.subagent_default_background) 0 else 1;
+                try session.output.print("{s}default when Agent omits run_in_background{s}\r\n", .{ term.dim(), term.reset() });
+                try session.output.flush();
+                if (try input_mod.pick(reader, session.output, &labels, initial)) |index| {
+                    session.settings.value.subagent_default_background = index == 0;
+                    try saveSettings(session);
+                    try applySubagentSettings(session);
+                }
+            },
             else => unreachable,
         }
     }
+}
+
+fn applySubagentSettings(session: *Session) !void {
+    if (session.subagent_manager) |*manager| try manager.configure(.{
+        .enabled = session.settings.value.subagents_enabled,
+        .max_concurrent = session.settings.value.subagent_max_concurrent,
+        .background_by_default = session.settings.value.subagent_default_background,
+    });
 }
 
 fn pickResume(session: *Session, reader: *Io.Reader) !void {
@@ -699,7 +1094,7 @@ fn pickResume(session: *Session, reader: *Io.Reader) !void {
     try session.output.flush();
     if (try input_mod.pick(reader, session.output, items, 0)) |index| {
         session.resumeThread(summaries[index].id) catch |err| {
-            try session.output.print("cannot resume: {s}\n", .{@errorName(err)});
+            try session.output.print("cannot resume: {s}\n", .{resumeErrorMessage(err)});
             return;
         };
         try printResumed(session);
@@ -708,7 +1103,7 @@ fn pickResume(session: *Session, reader: *Io.Reader) !void {
     }
 }
 
-fn fmtAge(buffer: []u8, now_seconds: i64, modified_ns: i96) []const u8 {
+pub fn fmtAge(buffer: []u8, now_seconds: i64, modified_ns: i96) []const u8 {
     const modified_seconds: i64 = @intCast(@divTrunc(modified_ns, std.time.ns_per_s));
     const delta = @max(now_seconds - modified_seconds, 0);
     if (delta < 90) return "now";
@@ -739,8 +1134,9 @@ fn printResumed(session: *Session) !void {
     if (last_assistant) |text| {
         const replay_limit = 2048;
         if (text.len > replay_limit) try output.print("{s}[\u{2026}]{s} ", .{ term.dim(), term.reset() });
-        var safe: term.SafeWriter = .{ .output = output };
-        try safe.write(if (text.len > replay_limit) text[text.len - replay_limit ..] else text);
+        var rendered = markdown.Writer.init(output);
+        try rendered.write(if (text.len > replay_limit) text[text.len - replay_limit ..] else text);
+        try rendered.finish();
         try output.writeByte('\n');
     }
     try output.flush();
@@ -757,9 +1153,43 @@ fn setTitle(session: *Session, busy: bool) !void {
     try session.output.flush();
 }
 
+// The fullscreen view erases its screen on exit, taking any final
+// provider diagnostic with it; main re-prints this on the real screen.
+var provider_error_buffer: [512]u8 = undefined;
+var provider_error_len: usize = 0;
+
+fn rememberProviderError(status: u16, body: []const u8) void {
+    var writer: Io.Writer = .fixed(&provider_error_buffer);
+    writer.print("provider HTTP {d}: ", .{status}) catch {};
+    for (body) |byte| {
+        if (byte == '\n' or byte == '\r') break;
+        if (byte < 0x20 or byte == 0x7f) continue;
+        writer.writeByte(byte) catch break;
+    }
+    provider_error_len = writer.buffered().len;
+}
+
+pub fn lastProviderError() ?[]const u8 {
+    if (provider_error_len == 0) return null;
+    return provider_error_buffer[0..provider_error_len];
+}
+
+/// Human-readable messages for /resume failures; raw Zig error names
+/// like NoThreads read as internals, not guidance.
+fn resumeErrorMessage(err: anyerror) []const u8 {
+    return switch (err) {
+        error.NoThreads => "no saved threads for this directory",
+        error.FileNotFound => "no thread with that ID for this directory",
+        error.InvalidThreadId => "invalid thread ID (16 URL-safe base64 characters)",
+        error.InvalidThread => "thread file is corrupt or incomplete",
+        else => @errorName(err),
+    };
+}
+
 /// Dim aftermath line for failed tool calls: `  ↳ exit 2`. Success stays
 /// silent (timing is appended inline on the call line); failures should not
-/// require reading the model's reaction to be noticed.
+/// require reading the model's reaction to be noticed. Routine read
+/// truncation is model-facing pagination, not a failure, and stays silent.
 fn printToolOutcome(output: *Io.Writer, text: []const u8) !void {
     var info: ?[]const u8 = null;
     if (std.mem.startsWith(u8, text, "tool error:") or std.mem.startsWith(u8, text, "invalid tool arguments")) {
@@ -771,9 +1201,32 @@ fn printToolOutcome(output: *Io.Writer, text: []const u8) !void {
         if (last.len >= 3 and last[0] == '[' and last[last.len - 1] == ']') info = last[1 .. last.len - 1];
     }
     if (info == null) return;
+    if (std.mem.startsWith(u8, info.?, "truncated:")) return;
     try output.print("{s}  \u{21b3} ", .{term.dim()});
     try writePreview(output, info.?);
     try output.print("{s}\n", .{term.reset()});
+    try output.flush();
+}
+
+const verbose_lines_max = 12;
+
+/// Indented, clamped echo of a tool result for /verbose: at most twelve
+/// lines, each sanitized and cut at the preview width.
+fn printToolVerbose(output: *Io.Writer, text: []const u8) !void {
+    const trimmed = std.mem.trim(u8, text, " \n");
+    if (trimmed.len == 0) return;
+    var shown: usize = 0;
+    var lines = std.mem.splitScalar(u8, trimmed, '\n');
+    while (lines.next()) |line| {
+        if (shown == verbose_lines_max) {
+            try output.print("{s}  \u{2502} \u{2026}{s}\n", .{ term.dim(), term.reset() });
+            break;
+        }
+        try output.print("{s}  \u{2502} ", .{term.dim()});
+        try writePreview(output, line);
+        try output.print("{s}\n", .{term.reset()});
+        shown += 1;
+    }
     try output.flush();
 }
 
@@ -781,16 +1234,35 @@ fn printToolOutcome(output: *Io.Writer, text: []const u8) !void {
 /// first line of the main argument, sanitized and clamped, never full
 /// contents. The line stays open (dim, no newline) so the caller can append
 /// the elapsed time once the tool returns.
-fn printToolCall(output: *Io.Writer, first: bool, name: []const u8, arguments: ?std.json.Value) !void {
-    if (first) try output.writeByte('\n');
+fn printToolCall(output: *Io.Writer, name: []const u8, arguments: ?std.json.Value) !void {
     try output.print("{s}[{s}]", .{ term.dim(), name });
     if (arguments) |value| {
-        const key = if (std.mem.eql(u8, name, "bash")) "command" else "path";
+        const key = if (std.mem.eql(u8, name, "bash"))
+            "command"
+        else if (std.mem.eql(u8, name, "Agent"))
+            "description"
+        else if (std.mem.eql(u8, name, "get_subagent_result") or std.mem.eql(u8, name, "steer_subagent"))
+            "agent_id"
+        else
+            "path";
         if (eventString(value, key)) |preview| {
             try output.writeByte(' ');
             try writePreview(output, preview);
         }
     }
+    try output.flush();
+}
+
+fn isSubagentTool(name: []const u8) bool {
+    return std.mem.eql(u8, name, "Agent") or std.mem.eql(u8, name, "get_subagent_result") or std.mem.eql(u8, name, "steer_subagent");
+}
+
+fn printSubagentOutcome(output: *Io.Writer, text: []const u8) !void {
+    const first_end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+    if (first_end == 0) return;
+    try output.print("{s}  \u{21b3} ", .{term.dim()});
+    try writePreview(output, text[0..first_end]);
+    try output.print("{s}\n", .{term.reset()});
     try output.flush();
 }
 
@@ -859,7 +1331,9 @@ fn compactIfNeeded(session: *Session, force: bool) !bool {
         if (!session.settings.value.auto_compact) return false;
         if (current_tokens <= threshold_tokens) return false;
     }
-    if (session.entries.items.len < 4) return false;
+    // Forced compaction accepts tiny histories: even three oversized
+    // entries can exceed the model window with no other way out.
+    if (session.entries.items.len < @as(usize, if (force) 2 else 4)) return false;
 
     var keep_start = session.entries.items.len;
     var kept: usize = 0;
@@ -873,12 +1347,15 @@ fn compactIfNeeded(session: *Session, force: bool) !bool {
     if (keep_start == 0) return false;
 
     const compact_model = effectiveCompactModel(session);
-    try session.output.print("{s}[compacting \u{b7} {s}]{s}\n", .{ term.dim(), compact_model, term.reset() });
-    try session.output.flush();
+    try session.trace.print("{s}[compacting \u{b7} {s}]{s}\n", .{ term.dim(), compact_model, term.reset() });
+    try session.trace.flush();
     var summary: Io.Writer.Allocating = .init(session.gpa);
     defer summary.deinit();
     try summary.writer.writeAll("Compacted earlier conversation:\n");
     const generated = compactWithModel(session, compact_model, session.entries.items[0..keep_start]) catch |err| fallback: {
+        // A cancelled summary must not silently fall back and keep
+        // working; the caller's loop-top check handles the message.
+        if (err == error.Cancelled) return false;
         log.logf("agent", "event=compact_fallback error={s}", .{@errorName(err)});
         break :fallback null;
     };
@@ -886,7 +1363,8 @@ fn compactIfNeeded(session: *Session, force: bool) !bool {
         if (text.len > 0) try summary.writer.writeAll(text);
     }
     if (generated == null or summary.written().len == "Compacted earlier conversation:\n".len) {
-        try session.output.print("{s}[using local compaction fallback]{s}\n", .{ term.dim(), term.reset() });
+        try session.trace.print("{s}[using local compaction fallback]{s}\n", .{ term.dim(), term.reset() });
+        try session.trace.flush();
         for (session.entries.items[0..keep_start]) |entry| {
             if (summary.written().len >= compact_summary_bytes) break;
             switch (entry) {
@@ -904,7 +1382,10 @@ fn compactIfNeeded(session: *Session, force: bool) !bool {
     }
 
     var next_arena: std.heap.ArenaAllocator = .init(session.gpa);
-    errdefer next_arena.deinit();
+    // Disarm once installed: persistSnapshot failing after the swap must
+    // not free the arena the session now owns.
+    var installed = false;
+    errdefer if (!installed) next_arena.deinit();
     const next_gpa = next_arena.allocator();
     var next_entries: std.ArrayList(Entry) = .empty;
     try next_entries.append(next_gpa, .{ .user = try next_gpa.dupe(u8, summary.written()) });
@@ -912,6 +1393,7 @@ fn compactIfNeeded(session: *Session, force: bool) !bool {
     session.arena.deinit();
     session.arena = next_arena;
     session.entries = next_entries;
+    installed = true;
     try persistSnapshot(session);
     log.logf("agent", "event=compact before_tokens={d} after_tokens={d} model={s}", .{ current_tokens, estimatedContextTokens(session), compact_model });
     return true;
@@ -923,15 +1405,49 @@ fn syncTui(session: *Session) void {
     if (!tui.active) return;
     const window = models.contextWindow(session.provider, session.model);
     const percent: u8 = @intCast(@min(estimatedContextTokens(session) * 100 / @max(window, 1), 100));
+    const git_identity: ?tui.GitIdentity = if (session.git_status.present) .{
+        .worktree = session.git_status.worktree(),
+        .branch = session.git_status.branch(),
+        .dirty = session.git_status.dirty,
+    } else null;
     tui.noteIdentity(
         @tagName(session.provider),
         session.model,
-        if (session.effort) |effort| @tagName(effort) else null,
-        false,
+        if (session.effort) |value| @tagName(value) else null,
+        session.fast,
         if (session.thread) |thread| thread.id else null,
-        null,
+        git_identity,
     );
     tui.noteUsage(session.usage.input, session.usage.output, percent);
+    if (session.subagent_manager) |*manager| {
+        const agent_counts = manager.counts();
+        tui.noteAgents(agent_counts.running, agent_counts.queued);
+    } else {
+        tui.noteAgents(0, 0);
+    }
+}
+
+fn refreshGit(session: *Session) void {
+    if (!tui.active) return;
+    session.git_status = git.inspect(session.gpa, session.io, session.cwd) orelse .{};
+}
+
+fn toolMayChangeWorktree(name: []const u8) bool {
+    return std.mem.eql(u8, name, "bash") or
+        std.mem.eql(u8, name, "edit") or
+        std.mem.eql(u8, name, "write") or
+        std.mem.eql(u8, name, "Agent") or
+        std.mem.eql(u8, name, "get_subagent_result");
+}
+
+test "git refresh follows workspace-changing tools" {
+    try std.testing.expect(toolMayChangeWorktree("bash"));
+    try std.testing.expect(toolMayChangeWorktree("edit"));
+    try std.testing.expect(toolMayChangeWorktree("write"));
+    try std.testing.expect(toolMayChangeWorktree("Agent"));
+    try std.testing.expect(toolMayChangeWorktree("get_subagent_result"));
+    try std.testing.expect(!toolMayChangeWorktree("read"));
+    try std.testing.expect(!toolMayChangeWorktree("web_fetch"));
 }
 
 fn estimatedContextTokens(session: *const Session) usize {
@@ -942,10 +1458,11 @@ fn estimatedContextTokens(session: *const Session) usize {
 fn compactWithModel(session: *Session, model: []const u8, entries: []const Entry) !?[]const u8 {
     var request_arena: std.heap.ArenaAllocator = .init(session.gpa);
     defer request_arena.deinit();
-    const body = try buildCompactRequest(request_arena.allocator(), session.provider, model, effectiveCompactEffort(session), entries);
+    const fast = session.fast and models.supportsFast(session.provider, model);
+    const body = try request.buildCompact(request_arena.allocator(), session.provider, model, effectiveCompactEffort(session), fast, entries);
     var sink: Io.Writer.Allocating = .init(session.gpa);
     defer sink.deinit();
-    const answer = try performBody(session, model, body, &sink.writer, "compact");
+    const answer = try performBody(session, model, body, &sink.writer, "compact", fast);
     if (answer.calls.len > 0 or answer.text.len == 0) return null;
     session.usage.input += answer.usage.input;
     session.usage.cached += answer.usage.cached;
@@ -997,323 +1514,27 @@ fn cloneEntry(gpa: std.mem.Allocator, entry: Entry) !Entry {
 
 fn persistSnapshot(session: *Session) !void {
     if (session.thread) |*thread| {
-        try thread.appendReset();
-        for (session.entries.items) |entry| try thread.appendEntry(entry);
+        try thread.rewrite(
+            session.provider,
+            session.model,
+            if (session.effort) |value| @tagName(value) else null,
+            session.fast,
+            session.cwd,
+            session.entries.items,
+        );
     }
 }
 
-fn buildRequest(gpa: std.mem.Allocator, provider: auth.Provider, model: []const u8, effort: ?Effort, cwd: []const u8, instructions: []const u8, entries: []const Entry) ![]u8 {
-    const system = try std.fmt.allocPrint(gpa, "You are a concise coding agent in {s}. Use read, bash, edit, and write to inspect and modify the host directly. Tools have full user permissions; do not ask for tool approval. Verify material changes.{s}", .{ cwd, instructions });
-    defer gpa.free(system);
-
-    var out: Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var js: std.json.Stringify = .{ .writer = &out.writer };
-    try js.beginObject();
-    try js.objectField("model");
-    try js.write(model);
-    if (provider == .claude) {
-        try js.objectField("max_tokens");
-        try js.write(32768);
-        try js.objectField("stream");
-        try js.write(true);
-        if (effort) |value| {
-            try js.objectField("thinking");
-            try js.beginObject();
-            try js.objectField("type");
-            try js.write("adaptive");
-            try js.endObject();
-            try js.objectField("output_config");
-            try js.beginObject();
-            try js.objectField("effort");
-            try js.write(@tagName(value));
-            try js.endObject();
-        }
-        try js.objectField("system");
-        try js.beginArray();
-        try js.beginObject();
-        try js.objectField("type");
-        try js.write("text");
-        try js.objectField("text");
-        try js.write("You are Claude Code, Anthropic's official CLI for Claude.");
-        try js.endObject();
-        try js.beginObject();
-        try js.objectField("type");
-        try js.write("text");
-        try js.objectField("text");
-        try js.write(system);
-        try js.endObject();
-        try js.endArray();
-        try js.objectField("messages");
-        try writeClaudeMessages(&js, entries, null);
-        try js.objectField("tools");
-        try tools.claudeSchemas(&js);
-    } else {
-        try js.objectField("store");
-        try js.write(false);
-        try js.objectField("stream");
-        try js.write(true);
-        if (effort) |value| {
-            try js.objectField("reasoning");
-            try js.beginObject();
-            try js.objectField("effort");
-            try js.write(@tagName(value));
-            try js.endObject();
-        }
-        if (provider == .chatgpt) {
-            try js.objectField("instructions");
-            try js.write(system);
-            try js.objectField("text");
-            try js.beginObject();
-            try js.objectField("verbosity");
-            try js.write("low");
-            try js.endObject();
-        }
-        try js.objectField("input");
-        try writeResponsesInput(&js, entries, if (provider == .grok) system else null, null);
-        try js.objectField("tools");
-        try tools.schemas(&js);
-        try js.objectField("tool_choice");
-        try js.write("auto");
-        try js.objectField("parallel_tool_calls");
-        try js.write(true);
-        if (provider == .chatgpt) {
-            try js.objectField("include");
-            try js.beginArray();
-            try js.write("reasoning.encrypted_content");
-            try js.endArray();
-        }
-    }
-    try js.endObject();
-    return out.toOwnedSlice();
+pub fn buildRequest(gpa: std.mem.Allocator, provider: auth.Provider, model: []const u8, effort: ?Effort, fast: bool, tool_options: tools.SchemaOptions, cwd: []const u8, instructions: []const u8, entries: []const Entry) ![]u8 {
+    return request.build(gpa, provider, model, effort, fast, tool_options, cwd, instructions, entries);
 }
 
-const compact_system = "Summarize the supplied coding-agent history for continuation. Preserve the active goal, user requirements, decisions, files and symbols changed, commands and test results, unresolved errors, and exact identifiers needed to continue. Drop repetition and obsolete exploration. Output only a concise factual handoff; do not call tools.";
-const compact_prompt = "Create the continuation handoff now.";
+const compact_system = request.compact_system;
+const compact_prompt = request.compact_prompt;
 
-fn buildCompactRequest(gpa: std.mem.Allocator, provider: auth.Provider, model: []const u8, effort: ?Effort, entries: []const Entry) ![]u8 {
-    var out: Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var js: std.json.Stringify = .{ .writer = &out.writer };
-    try js.beginObject();
-    try js.objectField("model");
-    try js.write(model);
-    try js.objectField("stream");
-    try js.write(true);
-    if (provider == .claude) {
-        try js.objectField("max_tokens");
-        try js.write(8192);
-        if (effort) |value| {
-            try js.objectField("thinking");
-            try js.beginObject();
-            try js.objectField("type");
-            try js.write("adaptive");
-            try js.endObject();
-            try js.objectField("output_config");
-            try js.beginObject();
-            try js.objectField("effort");
-            try js.write(@tagName(value));
-            try js.endObject();
-        }
-        try js.objectField("system");
-        try js.write(compact_system);
-        try js.objectField("messages");
-        try writeClaudeMessages(&js, entries, compact_prompt);
-    } else {
-        try js.objectField("store");
-        try js.write(false);
-        if (provider == .grok) {
-            try js.objectField("max_output_tokens");
-            try js.write(8192);
-        }
-        if (effort) |value| {
-            try js.objectField("reasoning");
-            try js.beginObject();
-            try js.objectField("effort");
-            try js.write(@tagName(value));
-            try js.endObject();
-        }
-        if (provider == .chatgpt) {
-            try js.objectField("instructions");
-            try js.write(compact_system);
-            try js.objectField("text");
-            try js.beginObject();
-            try js.objectField("verbosity");
-            try js.write("low");
-            try js.endObject();
-        }
-        try js.objectField("input");
-        try writeResponsesInput(&js, entries, if (provider == .grok) compact_system else null, compact_prompt);
-    }
-    try js.endObject();
-    return out.toOwnedSlice();
+fn buildCompactRequest(gpa: std.mem.Allocator, provider: auth.Provider, model: []const u8, effort: ?Effort, fast: bool, entries: []const Entry) ![]u8 {
+    return request.buildCompact(gpa, provider, model, effort, fast, entries);
 }
-
-fn writeResponsesInput(js: *std.json.Stringify, entries: []const Entry, system: ?[]const u8, final_user: ?[]const u8) !void {
-    try js.beginArray();
-    if (system) |text| {
-        try js.beginObject();
-        try js.objectField("role");
-        try js.write("developer");
-        try js.objectField("content");
-        try js.write(text);
-        try js.endObject();
-    }
-    for (entries) |entry| switch (entry) {
-        .user => |text| {
-            try js.beginObject();
-            try js.objectField("role");
-            try js.write("user");
-            try js.objectField("content");
-            try js.beginArray();
-            try js.beginObject();
-            try js.objectField("type");
-            try js.write("input_text");
-            try js.objectField("text");
-            try js.write(text);
-            try js.endObject();
-            try js.endArray();
-            try js.endObject();
-        },
-        .assistant => |answer| {
-            if (answer.raw_items.len > 0) {
-                for (answer.raw_items) |raw| try rawValue(js, raw);
-            } else {
-                if (answer.text.len > 0) {
-                    try js.beginObject();
-                    try js.objectField("type");
-                    try js.write("message");
-                    try js.objectField("role");
-                    try js.write("assistant");
-                    try js.objectField("content");
-                    try js.beginArray();
-                    try js.beginObject();
-                    try js.objectField("type");
-                    try js.write("output_text");
-                    try js.objectField("text");
-                    try js.write(answer.text);
-                    try js.objectField("annotations");
-                    try js.beginArray();
-                    try js.endArray();
-                    try js.endObject();
-                    try js.endArray();
-                    try js.objectField("status");
-                    try js.write("completed");
-                    try js.endObject();
-                }
-                for (answer.calls) |call| {
-                    try js.beginObject();
-                    try js.objectField("type");
-                    try js.write("function_call");
-                    try js.objectField("call_id");
-                    try js.write(call.id);
-                    try js.objectField("name");
-                    try js.write(call.name);
-                    try js.objectField("arguments");
-                    try js.write(call.arguments);
-                    try js.endObject();
-                }
-            }
-        },
-        .results => |results| for (results) |result| {
-            try js.beginObject();
-            try js.objectField("type");
-            try js.write("function_call_output");
-            try js.objectField("call_id");
-            try js.write(result.id);
-            try js.objectField("output");
-            try js.write(result.text);
-            try js.endObject();
-        },
-    };
-    if (final_user) |text| {
-        try js.beginObject();
-        try js.objectField("role");
-        try js.write("user");
-        try js.objectField("content");
-        try js.write(text);
-        try js.endObject();
-    }
-    try js.endArray();
-}
-
-fn writeClaudeMessages(js: *std.json.Stringify, entries: []const Entry, final_user: ?[]const u8) !void {
-    try js.beginArray();
-    for (entries) |entry| switch (entry) {
-        .user => |text| {
-            try js.beginObject();
-            try js.objectField("role");
-            try js.write("user");
-            try js.objectField("content");
-            try js.write(text);
-            try js.endObject();
-        },
-        .assistant => |answer| {
-            try js.beginObject();
-            try js.objectField("role");
-            try js.write("assistant");
-            try js.objectField("content");
-            try js.beginArray();
-            if (answer.text.len > 0) {
-                try js.beginObject();
-                try js.objectField("type");
-                try js.write("text");
-                try js.objectField("text");
-                try js.write(answer.text);
-                try js.endObject();
-            }
-            for (answer.calls) |call| {
-                try js.beginObject();
-                try js.objectField("type");
-                try js.write("tool_use");
-                try js.objectField("id");
-                try js.write(call.id);
-                try js.objectField("name");
-                try js.write(call.name);
-                try js.objectField("input");
-                try rawValue(js, call.arguments);
-                try js.endObject();
-            }
-            try js.endArray();
-            try js.endObject();
-        },
-        .results => |results| {
-            try js.beginObject();
-            try js.objectField("role");
-            try js.write("user");
-            try js.objectField("content");
-            try js.beginArray();
-            for (results) |result| {
-                try js.beginObject();
-                try js.objectField("type");
-                try js.write("tool_result");
-                try js.objectField("tool_use_id");
-                try js.write(result.id);
-                try js.objectField("content");
-                try js.write(result.text);
-                try js.endObject();
-            }
-            try js.endArray();
-            try js.endObject();
-        },
-    };
-    if (final_user) |text| {
-        try js.beginObject();
-        try js.objectField("role");
-        try js.write("user");
-        try js.objectField("content");
-        try js.write(text);
-        try js.endObject();
-    }
-    try js.endArray();
-}
-
-fn rawValue(js: *std.json.Stringify, value: []const u8) !void {
-    try js.beginWriteRaw();
-    try js.writer.writeAll(value);
-    js.endWriteRaw();
-}
-
 fn eventString(value: std.json.Value, key: []const u8) ?[]const u8 {
     const child = switch (value) {
         .object => |o| o.get(key) orelse return null,
@@ -1346,20 +1567,26 @@ fn eventInteger(value: std.json.Value, key: []const u8) ?u64 {
 fn performRound(session: *Session) !Assistant {
     var request_arena: std.heap.ArenaAllocator = .init(session.gpa);
     defer request_arena.deinit();
-    const body = try buildRequest(
+    const body = try request.build(
         request_arena.allocator(),
         session.provider,
         session.model,
         session.effort,
+        session.fast,
+        .{
+            .web_enabled = session.settings.value.firecrawl_api_key != null,
+            .write_enabled = true,
+            .subagents_enabled = session.subagent_manager != null and session.settings.value.subagents_enabled,
+        },
         session.cwd,
         session.instructions,
         session.entries.items,
     );
-    return performBody(session, session.model, body, session.output, "round");
+    return performBody(session, session.model, body, session.output, "round", session.fast);
 }
 
-fn performBody(session: *Session, model: []const u8, body: []const u8, output: *Io.Writer, kind: []const u8) !Assistant {
-    log.logf("agent", "event=request kind={s} provider={s} model={s} turn={d} entries={d} body_bytes={d}", .{ kind, @tagName(session.provider), model, session.turn, session.entries.items.len, body.len });
+fn performBody(session: *Session, model: []const u8, body: []const u8, output: *Io.Writer, kind: []const u8, fast: bool) !Assistant {
+    log.logf("agent", "event=request kind={s} provider={s} model={s} fast={s} turn={d} entries={d} body_bytes={d}", .{ kind, @tagName(session.provider), model, if (fast) "on" else "off", session.turn, session.entries.items.len, body.len });
     var attempt: usize = 0;
     var refreshed = false;
     while (attempt < 3) : (attempt += 1) {
@@ -1376,10 +1603,21 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
         decoder.stop_spinner = !compacting;
         try output.flush();
         spin.start(session.io, if (compacting) "compacting" else "thinking");
-        const response = requestStream(session.gpa, session.io, session.provider, credential, body, &decoder) catch |err| {
+        const response = requestStream(session.gpa, session.io, session.provider, credential, body, &decoder, fast) catch |err| {
             spin.stop();
-            if (err == error.Cancelled or err == error.ProviderRequestFailed) return err;
-            if (decoder.received) {
+            if (err == error.Cancelled or err == error.ProviderRequestFailed) {
+                // Close any active markdown style before control returns to
+                // the prompt or an error line is printed.
+                decoder.finishRendering() catch {};
+                return err;
+            }
+            // A partial answer is worth keeping for a normal round; a
+            // partial compaction summary is silent data loss, because it
+            // would replace history it never covered.
+            if (decoder.received and !compacting) {
+                // A short construct may still be buffered. Flush it before
+                // the interruption notice so display order stays faithful.
+                try decoder.finishRendering();
                 try output.writeAll("\n[stream interrupted; partial response saved]\n");
                 try output.flush();
                 return decoder.finish();
@@ -1388,6 +1626,7 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
                 spin.start(session.io, "retrying");
                 defer spin.stop();
                 try session.io.sleep(.fromSeconds(@intCast(attempt + 1)), .awake);
+                if (cancel.requested()) return error.Cancelled;
                 continue;
             }
             return err;
@@ -1408,18 +1647,31 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
             spin.start(session.io, "retrying");
             defer spin.stop();
             try session.io.sleep(.fromSeconds(@intCast(delay)), .awake);
+            if (cancel.requested()) return error.Cancelled;
             continue;
         }
-        try output.print("provider HTTP {d}: ", .{response.status});
-        var safe: term.SafeWriter = .{ .output = output };
-        if (providerErrorMessage(session.gpa, response.body)) |message| {
+        // Interactive sessions read the diagnostic in the transcript and
+        // return to the prompt. One-shots propagate the error and main
+        // prints the remembered line to stderr, keeping piped stdout clean.
+        if (session.interactive) {
+            try output.print("provider HTTP {d}: ", .{response.status});
+            var safe: term.SafeWriter = .{ .output = output };
+            if (providerErrorMessage(session.gpa, response.body)) |message| {
+                defer session.gpa.free(message);
+                try safe.write(message);
+                rememberProviderError(response.status, message);
+            } else {
+                try safe.write(response.body);
+                rememberProviderError(response.status, response.body);
+            }
+            try output.writeByte('\n');
+            try output.flush();
+        } else if (providerErrorMessage(session.gpa, response.body)) |message| {
             defer session.gpa.free(message);
-            try safe.write(message);
+            rememberProviderError(response.status, message);
         } else {
-            try safe.write(response.body);
+            rememberProviderError(response.status, response.body);
         }
-        try output.writeByte('\n');
-        try output.flush();
         return error.ProviderRequestFailed;
     }
     return error.ProviderRequestFailed;
@@ -1449,7 +1701,7 @@ fn retryableStatus(status: u16) bool {
     return status == 408 or status == 409 or status == 425 or status == 429 or status == 500 or status == 502 or status == 503 or status == 504;
 }
 
-fn requestStream(gpa: std.mem.Allocator, io: Io, provider: auth.Provider, credential: auth.Credential, body: []const u8, decoder: *Decoder) !transport.Response {
+fn requestStream(gpa: std.mem.Allocator, io: Io, provider: auth.Provider, credential: auth.Credential, body: []const u8, decoder: *Decoder, fast: bool) !transport.Response {
     const authorization = try std.fmt.allocPrint(gpa, "Bearer {s}", .{credential.access});
     defer gpa.free(authorization);
     return switch (provider) {
@@ -1464,7 +1716,7 @@ fn requestStream(gpa: std.mem.Allocator, io: Io, provider: auth.Provider, creden
         .claude => transport.postStream(gpa, io, "https://api.anthropic.com/v1/messages", "application/json", &.{
             .{ .name = "Authorization", .value = authorization },
             .{ .name = "anthropic-version", .value = "2023-06-01" },
-            .{ .name = "anthropic-beta", .value = "claude-code-20250219,oauth-2025-04-20" },
+            .{ .name = "anthropic-beta", .value = claudeBetaHeader(fast) },
             .{ .name = "anthropic-dangerous-direct-browser-access", .value = "true" },
             .{ .name = "User-Agent", .value = "claude-cli/2.1.75" },
             .{ .name = "x-app", .value = "cli" },
@@ -1477,171 +1729,73 @@ fn requestStream(gpa: std.mem.Allocator, io: Io, provider: auth.Provider, creden
     };
 }
 
+fn claudeBetaHeader(fast: bool) []const u8 {
+    return if (fast)
+        "claude-code-20250219,oauth-2025-04-20,fast-mode-2026-02-01"
+    else
+        "claude-code-20250219,oauth-2025-04-20";
+}
+
 fn decodeLine(context_ptr: ?*anyopaque, line: []const u8) !void {
     const decoder: *Decoder = @ptrCast(@alignCast(context_ptr.?));
     try decoder.feed(line);
 }
 
-const StreamingClaudeCall = struct {
-    index: i64,
-    id: []const u8,
-    name: []const u8,
-    args: Io.Writer.Allocating,
-};
-
 const Decoder = struct {
-    provider: auth.Provider,
-    parse_gpa: std.mem.Allocator,
-    persist: std.mem.Allocator,
-    safe: term.SafeWriter,
-    text: Io.Writer.Allocating,
-    calls: std.ArrayList(ToolCall) = .empty,
-    raw: std.ArrayList([]const u8) = .empty,
-    claude_calls: std.ArrayList(StreamingClaudeCall) = .empty,
-    usage: Usage = .{},
-    received: bool = false,
-    /// Main rounds stop the shared spinner before the first visible
-    /// output; compact rounds stream into a sink and leave it running.
+    core: stream_decoder.Decoder,
+    rendered: markdown.Writer,
     stop_spinner: bool = true,
-
-    fn beforeOutput(self: *Decoder) void {
-        if (self.stop_spinner) spin.stop();
-    }
+    received: bool = false,
 
     fn init(provider: auth.Provider, parse_gpa: std.mem.Allocator, persist: std.mem.Allocator, output: *Io.Writer) Decoder {
         return .{
-            .provider = provider,
-            .parse_gpa = parse_gpa,
-            .persist = persist,
-            .safe = .{ .output = output },
-            .text = .init(persist),
+            .core = stream_decoder.Decoder.init(provider, parse_gpa, persist, .{}),
+            .rendered = markdown.Writer.init(output),
         };
     }
 
-    fn feed(self: *Decoder, raw_line: []const u8) !void {
-        const line = std.mem.trim(u8, raw_line, " \r");
-        if (!std.mem.startsWith(u8, line, "data:")) return;
-        const data = std.mem.trimStart(u8, line[5..], " ");
-        if (std.mem.eql(u8, data, "[DONE]") or data.len == 0) return;
-        var parsed = std.json.parseFromSlice(std.json.Value, self.parse_gpa, data, .{}) catch return;
-        defer parsed.deinit();
+    fn bind(self: *Decoder) void {
+        self.core.hooks = .{
+            .context = self,
+            .on_output = onOutput,
+            .on_delta = onDelta,
+        };
+    }
+
+    fn onOutput(raw: ?*anyopaque) !void {
+        const self: *Decoder = @ptrCast(@alignCast(raw.?));
         self.received = true;
-        if (self.provider == .claude) {
-            try self.feedClaude(parsed.value, data);
-        } else {
-            try self.feedResponses(parsed.value, data);
-        }
+        if (self.stop_spinner) spin.stop();
     }
 
-    fn feedResponses(self: *Decoder, value: std.json.Value, data: []const u8) !void {
-        const kind = eventString(value, "type") orelse return;
-        if (std.mem.eql(u8, kind, "response.output_text.delta")) {
-            const delta = eventString(value, "delta") orelse return;
-            self.beforeOutput();
-            try self.text.writer.writeAll(delta);
-            try self.safe.write(delta);
-            try self.safe.output.flush();
-        } else if (std.mem.eql(u8, kind, "response.output_item.done")) {
-            const item = switch (value) {
-                .object => |object| object.get("item") orelse return,
-                else => return,
-            };
-            var item_out: Io.Writer.Allocating = .init(self.persist);
-            try std.json.Stringify.value(item, .{}, &item_out.writer);
-            try self.raw.append(self.persist, try item_out.toOwnedSlice());
-            if (eventString(item, "type")) |item_type| if (std.mem.eql(u8, item_type, "function_call")) {
-                try self.calls.append(self.persist, .{
-                    .id = try self.persist.dupe(u8, eventString(item, "call_id") orelse return error.InvalidProviderResponse),
-                    .name = try self.persist.dupe(u8, eventString(item, "name") orelse return error.InvalidProviderResponse),
-                    .arguments = try self.persist.dupe(u8, eventString(item, "arguments") orelse "{}"),
-                });
-            };
-        } else if (std.mem.eql(u8, kind, "response.completed")) {
-            const usage_value = eventObject(eventObject(value, "response") orelse return, "usage") orelse return;
-            if (eventInteger(usage_value, "input_tokens")) |number| self.usage.input = number;
-            if (eventInteger(usage_value, "output_tokens")) |number| self.usage.output = number;
-            if (eventObject(usage_value, "input_tokens_details")) |details| {
-                if (eventInteger(details, "cached_tokens")) |number| self.usage.cached = number;
-            }
-        } else if (std.mem.eql(u8, kind, "response.failed") or std.mem.eql(u8, kind, "error")) {
-            _ = data;
-            return error.ProviderRequestFailed;
-        }
+    fn onDelta(raw: ?*anyopaque, delta: []const u8) !void {
+        const self: *Decoder = @ptrCast(@alignCast(raw.?));
+        try self.rendered.write(delta);
+        try self.rendered.output.flush();
     }
 
-    fn feedClaude(self: *Decoder, value: std.json.Value, data: []const u8) !void {
-        const kind = eventString(value, "type") orelse return;
-        if (std.mem.eql(u8, kind, "content_block_start")) {
-            const index = switch (value.object.get("index") orelse return) {
-                .integer => |number| number,
-                else => return,
-            };
-            const block = value.object.get("content_block") orelse return;
-            if (eventString(block, "type")) |block_type| if (std.mem.eql(u8, block_type, "tool_use")) {
-                try self.claude_calls.append(self.persist, .{
-                    .index = index,
-                    .id = try self.persist.dupe(u8, eventString(block, "id") orelse return error.InvalidProviderResponse),
-                    .name = try self.persist.dupe(u8, eventString(block, "name") orelse return error.InvalidProviderResponse),
-                    .args = .init(self.persist),
-                });
-            };
-        } else if (std.mem.eql(u8, kind, "content_block_delta")) {
-            const delta = value.object.get("delta") orelse return;
-            const delta_type = eventString(delta, "type") orelse return;
-            if (std.mem.eql(u8, delta_type, "text_delta")) {
-                const part = eventString(delta, "text") orelse return;
-                self.beforeOutput();
-                try self.text.writer.writeAll(part);
-                try self.safe.write(part);
-                try self.safe.output.flush();
-            } else if (std.mem.eql(u8, delta_type, "input_json_delta")) {
-                const index = switch (value.object.get("index") orelse return) {
-                    .integer => |number| number,
-                    else => return,
-                };
-                const part = eventString(delta, "partial_json") orelse return;
-                for (self.claude_calls.items) |*call| if (call.index == index) {
-                    try call.args.writer.writeAll(part);
-                    break;
-                };
-            }
-        } else if (std.mem.eql(u8, kind, "message_start")) {
-            const usage_value = eventObject(eventObject(value, "message") orelse return, "usage") orelse return;
-            if (eventInteger(usage_value, "input_tokens")) |number| self.usage.input = number;
-            if (eventInteger(usage_value, "cache_read_input_tokens")) |number| self.usage.cached = number;
-        } else if (std.mem.eql(u8, kind, "message_delta")) {
-            const usage_value = eventObject(value, "usage") orelse return;
-            if (eventInteger(usage_value, "input_tokens")) |number| self.usage.input = number;
-            if (eventInteger(usage_value, "output_tokens")) |number| self.usage.output = number;
-        } else if (std.mem.eql(u8, kind, "error")) {
-            _ = data;
-            return error.ProviderRequestFailed;
-        }
+    fn feed(self: *Decoder, line: []const u8) !void {
+        self.bind();
+        try self.core.feed(line);
+        self.received = self.core.received;
+    }
+
+    fn finishRendering(self: *Decoder) !void {
+        try self.rendered.finish();
     }
 
     fn finish(self: *Decoder) !Assistant {
-        if (self.provider == .claude) {
-            for (self.claude_calls.items) |*call| try self.calls.append(self.persist, .{
-                .id = call.id,
-                .name = call.name,
-                .arguments = if (call.args.written().len == 0)
-                    try self.persist.dupe(u8, "{}")
-                else
-                    try self.persist.dupe(u8, call.args.written()),
-            });
-        }
-        return .{
-            .text = try self.text.toOwnedSlice(),
-            .calls = try self.calls.toOwnedSlice(self.persist),
-            .raw_items = try self.raw.toOwnedSlice(self.persist),
-            .usage = self.usage,
-        };
+        self.bind();
+        try self.finishRendering();
+        return self.core.finish();
     }
 };
-
 test "slash command lookup matches names, aliases, and unique prefixes" {
     try std.testing.expectEqual(Command.help, (try findCommand("help")).?);
     try std.testing.expectEqual(Command.model, (try findCommand("mod")).?);
+    try std.testing.expectEqual(Command.fast, (try findCommand("fast")).?);
+    try std.testing.expectEqual(Command.firecrawl, (try findCommand("fire")).?);
+    try std.testing.expectEqual(Command.agents, (try findCommand("ag")).?);
     try std.testing.expectError(error.Ambiguous, findCommand("s"));
     try std.testing.expectEqual(Command.status, (try findCommand("stat")).?);
     try std.testing.expectEqual(Command.settings, (try findCommand("config")).?);
@@ -1692,16 +1846,46 @@ test "provider defaults" {
 }
 
 test "compact requests omit coding tools and use the selected model" {
-    const body = try buildCompactRequest(std.testing.allocator, .claude, "claude-opus-5", .low, &.{.{ .user = "keep this decision" }});
+    const body = try buildCompactRequest(std.testing.allocator, .claude, "claude-opus-5", .low, false, &.{.{ .user = "keep this decision" }});
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "claude-opus-5") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, compact_prompt) != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"effort\":\"low\"") != null);
 
-    const chatgpt = try buildCompactRequest(std.testing.allocator, .chatgpt, "gpt-5.6-sol", .low, &.{.{ .user = "keep this decision" }});
+    const chatgpt = try buildCompactRequest(std.testing.allocator, .chatgpt, "gpt-5.6-sol", .low, false, &.{.{ .user = "keep this decision" }});
     defer std.testing.allocator.free(chatgpt);
     try std.testing.expect(std.mem.indexOf(u8, chatgpt, "max_output_tokens") == null);
+}
+
+test "fast mode uses each provider's request contract" {
+    const openai = try buildRequest(std.testing.allocator, .chatgpt, "gpt-5.6-sol", null, true, .{}, "/work", "", &.{});
+    defer std.testing.allocator.free(openai);
+    try std.testing.expect(std.mem.indexOf(u8, openai, "\"service_tier\":\"fast\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, openai, "\"speed\"") == null);
+
+    const anthropic = try buildRequest(std.testing.allocator, .claude, "claude-opus-5", null, true, .{}, "/work", "", &.{});
+    defer std.testing.allocator.free(anthropic);
+    try std.testing.expect(std.mem.indexOf(u8, anthropic, "\"speed\":\"fast\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, anthropic, "\"service_tier\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, claudeBetaHeader(true), "fast-mode-2026-02-01") != null);
+    try std.testing.expect(std.mem.indexOf(u8, claudeBetaHeader(false), "fast-mode-2026-02-01") == null);
+
+    const standard = try buildRequest(std.testing.allocator, .chatgpt, "gpt-5.6-sol", null, false, .{}, "/work", "", &.{});
+    defer std.testing.allocator.free(standard);
+    try std.testing.expect(std.mem.indexOf(u8, standard, "\"service_tier\"") == null);
+}
+
+test "web tools are included only after Firecrawl setup" {
+    const disabled = try buildRequest(std.testing.allocator, .chatgpt, "gpt-5.6-sol", null, false, .{}, "/work", "", &.{});
+    defer std.testing.allocator.free(disabled);
+    try std.testing.expect(std.mem.indexOf(u8, disabled, "web_fetch") == null);
+    try std.testing.expect(std.mem.indexOf(u8, disabled, "web_search") == null);
+
+    const enabled = try buildRequest(std.testing.allocator, .chatgpt, "gpt-5.6-sol", null, false, .{ .web_enabled = true }, "/work", "", &.{});
+    defer std.testing.allocator.free(enabled);
+    try std.testing.expect(std.mem.indexOf(u8, enabled, "web_fetch") != null);
+    try std.testing.expect(std.mem.indexOf(u8, enabled, "web_search") != null);
 }
 
 test "decode Responses SSE" {

@@ -19,15 +19,58 @@ pub const Thread = struct {
         var out: Io.Writer.Allocating = .init(self.gpa);
         defer out.deinit();
         var js: std.json.Stringify = .{ .writer = &out.writer };
+        try writeEntryLine(&js, &out.writer, entry);
+        try append(self.io, self.path, out.written());
+    }
+
+    /// Replace the whole file atomically with a fresh meta line plus the
+    /// given entries. Used for compaction snapshots: append-reset-then-
+    /// re-append was neither atomic nor bounded, so a mid-write failure
+    /// truncated replayable history and long sessions grew the file
+    /// without limit.
+    pub fn rewrite(self: *Thread, provider: auth.Provider, model: []const u8, effort: ?[]const u8, fast: bool, cwd: []const u8, entries: []const types.Entry) !void {
+        var out: Io.Writer.Allocating = .init(self.gpa);
+        defer out.deinit();
+        var js: std.json.Stringify = .{ .writer = &out.writer };
+        try js.beginObject();
+        try field(&js, "type", "meta");
+        try field(&js, "id", self.id);
+        try field(&js, "provider", @tagName(provider));
+        try field(&js, "model", model);
+        if (effort) |value| try field(&js, "effort", value);
+        try js.objectField("fast");
+        try js.write(fast);
+        try field(&js, "cwd", cwd);
+        try js.endObject();
+        try out.writer.writeByte('\n');
+        for (entries) |entry| {
+            js = .{ .writer = &out.writer };
+            try writeEntryLine(&js, &out.writer, entry);
+        }
+        var random: [8]u8 = undefined;
+        try self.io.randomSecure(&random);
+        const hex = std.fmt.bytesToHex(random, .lower);
+        const temporary = try std.fmt.allocPrint(self.gpa, "{s}.tmp-{s}", .{ self.path, &hex });
+        defer self.gpa.free(temporary);
+        errdefer Io.Dir.cwd().deleteFile(self.io, temporary) catch {};
+        try Io.Dir.cwd().writeFile(self.io, .{
+            .sub_path = temporary,
+            .data = out.written(),
+            .flags = .{ .exclusive = true, .permissions = @enumFromInt(0o600) },
+        });
+        try Io.Dir.cwd().rename(temporary, Io.Dir.cwd(), self.path, self.io);
+    }
+
+    fn writeEntryLine(js: *std.json.Stringify, writer: *Io.Writer, entry: types.Entry) !void {
         try js.beginObject();
         switch (entry) {
             .user => |text| {
-                try field(&js, "type", "user");
-                try field(&js, "text", text);
+                try field(js, "type", "user");
+                try field(js, "text", text);
             },
             .assistant => |answer| {
-                try field(&js, "type", "assistant");
-                try field(&js, "text", answer.text);
+                try field(js, "type", "assistant");
+                try field(js, "text", answer.text);
                 try js.objectField("calls");
                 try js.write(answer.calls);
                 try js.objectField("raw_items");
@@ -36,14 +79,13 @@ pub const Thread = struct {
                 try js.write(answer.usage);
             },
             .results => |results| {
-                try field(&js, "type", "results");
+                try field(js, "type", "results");
                 try js.objectField("results");
                 try js.write(results);
             },
         }
         try js.endObject();
-        try out.writer.writeByte('\n');
-        try append(self.io, self.path, out.written());
+        try writer.writeByte('\n');
     }
 
     pub fn appendReset(self: *Thread) !void {
@@ -56,6 +98,19 @@ pub const Thread = struct {
 
     pub fn appendEffort(self: *Thread, effort: []const u8) !void {
         try self.appendSetting("effort", "effort", effort);
+    }
+
+    pub fn appendFast(self: *Thread, enabled: bool) !void {
+        var out: Io.Writer.Allocating = .init(self.gpa);
+        defer out.deinit();
+        var js: std.json.Stringify = .{ .writer = &out.writer };
+        try js.beginObject();
+        try field(&js, "type", "fast");
+        try js.objectField("fast");
+        try js.write(enabled);
+        try js.endObject();
+        try out.writer.writeByte('\n');
+        try append(self.io, self.path, out.written());
     }
 
     fn appendSetting(self: *Thread, kind: []const u8, name: []const u8, value: []const u8) !void {
@@ -76,6 +131,7 @@ pub const Loaded = struct {
     provider: auth.Provider,
     model: []const u8,
     effort: ?[]const u8,
+    fast: bool,
     entries: std.ArrayList(types.Entry),
 };
 
@@ -138,7 +194,9 @@ fn listDir(gpa: std.mem.Allocator, io: Io, dir_path: []const u8, exclude_id: ?[]
     return summaries.toOwnedSlice(gpa);
 }
 
-const preview_scan_bytes = 8 * 1024;
+// Large enough that a long first prompt (bounded by the 4 MiB stdin cap
+// but typically far smaller) still yields a parseable preview line.
+const preview_scan_bytes = 64 * 1024;
 const preview_max_bytes = 48;
 
 fn firstUserPreview(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, id: []const u8) ![]u8 {
@@ -182,7 +240,7 @@ fn newestFirst(_: void, a: Summary, b: Summary) bool {
 /// Threads kept per directory; older ones are pruned on create.
 pub const retained_threads = 50;
 
-pub fn create(gpa: std.mem.Allocator, io: Io, home: []const u8, cwd: []const u8, provider: auth.Provider, model: []const u8, effort: ?[]const u8) !Thread {
+pub fn create(gpa: std.mem.Allocator, io: Io, home: []const u8, cwd: []const u8, provider: auth.Provider, model: []const u8, effort: ?[]const u8, fast: bool) !Thread {
     const dir_path = try threadDir(gpa, home, cwd);
     defer gpa.free(dir_path);
     try Io.Dir.cwd().createDirPath(io, dir_path);
@@ -206,6 +264,8 @@ pub fn create(gpa: std.mem.Allocator, io: Io, home: []const u8, cwd: []const u8,
     try field(&js, "provider", @tagName(provider));
     try field(&js, "model", model);
     if (effort) |value| try field(&js, "effort", value);
+    try js.objectField("fast");
+    try js.write(fast);
     try field(&js, "cwd", cwd);
     try js.endObject();
     try out.writer.writeByte('\n');
@@ -236,6 +296,7 @@ pub fn load(gpa: std.mem.Allocator, entry_gpa: std.mem.Allocator, io: Io, home: 
     var provider: ?auth.Provider = null;
     var model: ?[]const u8 = null;
     var effort: ?[]const u8 = null;
+    var fast = false;
     var entries: std.ArrayList(types.Entry) = .empty;
     errdefer entries.deinit(entry_gpa);
     var last_reset_offset: usize = 0;
@@ -258,10 +319,13 @@ pub fn load(gpa: std.mem.Allocator, entry_gpa: std.mem.Allocator, io: Io, home: 
             provider = auth.Provider.parse(objectString(parsed.value, "provider") orelse continue);
             model = try entry_gpa.dupe(u8, objectString(parsed.value, "model") orelse continue);
             if (objectString(parsed.value, "effort")) |value| effort = try entry_gpa.dupe(u8, value);
+            fast = objectBool(parsed.value, "fast") orelse false;
         } else if (std.mem.eql(u8, kind, "model")) {
             model = try entry_gpa.dupe(u8, objectString(parsed.value, "model") orelse continue);
         } else if (std.mem.eql(u8, kind, "effort")) {
             effort = try entry_gpa.dupe(u8, objectString(parsed.value, "effort") orelse continue);
+        } else if (std.mem.eql(u8, kind, "fast")) {
+            fast = objectBool(parsed.value, "fast") orelse continue;
         } else if (std.mem.eql(u8, kind, "reset")) {
             entries.clearRetainingCapacity();
         } else if (std.mem.eql(u8, kind, "user")) {
@@ -280,6 +344,7 @@ pub fn load(gpa: std.mem.Allocator, entry_gpa: std.mem.Allocator, io: Io, home: 
         .provider = provider orelse return error.InvalidThread,
         .model = model orelse return error.InvalidThread,
         .effort = effort,
+        .fast = fast,
         .entries = entries,
     };
 }
@@ -368,7 +433,13 @@ fn pruneDir(gpa: std.mem.Allocator, io: Io, dir_path: []const u8, keep: usize) !
     }
     if (summaries.items.len <= keep) return;
     std.mem.sort(Summary, summaries.items, {}, newestFirst);
+    const now_ns: i96 = Io.Clock.real.now(io).nanoseconds;
+    const one_day_ns: i96 = 24 * 60 * 60 * std.time.ns_per_s;
     for (summaries.items[keep..]) |summary| {
+        // Never delete a recently-touched thread: it may belong to a
+        // live session in another process, and recreating it later
+        // would lose its meta line.
+        if (now_ns - summary.modified < one_day_ns) continue;
         var name_buffer: [64]u8 = undefined;
         const name = std.fmt.bufPrint(&name_buffer, "{s}.jsonl", .{summary.id}) catch continue;
         dir.deleteFile(io, name) catch {};
@@ -395,11 +466,12 @@ fn threadDir(gpa: std.mem.Allocator, home: []const u8, cwd: []const u8) ![]u8 {
 }
 
 fn append(io: Io, path: []const u8, bytes: []const u8) !void {
-    var file = try Io.Dir.cwd().createFile(io, path, .{
-        .truncate = false,
-        .lock = .exclusive,
-        .permissions = @enumFromInt(0o600),
-    });
+    // Open, never create: silently recreating a pruned or deleted thread
+    // file would produce a meta-less JSONL that later fails to load.
+    var file = Io.Dir.cwd().openFile(io, path, .{ .mode = .write_only, .lock = .exclusive }) catch |err| switch (err) {
+        error.FileNotFound => return error.ThreadMissing,
+        else => return err,
+    };
     defer file.close(io);
     const stat = try file.stat(io);
     var buffer: [4096]u8 = undefined;
@@ -424,6 +496,13 @@ fn objectValue(value: std.json.Value, key: []const u8) ?std.json.Value {
 fn objectString(value: std.json.Value, key: []const u8) ?[]const u8 {
     return if (objectValue(value, key)) |item| switch (item) {
         .string => |text| text,
+        else => null,
+    } else null;
+}
+
+fn objectBool(value: std.json.Value, key: []const u8) ?bool {
+    return if (objectValue(value, key)) |item| switch (item) {
+        .bool => |enabled| enabled,
         else => null,
     } else null;
 }
@@ -455,12 +534,20 @@ test "thread JSONL resumes state after the last reset" {
     defer temporary.cleanup();
     const home = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path});
     defer std.testing.allocator.free(home);
-    var thread = try create(std.testing.allocator, std.testing.io, home, "/work/project", .chatgpt, "model-a", "high");
+    var thread = try create(std.testing.allocator, std.testing.io, home, "/work/project", .chatgpt, "model-a", "high", true);
     const id = try std.testing.allocator.dupe(u8, thread.id);
     defer std.testing.allocator.free(id);
+    {
+        var initial_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer initial_arena.deinit();
+        var initial = try load(std.testing.allocator, initial_arena.allocator(), std.testing.io, home, "/work/project", id, null);
+        defer initial.thread.deinit();
+        try std.testing.expect(initial.fast);
+    }
     try thread.appendEntry(.{ .user = "old" });
     try thread.appendReset();
     try thread.appendEntry(.{ .user = "new" });
+    try thread.appendFast(false);
     const summaries = try list(std.testing.allocator, std.testing.io, home, "/work/project", null, 8);
     defer freeSummaries(std.testing.allocator, summaries);
     try std.testing.expectEqual(@as(usize, 1), summaries.len);
@@ -478,6 +565,7 @@ test "thread JSONL resumes state after the last reset" {
     try std.testing.expectEqual(auth.Provider.chatgpt, loaded.provider);
     try std.testing.expectEqualStrings("model-a", loaded.model);
     try std.testing.expectEqualStrings("high", loaded.effort.?);
+    try std.testing.expect(!loaded.fast);
     try std.testing.expectEqual(@as(usize, 1), loaded.entries.items.len);
     try std.testing.expectEqualStrings("new", loaded.entries.items[0].user);
 }

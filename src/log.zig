@@ -36,7 +36,9 @@ pub fn init(gpa: std.mem.Allocator, io: Io, home: []const u8, env_value: ?[]cons
     const path = (choosePath(gpa, home, env_value) catch return) orelse return;
     defer gpa.free(path);
     open(gpa, io, path) catch return;
-    path_len = @min(path.len, path_buffer.len);
+    // An over-long path cannot be reported truthfully by activePath();
+    // store nothing rather than lying about where the log lives.
+    path_len = if (path.len <= path_buffer.len) path.len else 0;
     @memcpy(path_buffer[0..path_len], path[0..path_len]);
     if (env_scopes) |scopes| {
         const trimmed = std.mem.trim(u8, scopes, " \t\r\n");
@@ -66,7 +68,20 @@ pub fn activePath() ?[]const u8 {
 /// provider round), not per line.
 pub fn flush() void {
     if (!active) return;
-    writer.interface.flush() catch disable();
+    writer.interface.flush() catch return disable();
+    // The startup-time size cap also applies to long-running sessions:
+    // rotate in place once the file outgrows it.
+    if (writer.pos < max_log_bytes) return;
+    if (path_len == 0) return disable();
+    const path = path_buffer[0..path_len];
+    file.close(log_io);
+    active = false;
+    var old_buffer: [path_buffer.len + 4]u8 = undefined;
+    const old = std.fmt.bufPrint(&old_buffer, "{s}.old", .{path}) catch return;
+    Io.Dir.cwd().rename(path, Io.Dir.cwd(), old, log_io) catch return;
+    file = Io.Dir.cwd().createFile(log_io, path, .{ .truncate = true, .permissions = @enumFromInt(0o600) }) catch return;
+    writer = .init(file, log_io, &write_buffer);
+    active = true;
 }
 
 pub fn shutdown() void {
@@ -103,7 +118,8 @@ fn choosePath(gpa: std.mem.Allocator, home: []const u8, env_value: ?[]const u8) 
     return try gpa.dupe(u8, raw);
 }
 
-fn isTruthy(value: []const u8) bool {
+/// Shared by other environment toggles such as XAQ_PLAIN.
+pub fn isTruthy(value: []const u8) bool {
     return std.ascii.eqlIgnoreCase(value, "1") or std.ascii.eqlIgnoreCase(value, "true") or
         std.ascii.eqlIgnoreCase(value, "yes") or std.ascii.eqlIgnoreCase(value, "on");
 }
