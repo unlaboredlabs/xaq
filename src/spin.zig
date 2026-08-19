@@ -10,6 +10,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const term = @import("term.zig");
+const tui = @import("tui.zig");
 
 const frames = [_][]const u8{ "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" };
 const frame_interval_ms = 80;
@@ -23,6 +24,12 @@ var label: []const u8 = "";
 /// outlive the spinner (pass a literal). No-op when styling is disabled
 /// or a spinner is already running.
 pub fn start(io: Io, text: []const u8) void {
+    // Fullscreen shows the label statically in the info bar; a raw
+    // concurrent writer would interleave with the chrome.
+    if (tui.active) {
+        tui.setActivity(text);
+        return;
+    }
     if (!term.enabled) return;
     if (future != null) return;
     label = text;
@@ -33,6 +40,10 @@ pub fn start(io: Io, text: []const u8) void {
 /// Stop and erase the spinner line. Cancels and awaits the task, so no
 /// frame can land after this returns. Safe to call when nothing runs.
 pub fn stop() void {
+    if (tui.active) {
+        tui.setActivity(null);
+        return;
+    }
     var running = future orelse return;
     future = null;
     running.cancel(io_handle);

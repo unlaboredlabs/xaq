@@ -923,7 +923,14 @@ fn syncTui(session: *Session) void {
     if (!tui.active) return;
     const window = models.contextWindow(session.provider, session.model);
     const percent: u8 = @intCast(@min(estimatedContextTokens(session) * 100 / @max(window, 1), 100));
-    tui.noteIdentity(@tagName(session.provider), session.model, if (session.thread) |thread| thread.id else null);
+    tui.noteIdentity(
+        @tagName(session.provider),
+        session.model,
+        if (session.effort) |effort| @tagName(effort) else null,
+        false,
+        if (session.thread) |thread| thread.id else null,
+        null,
+    );
     tui.noteUsage(session.usage.input, session.usage.output, percent);
 }
 
