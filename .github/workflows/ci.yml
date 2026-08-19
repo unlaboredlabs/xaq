@@ -11,6 +11,7 @@ permissions:
 jobs:
   check:
     strategy:
+      fail-fast: false
       matrix:
         os: [blacksmith-2vcpu-ubuntu-2404, blacksmith-6vcpu-macos-latest]
     runs-on: ${{ matrix.os }}
@@ -22,39 +23,62 @@ jobs:
       - run: zig fmt --check build.zig src tools
       - run: zig build test
       - run: zig build -Doptimize=ReleaseSmall
+      - name: Shell checks
+        if: runner.os == 'Linux'
+        run: |
+          shellcheck install.sh tools/*.sh tests/*.sh
+          tests/edge_release_test.sh
+          tests/install_test.sh
+          tests/publish_edge_test.sh
       - name: Size and startup budget
         if: runner.os == 'Linux'
         run: zig build perf
-      - name: Package edge build
-        if: github.event_name == 'push'
-        shell: bash
-        run: |
-          case "${RUNNER_OS}/${RUNNER_ARCH}" in
-            Linux/X64) platform=linux-x86_64 ;;
-            Linux/ARM64) platform=linux-aarch64 ;;
-            macOS/X64) platform=macos-x86_64 ;;
-            macOS/ARM64) platform=macos-aarch64 ;;
-            *) echo "unsupported runner: ${RUNNER_OS}/${RUNNER_ARCH}" >&2; exit 1 ;;
-          esac
-          package="xaq-${platform}"
-          package_dir="${RUNNER_TEMP}/${package}"
-          mkdir -p dist "${package_dir}"
-          cp zig-out/bin/xaq "dist/${package}"
-          cp zig-out/bin/xaq README.md LICENSE "${package_dir}/"
-          tar -czf "dist/${package}.tar.gz" -C "${RUNNER_TEMP}" "${package}"
-      - name: Upload edge build
-        if: github.event_name == 'push'
+
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            target: x86_64-linux
+            os: blacksmith-2vcpu-ubuntu-2404
+          - platform: linux-aarch64
+            target: aarch64-linux
+            os: blacksmith-2vcpu-ubuntu-2404
+          - platform: macos-x86_64
+            target: x86_64-macos
+            os: blacksmith-6vcpu-macos-latest
+          - platform: macos-aarch64
+            target: aarch64-macos
+            os: blacksmith-6vcpu-macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - name: Build edge package
+        run: tools/package-edge.sh "${{ matrix.platform }}" "${{ matrix.target }}" "${GITHUB_SHA}"
+      - name: Upload edge binary
         uses: actions/upload-artifact@v7
         with:
-          name: xaq-${{ runner.os }}-${{ runner.arch }}
-          path: dist/xaq-*
+          name: edge-${{ matrix.platform }}-binary
+          path: dist/xaq-${{ matrix.platform }}-${{ github.sha }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 1
+      - name: Upload edge archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: edge-${{ matrix.platform }}-archive
+          path: dist/xaq-${{ matrix.platform }}-${{ github.sha }}.tar.gz
           archive: false
           if-no-files-found: error
           retention-days: 1
 
   edge:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: check
+    needs: [check, package]
     runs-on: blacksmith-2vcpu-ubuntu-2404
     concurrency:
       group: edge
@@ -62,34 +86,18 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: Download edge builds
         uses: actions/download-artifact@v8
         with:
-          pattern: xaq-*
+          pattern: edge-*
           path: dist
           merge-multiple: true
+      - name: Prepare edge manifest
+        run: tools/prepare-edge.sh dist "${GITHUB_SHA}"
       - name: Publish edge release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          cd dist
-          sha256sum xaq-* > SHA256SUMS
-          cd ..
-
-          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/edge" >/dev/null 2>&1; then
-            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/edge" \
-              -f sha="${GITHUB_SHA}" -F force=true >/dev/null
-          else
-            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-              -f ref=refs/tags/edge -f sha="${GITHUB_SHA}" >/dev/null
-          fi
-
-          notes="Rolling build from main at ${GITHUB_SHA}. This prerelease is replaced after every successful main build."
-          if gh release view edge --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release edit edge --repo "${GITHUB_REPOSITORY}" \
-              --title "xaq edge" --prerelease --notes "${notes}"
-          else
-            gh release create edge --repo "${GITHUB_REPOSITORY}" \
-              --title "xaq edge" --prerelease --notes "${notes}"
-          fi
-          gh release upload edge dist/* --repo "${GITHUB_REPOSITORY}" --clobber
+        run: tools/publish-edge.sh dist "${GITHUB_REPOSITORY}" "${GITHUB_SHA}"
