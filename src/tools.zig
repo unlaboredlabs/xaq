@@ -300,7 +300,15 @@ fn firecrawlFailure(gpa: std.mem.Allocator, tool_name: []const u8, status: u16, 
         std.fmt.allocPrint(gpa, "{s} failed: Firecrawl HTTP {d}", .{ tool_name, status });
 }
 
-fn boundedDocument(gpa: std.mem.Allocator, title: ?[]const u8, url: []const u8, markdown_text: []const u8) ![]u8 {
+fn boundedDocument(gpa: std.mem.Allocator, title: ?[]const u8, url: []const u8, markdown_text: []const u8, warning: ?[]const u8) ![]u8 {
+    var warning_text: Io.Writer.Allocating = .init(gpa);
+    defer warning_text.deinit();
+    if (warning) |message| if (message.len > 0) {
+        try warning_text.writer.writeAll("[Firecrawl warning: ");
+        try writeSingleLine(&warning_text.writer, message, 4096);
+        try warning_text.writer.writeByte(']');
+    };
+
     var out: Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     if (title) |value| {
@@ -312,7 +320,9 @@ fn boundedDocument(gpa: std.mem.Allocator, title: ?[]const u8, url: []const u8, 
     try writeSingleLine(&out.writer, url, 8192);
     try out.writer.writeAll("\n\n");
     const suffix = "\n\n[content truncated]";
-    const available = output_payload -| out.written().len;
+    const warning_separator = if (warning_text.written().len == 0 or markdown_text.len == 0) "" else "\n\n";
+    const document_budget = output_payload -| warning_separator.len -| warning_text.written().len;
+    const available = document_budget -| out.written().len;
     if (markdown_text.len <= available) {
         try out.writer.writeAll(markdown_text);
     } else {
@@ -320,6 +330,8 @@ fn boundedDocument(gpa: std.mem.Allocator, title: ?[]const u8, url: []const u8, 
         try out.writer.writeAll(boundedUtf8(markdown_text, keep));
         try out.writer.writeAll(suffix);
     }
+    try out.writer.writeAll(warning_separator);
+    try out.writer.writeAll(warning_text.written());
     return out.toOwnedSlice();
 }
 
@@ -330,14 +342,12 @@ fn formatFetchedDocument(gpa: std.mem.Allocator, requested_url: []const u8, body
     if (objectBool(parsed.value, "success") != true) return firecrawlFailure(gpa, "web_fetch", 200, body);
     const data = objectField(parsed.value, "data") orelse return gpa.dupe(u8, "web_fetch failed: Firecrawl response did not contain page data");
     const metadata = objectField(data, "metadata");
-    const markdown_text = objectString(data, "markdown") orelse {
-        if (metadata) |value| if (objectString(value, "error")) |message|
-            return std.fmt.allocPrint(gpa, "web_fetch failed: {s}", .{boundedUtf8(message, 4096)});
-        return gpa.dupe(u8, "web_fetch failed: Firecrawl response did not contain Markdown");
-    };
+    if (metadata) |value| if (objectString(value, "error")) |message| if (message.len > 0)
+        return std.fmt.allocPrint(gpa, "web_fetch failed: {s}", .{boundedUtf8(message, 4096)});
+    const markdown_text = objectString(data, "markdown") orelse return gpa.dupe(u8, "web_fetch failed: Firecrawl response did not contain Markdown");
     const title = if (metadata) |value| objectString(value, "title") else null;
     const source_url = if (metadata) |value| objectString(value, "sourceURL") orelse objectString(value, "url") orelse requested_url else requested_url;
-    return boundedDocument(gpa, title, source_url, markdown_text);
+    return boundedDocument(gpa, title, source_url, markdown_text, objectString(data, "warning"));
 }
 
 fn webFetch(gpa: std.mem.Allocator, io: Io, api_key: []const u8, args: std.json.Value) ![]u8 {
@@ -794,10 +804,21 @@ test "Firecrawl fetched documents use response metadata" {
     try std.testing.expectEqualStrings("Title: Fetched title\nURL: https://canonical.example/page\n\n# Page\n\nBody", result);
 
     const failed = try formatFetchedDocument(std.testing.allocator, "https://requested.example",
-        \\{"success":true,"data":{"metadata":{"error":"Robots denied this page."}}}
+        \\{"success":true,"data":{"markdown":"","metadata":{"error":"Robots denied this page."}}}
     );
     defer std.testing.allocator.free(failed);
     try std.testing.expectEqualStrings("web_fetch failed: Robots denied this page.", failed);
+}
+
+test "Firecrawl fetched documents preserve data warnings" {
+    const result = try formatFetchedDocument(std.testing.allocator, "https://requested.example",
+        \\{"success":true,"data":{"markdown":"Page body","warning":"Cached\ncopy\u007fused."}}
+    );
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings(
+        "URL: https://requested.example\n\nPage body\n\n[Firecrawl warning: Cached copy used.]",
+        result,
+    );
 }
 
 test "Firecrawl search metadata fallbacks and warnings remain visible" {
@@ -845,7 +866,7 @@ test "web output bounds preserve UTF-8 boundaries" {
     var index: usize = 0;
     while (index + "€".len <= markdown_text.len) : (index += "€".len) @memcpy(markdown_text[index .. index + "€".len], "€");
     @memset(markdown_text[index..], 'x');
-    const result = try boundedDocument(std.testing.allocator, "Unicode", "https://example.com", markdown_text);
+    const result = try boundedDocument(std.testing.allocator, "Unicode", "https://example.com", markdown_text, null);
     defer std.testing.allocator.free(result);
     try std.testing.expect(std.unicode.utf8ValidateSlice(result));
     try std.testing.expect(std.mem.endsWith(u8, result, "[content truncated]"));
@@ -855,8 +876,17 @@ test "Firecrawl documents are capped to the tool output budget" {
     const markdown_text = try std.testing.allocator.alloc(u8, max_output * 2);
     defer std.testing.allocator.free(markdown_text);
     @memset(markdown_text, 'x');
-    const result = try boundedDocument(std.testing.allocator, "Example", "https://example.com", markdown_text);
+    const result = try boundedDocument(std.testing.allocator, "Example", "https://example.com", markdown_text, null);
     defer std.testing.allocator.free(result);
     try std.testing.expect(result.len <= max_output);
     try std.testing.expect(std.mem.endsWith(u8, result, "[content truncated]"));
+
+    const warning = try std.testing.allocator.alloc(u8, max_output * 2);
+    defer std.testing.allocator.free(warning);
+    @memset(warning, 'w');
+    const warned = try boundedDocument(std.testing.allocator, "Example", "https://example.com", markdown_text, warning);
+    defer std.testing.allocator.free(warned);
+    try std.testing.expect(warned.len <= max_output);
+    try std.testing.expect(std.mem.indexOf(u8, warned, "[content truncated]") != null);
+    try std.testing.expect(std.mem.endsWith(u8, warned, "w]"));
 }
