@@ -28,13 +28,46 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const module_tests = b.addTest(.{ .root_module = module });
     const run_module_tests = b.addRunArtifact(module_tests);
+    const perf_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/perf.zig"),
+            .target = b.graph.host,
+            .optimize = optimize,
+        }),
+    });
+    const run_perf_tests = b.addRunArtifact(perf_tests);
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_module_tests.step);
+    test_step.dependOn(&run_perf_tests.step);
+
+    // Keep the benchmark independent from the selected build mode. It always
+    // measures the stripped ReleaseSmall artifact shipped by the project.
+    const perf_target = b.addExecutable(.{
+        .name = "xaq",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSmall,
+            .strip = true,
+        }),
+    });
+    const perf_runner = b.addExecutable(.{
+        .name = "xaq-perf",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/perf.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const run_perf = b.addRunArtifact(perf_runner);
+    run_perf.addArtifactArg(perf_target);
+    if (b.args) |args| run_perf.addArgs(args);
+    b.step("perf", "Test ReleaseSmall size and startup performance").dependOn(&run_perf.step);
 
     // Compile without installing: fast feedback and ZLS build-on-save diagnostics.
     b.step("check", "Type-check without installing").dependOn(&exe.step);
 
-    const fmt = b.addFmt(.{ .paths = &.{ "build.zig", "src" } });
+    const fmt = b.addFmt(.{ .paths = &.{ "build.zig", "src", "tools" } });
     b.step("fmt", "Format source in place").dependOn(&fmt.step);
 }
