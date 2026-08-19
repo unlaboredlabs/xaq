@@ -22,7 +22,8 @@ scratch=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/xaq-edge-publish.XXXXXX")
 cleanup() {
     rm -rf "$scratch"
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
 
 assets=()
 for platform in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64; do
@@ -55,18 +56,11 @@ for name in "${assets[@]}"; do
 done
 
 old_ref=$(git ls-remote --refs origin "refs/heads/$channel_branch" | awk 'NR == 1 { print $1 }')
-if [[ -n "$old_ref" ]]; then
-    git fetch --quiet --no-tags origin "refs/heads/$channel_branch"
-    previous_manifest="$scratch/previous-manifest"
-    git show "FETCH_HEAD:manifest" > "$previous_manifest"
-    tools/validate-edge-manifest.sh "$previous_manifest"
+keep="$scratch/keep-assets"
+printf '%s\n' "${assets[@]}" > "$keep"
 
-    keep="$scratch/keep-assets"
-    printf '%s\n' "${assets[@]}" > "$keep"
-    awk 'NR > 1 { print $2 }' "$previous_manifest" >> "$keep"
-    previous_sha=$(awk 'NR == 1 { print $2 }' "$previous_manifest")
-    printf 'edge-manifest-%s\n' "$previous_sha" >> "$keep"
-
+cleanup_release_assets() {
+    local release_id asset_id name
     release_id=$(gh api "repos/$repository/releases/tags/$release_tag" --jq .id)
     while IFS=$'\t' read -r asset_id name; do
         if ! grep -Fqx -- "$name" "$keep"; then
@@ -74,6 +68,19 @@ if [[ -n "$old_ref" ]]; then
         fi
     done < <(gh api --paginate "repos/$repository/releases/$release_id/assets?per_page=100" \
         --jq '.[] | [.id, .name] | @tsv')
+}
+
+if [[ -n "$old_ref" ]]; then
+    git fetch --quiet --no-tags origin "refs/heads/$channel_branch"
+    previous_manifest="$scratch/previous-manifest"
+    git show "FETCH_HEAD:manifest" > "$previous_manifest"
+    tools/validate-edge-manifest.sh "$previous_manifest"
+
+    awk 'NR > 1 { print $2 }' "$previous_manifest" >> "$keep"
+    previous_sha=$(awk 'NR == 1 { print $2 }' "$previous_manifest")
+    printf 'edge-manifest-%s\n' "$previous_sha" >> "$keep"
+
+    cleanup_release_assets
 fi
 
 blob=$(git hash-object -w "$manifest")
@@ -99,3 +106,9 @@ else
     lease="--force-with-lease=refs/heads/$channel_branch:"
 fi
 git push "$lease" origin "$channel_commit:refs/heads/$channel_branch"
+
+# Before the first channel manifest exists, legacy assets are the only usable
+# release. Remove them only after the new channel is active.
+if [[ -z "$old_ref" ]]; then
+    cleanup_release_assets
+fi
