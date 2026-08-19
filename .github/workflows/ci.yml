@@ -1,0 +1,94 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+      - run: zig fmt --check build.zig src
+      - run: zig build test
+      - run: zig build -Doptimize=ReleaseSmall
+      - name: Size and startup budget
+        if: runner.os == 'Linux'
+        run: |
+          test "$(stat -c%s zig-out/bin/xaq)" -le 524288
+          timeout 5s bash -c 'for _ in {1..200}; do ./zig-out/bin/xaq --help >/dev/null; done'
+      - name: Package edge build
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          case "${RUNNER_OS}/${RUNNER_ARCH}" in
+            Linux/X64) platform=linux-x86_64 ;;
+            Linux/ARM64) platform=linux-aarch64 ;;
+            macOS/X64) platform=macos-x86_64 ;;
+            macOS/ARM64) platform=macos-aarch64 ;;
+            *) echo "unsupported runner: ${RUNNER_OS}/${RUNNER_ARCH}" >&2; exit 1 ;;
+          esac
+          package="xaq-${platform}"
+          mkdir -p "dist/${package}"
+          cp zig-out/bin/xaq README.md LICENSE "dist/${package}/"
+          tar -czf "dist/${package}.tar.gz" -C dist "${package}"
+      - name: Upload edge build
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v7
+        with:
+          path: dist/*.tar.gz
+          archive: false
+          if-no-files-found: error
+          retention-days: 1
+
+  edge:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: check
+    runs-on: ubuntu-latest
+    concurrency:
+      group: edge
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - name: Download edge builds
+        uses: actions/download-artifact@v8
+        with:
+          pattern: xaq-*.tar.gz
+          path: dist
+          merge-multiple: true
+      - name: Publish edge release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+          cd ..
+
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/edge" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/tags/edge" \
+              -f sha="${GITHUB_SHA}" -F force=true >/dev/null
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref=refs/tags/edge -f sha="${GITHUB_SHA}" >/dev/null
+          fi
+
+          notes="Rolling build from main at ${GITHUB_SHA}. This prerelease is replaced after every successful main build."
+          if gh release view edge --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release edit edge --repo "${GITHUB_REPOSITORY}" \
+              --title "xaq edge" --prerelease --notes "${notes}"
+          else
+            gh release create edge --repo "${GITHUB_REPOSITORY}" \
+              --title "xaq edge" --prerelease --notes "${notes}"
+          fi
+          gh release upload edge dist/* --repo "${GITHUB_REPOSITORY}" --clobber

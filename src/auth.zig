@@ -29,12 +29,13 @@ const Store = struct {
 };
 
 const openai_client = "app_EMoamEEZ73f0CkXaXp7hrann";
+const openai_redirect = "http://localhost:1455/auth/callback";
 const anthropic_client = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const xai_client = "b1a00492-073a-47ea-816f-4c329264a828";
 
 pub fn login(gpa: std.mem.Allocator, io: Io, home: []const u8, provider: Provider, input: *Io.Reader, output: *Io.Writer) !void {
     const new_credential = switch (provider) {
-        .chatgpt => try loginChatGpt(gpa, io, output),
+        .chatgpt => try loginChatGpt(gpa, io, input, output),
         .claude => try loginClaude(gpa, io, input, output),
         .grok => try loginGrok(gpa, io, output),
     };
@@ -43,14 +44,41 @@ pub fn login(gpa: std.mem.Allocator, io: Io, home: []const u8, provider: Provide
 }
 
 pub fn credential(gpa: std.mem.Allocator, io: Io, home: []const u8, provider: Provider) !Credential {
+    var lock = try authLock(gpa, io, home);
+    defer lock.close(io);
     var store = try load(gpa, io, home);
     var current = get(store, provider) orelse return error.NotLoggedIn;
     const now = Io.Clock.real.now(io).toSeconds();
     if (current.expires > now + 60) return current;
     current = try refresh(gpa, io, provider, current);
     set(&store, provider, current);
-    try save(gpa, io, home, store);
+    try saveUnlocked(gpa, io, home, store);
     return current;
+}
+
+/// Refresh even when the cached expiry has not elapsed. Used once after an
+/// authenticated provider request returns 401.
+pub fn forceRefresh(gpa: std.mem.Allocator, io: Io, home: []const u8, provider: Provider) !void {
+    var lock = try authLock(gpa, io, home);
+    defer lock.close(io);
+    var store = try load(gpa, io, home);
+    const current = get(store, provider) orelse return error.NotLoggedIn;
+    set(&store, provider, try refresh(gpa, io, provider, current));
+    try saveUnlocked(gpa, io, home, store);
+}
+
+pub fn logout(gpa: std.mem.Allocator, io: Io, home: []const u8, provider: Provider) !bool {
+    var lock = try authLock(gpa, io, home);
+    defer lock.close(io);
+    var store = try load(gpa, io, home);
+    if (get(store, provider) == null) return false;
+    switch (provider) {
+        .chatgpt => store.chatgpt = null,
+        .claude => store.claude = null,
+        .grok => store.grok = null,
+    }
+    try saveUnlocked(gpa, io, home, store);
+    return true;
 }
 
 fn authPath(gpa: std.mem.Allocator, home: []const u8) ![]u8 {
@@ -65,10 +93,15 @@ fn load(gpa: std.mem.Allocator, io: Io, home: []const u8) !Store {
         else => return err,
     };
     defer gpa.free(bytes);
-    return try std.json.parseFromSliceLeaky(Store, gpa, bytes, .{ .ignore_unknown_fields = true });
+    return try std.json.parseFromSliceLeaky(Store, gpa, bytes, .{
+        .ignore_unknown_fields = true,
+        // Store strings must outlive the input buffer; credentials are used
+        // after this function frees `bytes`.
+        .allocate = .alloc_always,
+    });
 }
 
-fn save(gpa: std.mem.Allocator, io: Io, home: []const u8, store: Store) !void {
+fn saveUnlocked(gpa: std.mem.Allocator, io: Io, home: []const u8, store: Store) !void {
     const path = try authPath(gpa, home);
     defer gpa.free(path);
     if (std.fs.path.dirname(path)) |parent| try Io.Dir.cwd().createDirPath(io, parent);
@@ -76,20 +109,43 @@ fn save(gpa: std.mem.Allocator, io: Io, home: []const u8, store: Store) !void {
     defer out.deinit();
     try std.json.Stringify.value(store, .{ .whitespace = .indent_2 }, &out.writer);
     try out.writer.writeByte('\n');
+    var random: [8]u8 = undefined;
+    try io.randomSecure(&random);
+    const hex = std.fmt.bytesToHex(random, .lower);
+    const temporary = try std.fmt.allocPrint(gpa, "{s}.tmp-{s}", .{ path, &hex });
+    defer gpa.free(temporary);
+    errdefer Io.Dir.cwd().deleteFile(io, temporary) catch {};
     try Io.Dir.cwd().writeFile(io, .{
-        .sub_path = path,
+        .sub_path = temporary,
         .data = out.written(),
-        .flags = .{ .permissions = @enumFromInt(0o600) },
+        .flags = .{ .exclusive = true, .permissions = @enumFromInt(0o600) },
     });
-    var file = try Io.Dir.cwd().openFile(io, path, .{});
+    var file = try Io.Dir.cwd().openFile(io, temporary, .{ .mode = .read_write });
     defer file.close(io);
     try file.setPermissions(io, @enumFromInt(0o600));
+    try file.sync(io);
+    try Io.Dir.renameAbsolute(temporary, path, io);
 }
 
 fn put(gpa: std.mem.Allocator, io: Io, home: []const u8, provider: Provider, value: Credential) !void {
+    var lock = try authLock(gpa, io, home);
+    defer lock.close(io);
     var store = try load(gpa, io, home);
     set(&store, provider, value);
-    try save(gpa, io, home, store);
+    try saveUnlocked(gpa, io, home, store);
+}
+
+fn authLock(gpa: std.mem.Allocator, io: Io, home: []const u8) !Io.File {
+    const directory = try std.fs.path.join(gpa, &.{ home, ".config", "xaq" });
+    defer gpa.free(directory);
+    try Io.Dir.cwd().createDirPath(io, directory);
+    const path = try std.fs.path.join(gpa, &.{ directory, "auth.lock" });
+    defer gpa.free(path);
+    return Io.Dir.cwd().createFile(io, path, .{
+        .truncate = false,
+        .lock = .exclusive,
+        .permissions = @enumFromInt(0o600),
+    });
 }
 
 fn get(store: Store, provider: Provider) ?Credential {
@@ -163,47 +219,43 @@ fn tokenCredential(gpa: std.mem.Allocator, io: Io, body: []const u8, old_refresh
     };
 }
 
-fn loginChatGpt(gpa: std.mem.Allocator, io: Io, output: *Io.Writer) !Credential {
-    const response = try transport.post(gpa, io, "https://auth.openai.com/api/accounts/deviceauth/usercode", "application/json", &.{},
-        \\{"client_id":"app_EMoamEEZ73f0CkXaXp7hrann"}
+fn loginChatGpt(gpa: std.mem.Allocator, io: Io, input: *Io.Reader, output: *Io.Writer) !Credential {
+    const pair = try pkce(gpa, io);
+    const state = try randomToken(gpa, io, 16);
+    const fields = [_]struct { []const u8, []const u8 }{
+        .{ "response_type", "code" },
+        .{ "client_id", openai_client },
+        .{ "redirect_uri", openai_redirect },
+        .{ "scope", "openid profile email offline_access" },
+        .{ "code_challenge", pair.challenge },
+        .{ "code_challenge_method", "S256" },
+        .{ "state", state },
+        .{ "id_token_add_organizations", "true" },
+        .{ "codex_cli_simplified_flow", "true" },
+        .{ "originator", "xaq" },
+    };
+    const query = try transport.formEncode(gpa, &fields);
+    const url = try std.fmt.allocPrint(gpa, "https://auth.openai.com/oauth/authorize?{s}", .{query});
+    openBrowser(gpa, io, url);
+    try output.print(
+        "Open this URL (a browser may already have opened):\n{s}\nAfter login the localhost page will fail to load — that is expected.\nPaste its full address-bar URL or the authorization code here: ",
+        .{url},
     );
-    defer gpa.free(response.body);
-    try requireStatus(response);
-    var parsed = try parseJson(gpa, response.body);
-    defer parsed.deinit();
-    const device_id = try gpa.dupe(u8, try string(parsed.value, "device_auth_id"));
-    const user_code = try gpa.dupe(u8, try string(parsed.value, "user_code"));
-    const interval = number(parsed.value, "interval", 5);
-    try output.print("Open https://auth.openai.com/codex/device and enter: {s}\n", .{user_code});
     try output.flush();
-
-    while (true) {
-        try io.sleep(.fromSeconds(@max(interval, 1)), .awake);
-        var body: Io.Writer.Allocating = .init(gpa);
-        defer body.deinit();
-        var js: std.json.Stringify = .{ .writer = &body.writer };
-        try js.beginObject();
-        try js.objectField("device_auth_id");
-        try js.write(device_id);
-        try js.objectField("user_code");
-        try js.write(user_code);
-        try js.endObject();
-        const poll = try transport.post(gpa, io, "https://auth.openai.com/api/accounts/deviceauth/token", "application/json", &.{}, body.written());
-        defer gpa.free(poll.body);
-        if (poll.status == 403 or poll.status == 404) continue;
-        try requireStatus(poll);
-        var token = try parseJson(gpa, poll.body);
-        defer token.deinit();
-        const code = try gpa.dupe(u8, try string(token.value, "authorization_code"));
-        const verifier = try gpa.dupe(u8, try string(token.value, "code_verifier"));
-        return exchangeOpenAi(gpa, io, code, verifier);
+    const line = (try input.takeDelimiter('\n')) orelse return error.EndOfStream;
+    const submitted = std.mem.trim(u8, line, " \r\n");
+    const returned_state = try authorizationState(gpa, submitted);
+    if (returned_state) |actual| {
+        if (!std.mem.eql(u8, actual, state)) return error.OAuthStateMismatch;
     }
+    const code = try authorizationCode(gpa, submitted);
+    return exchangeOpenAi(gpa, io, code, pair.verifier);
 }
 
 fn exchangeOpenAi(gpa: std.mem.Allocator, io: Io, code: []const u8, verifier: []const u8) !Credential {
     const body = try transport.formEncode(gpa, &.{
-        .{ "grant_type", "authorization_code" }, .{ "client_id", openai_client },                                    .{ "code", code },
-        .{ "code_verifier", verifier },          .{ "redirect_uri", "https://auth.openai.com/deviceauth/callback" },
+        .{ "grant_type", "authorization_code" }, .{ "client_id", openai_client },      .{ "code", code },
+        .{ "code_verifier", verifier },          .{ "redirect_uri", openai_redirect },
     });
     defer gpa.free(body);
     const response = try transport.post(gpa, io, "https://auth.openai.com/oauth/token", "application/x-www-form-urlencoded", &.{}, body);
@@ -244,6 +296,29 @@ fn pkce(gpa: std.mem.Allocator, io: Io) !struct { verifier: []u8, challenge: []u
     return .{ .verifier = verifier, .challenge = challenge };
 }
 
+fn randomToken(gpa: std.mem.Allocator, io: Io, comptime byte_count: usize) ![]u8 {
+    var random: [byte_count]u8 = undefined;
+    try io.randomSecure(&random);
+    const encoder = std.base64.url_safe_no_pad.Encoder;
+    const token = try gpa.alloc(u8, encoder.calcSize(random.len));
+    _ = encoder.encode(token, &random);
+    return token;
+}
+
+/// Best-effort convenience: launch the platform opener and ignore any
+/// failure; the URL is always printed for manual use.
+fn openBrowser(gpa: std.mem.Allocator, io: Io, url: []const u8) void {
+    const opener = if (@import("builtin").os.tag == .macos) "open" else "xdg-open";
+    const result = std.process.run(gpa, io, .{
+        .argv = &.{ opener, url },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+        .timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } },
+    }) catch return;
+    gpa.free(result.stdout);
+    gpa.free(result.stderr);
+}
+
 fn loginClaude(gpa: std.mem.Allocator, io: Io, input: *Io.Reader, output: *Io.Writer) !Credential {
     const pair = try pkce(gpa, io);
     const fields = [_]struct { []const u8, []const u8 }{
@@ -253,7 +328,11 @@ fn loginClaude(gpa: std.mem.Allocator, io: Io, input: *Io.Reader, output: *Io.Wr
     };
     const query = try transport.formEncode(gpa, &fields);
     const url = try std.fmt.allocPrint(gpa, "https://claude.ai/oauth/authorize?{s}", .{query});
-    try output.print("Open this URL:\n{s}\nPaste the final redirect URL or authorization code: ", .{url});
+    openBrowser(gpa, io, url);
+    try output.print(
+        "Open this URL (a browser may already have opened):\n{s}\nAfter login the localhost page will fail to load — that is expected.\nPaste its full address-bar URL or the authorization code here: ",
+        .{url},
+    );
     try output.flush();
     const line = (try input.takeDelimiter('\n')) orelse return error.EndOfStream;
     const code = try authorizationCode(gpa, std.mem.trim(u8, line, " \r\n"));
@@ -278,10 +357,24 @@ fn authorizationCode(gpa: std.mem.Allocator, value: []const u8) ![]const u8 {
         const tail = value[at + 5 ..];
         const end = std.mem.indexOfAny(u8, tail, "&#") orelse tail.len;
         const out = try gpa.dupe(u8, tail[0..end]);
-        return std.Uri.percentDecodeInPlace(out);
+        // percentDecodeInPlace returns a subslice; dupe so callers can free.
+        defer gpa.free(out);
+        return try gpa.dupe(u8, std.Uri.percentDecodeInPlace(out));
     }
     if (std.mem.indexOfScalar(u8, value, '#')) |at| return gpa.dupe(u8, value[0..at]);
     return gpa.dupe(u8, value);
+}
+
+fn authorizationState(gpa: std.mem.Allocator, value: []const u8) !?[]const u8 {
+    if (std.mem.indexOf(u8, value, "state=")) |at| {
+        const tail = value[at + 6 ..];
+        const end = std.mem.indexOfAny(u8, tail, "&#") orelse tail.len;
+        const out = try gpa.dupe(u8, tail[0..end]);
+        defer gpa.free(out);
+        return try gpa.dupe(u8, std.Uri.percentDecodeInPlace(out));
+    }
+    if (std.mem.indexOfScalar(u8, value, '#')) |at| return try gpa.dupe(u8, value[at + 1 ..]);
+    return null;
 }
 
 fn loginGrok(gpa: std.mem.Allocator, io: Io, output: *Io.Writer) !Credential {
@@ -298,9 +391,13 @@ fn loginGrok(gpa: std.mem.Allocator, io: Io, output: *Io.Writer) !Credential {
     const user = try string(parsed.value, "user_code");
     const uri = try string(parsed.value, "verification_uri");
     const interval = number(parsed.value, "interval", 5);
+    openBrowser(gpa, io, uri);
     try output.print("Open {s} and enter: {s}\n", .{ uri, user });
     try output.flush();
+    // One dot per poll keeps the wait visibly alive without a raw-mode UI.
     while (true) {
+        try output.writeAll(".");
+        try output.flush();
         try io.sleep(.fromSeconds(@max(interval, 1)), .awake);
         const poll_body = try transport.formEncode(gpa, &.{
             .{ "grant_type", "urn:ietf:params:oauth:grant-type:device_code" }, .{ "client_id", xai_client }, .{ "device_code", device },
@@ -308,11 +405,17 @@ fn loginGrok(gpa: std.mem.Allocator, io: Io, output: *Io.Writer) !Credential {
         defer gpa.free(poll_body);
         const poll = try transport.post(gpa, io, "https://auth.x.ai/oauth2/token", "application/x-www-form-urlencoded", &.{}, poll_body);
         defer gpa.free(poll.body);
-        if (poll.status >= 200 and poll.status < 300) return tokenCredential(gpa, io, poll.body, null);
+        if (poll.status >= 200 and poll.status < 300) {
+            try output.writeByte('\n');
+            try output.flush();
+            return tokenCredential(gpa, io, poll.body, null);
+        }
         var problem = parseJson(gpa, poll.body) catch continue;
         defer problem.deinit();
         const kind = string(problem.value, "error") catch continue;
         if (std.mem.eql(u8, kind, "authorization_pending") or std.mem.eql(u8, kind, "slow_down")) continue;
+        try output.writeByte('\n');
+        try output.flush();
         try requireStatus(poll);
     }
 }
@@ -355,4 +458,32 @@ fn refresh(gpa: std.mem.Allocator, io: Io, provider: Provider, old: Credential) 
 test "provider parsing" {
     try std.testing.expectEqual(Provider.chatgpt, Provider.parse("chatgpt").?);
     try std.testing.expectEqual(@as(?Provider, null), Provider.parse("openai"));
+}
+
+test "authorization input parses browser callback" {
+    const gpa = std.testing.allocator;
+    const url = "http://localhost:1455/auth/callback?code=abc%2F123&state=expected";
+    const code = try authorizationCode(gpa, url);
+    defer gpa.free(code);
+    const state = (try authorizationState(gpa, url)).?;
+    defer gpa.free(state);
+    try std.testing.expectEqualStrings("abc/123", code);
+    try std.testing.expectEqualStrings("expected", state);
+}
+
+test "credential strings outlive auth file buffer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const gpa = arena.allocator();
+    const source = try gpa.dupe(u8,
+        \\{"chatgpt":{"access":"access-token","refresh":"refresh-token","expires":42,"account_id":"account-id"}}
+    );
+    const store = try std.json.parseFromSliceLeaky(Store, gpa, source, .{
+        .allocate = .alloc_always,
+    });
+    gpa.free(source);
+    const overwrite = try gpa.alloc(u8, source.len);
+    @memset(overwrite, 'x');
+    try std.testing.expectEqualStrings("access-token", store.chatgpt.?.access);
+    try std.testing.expectEqualStrings("account-id", store.chatgpt.?.account_id.?);
 }
