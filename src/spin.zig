@@ -1,10 +1,13 @@
 //! One continuously animating spinner for the whole process. It runs as a
 //! concurrent Io task at a fixed cadence, independent of stream events, so
-//! it never freezes while a provider is silent. Frames bypass the shared
-//! Io.Writer and go straight to the stdout fd: the foreground flushes
+//! it never freezes while a provider is silent. Inline, frames bypass the
+//! shared Io.Writer and go straight to the stdout fd; in fullscreen they
+//! go through the TUI's live transcript row, which serializes them with
+//! the chrome under the render mutex. Either way the foreground flushes
 //! before `start`, and `stop` awaits the task before anything else prints,
-//! so the two never interleave. Everything is a no-op when styling is
-//! disabled or the Io implementation cannot provide concurrency.
+//! so frames and output never interleave. Everything is a no-op when
+//! styling is disabled or the Io implementation cannot provide
+//! concurrency.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -24,13 +27,11 @@ var label: []const u8 = "";
 /// outlive the spinner (pass a literal). No-op when styling is disabled
 /// or a spinner is already running.
 pub fn start(io: Io, text: []const u8) void {
-    // Fullscreen shows the label statically in the info bar; a raw
-    // concurrent writer would interleave with the chrome.
     if (tui.active) {
+        // Fullscreen also shows the label statically in the info bar;
+        // frames animate on the transcript's live row.
         tui.setActivity(text);
-        return;
-    }
-    if (!term.enabled) return;
+    } else if (!term.enabled) return;
     if (future != null) return;
     label = text;
     io_handle = io;
@@ -40,22 +41,30 @@ pub fn start(io: Io, text: []const u8) void {
 /// Stop and erase the spinner line. Cancels and awaits the task, so no
 /// frame can land after this returns. Safe to call when nothing runs.
 pub fn stop() void {
-    if (tui.active) {
-        tui.setActivity(null);
+    var running = future orelse {
+        if (tui.active) tui.setActivity(null);
         return;
-    }
-    var running = future orelse return;
+    };
     future = null;
     running.cancel(io_handle);
-    write("\r\x1b[K");
+    if (tui.active) {
+        tui.spinnerClear();
+        tui.setActivity(null);
+    } else {
+        write("\r\x1b[K");
+    }
 }
 
 fn loop(io: Io) void {
     var frame: usize = 0;
     while (true) {
-        var buffer: [64]u8 = undefined;
-        const line = std.fmt.bufPrint(&buffer, "\r{s}{s} {s}{s}", .{ term.dim(), frames[frame], label, term.reset() }) catch return;
-        write(line);
+        if (tui.active) {
+            tui.spinnerFrame(frames[frame], label);
+        } else {
+            var buffer: [64]u8 = undefined;
+            const line = std.fmt.bufPrint(&buffer, "\r{s}{s} {s}{s}", .{ term.dim(), frames[frame], label, term.reset() }) catch return;
+            write(line);
+        }
         frame = (frame + 1) % frames.len;
         io.sleep(.fromMilliseconds(frame_interval_ms), .awake) catch return;
     }
