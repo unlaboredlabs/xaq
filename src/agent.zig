@@ -2827,10 +2827,16 @@ test "compact requests omit coding tools and use the selected model" {
 }
 
 test "fast mode uses each provider's request contract" {
-    const openai = try buildRequest(std.testing.allocator, .chatgpt, "gpt-5.6-sol", null, true, .{}, "/work", "", &.{});
-    defer std.testing.allocator.free(openai);
-    try std.testing.expect(std.mem.indexOf(u8, openai, "\"service_tier\":\"fast\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, openai, "\"speed\"") == null);
+    const chatgpt = try buildRequest(std.testing.allocator, .chatgpt, "gpt-5.6-sol", null, true, .{}, "/work", "", &.{});
+    defer std.testing.allocator.free(chatgpt);
+    try std.testing.expect(std.mem.indexOf(u8, chatgpt, "\"service_tier\":\"priority\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, chatgpt, "\"service_tier\":\"fast\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, chatgpt, "\"speed\"") == null);
+
+    const chatgpt_compact = try buildCompactRequest(std.testing.allocator, .chatgpt, "gpt-5.6-sol", null, true, &.{});
+    defer std.testing.allocator.free(chatgpt_compact);
+    try std.testing.expect(std.mem.indexOf(u8, chatgpt_compact, "\"service_tier\":\"priority\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, chatgpt_compact, "\"service_tier\":\"fast\"") == null);
 
     const anthropic = try buildRequest(std.testing.allocator, .claude, "claude-opus-5", null, true, .{}, "/work", "", &.{});
     defer std.testing.allocator.free(anthropic);
