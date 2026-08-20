@@ -1,0 +1,13 @@
+{
+  "name": "xaq-monorepo",
+  "private": true,
+  "packageManager": "pnpm@11.22.0",
+  "scripts": {
+    "dev": "pnpm --filter @xaq/web dev",
+    "build": "pnpm --filter @xaq/web build",
+    "start": "pnpm --filter @xaq/web start",
+    "lint": "pnpm --filter @xaq/web lint",
+    "typecheck": "pnpm --filter @xaq/web typecheck",
+    "test": "pnpm --filter @xaq/web test"
+  }
+}
