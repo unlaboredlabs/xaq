@@ -16,7 +16,7 @@ pub fn build(gpa: std.mem.Allocator, provider: auth.Provider, model: []const u8,
     const subagent_instructions = if (tool_options.subagents_enabled) " Agent launches separate-process subagents in the same working directory. Background is the default: launch independent work together, then use get_subagent_result with wait true before relying on it. Give each subagent a self-contained brief and verify any claimed edits." else "";
     const custom_instructions = if (tool_options.custom.len > 0) " Use host-provided tools when they help with the request." else "";
     const permission_instructions = if (tool_options.include_builtin) " Built-in tools have full user permissions; do not ask for tool approval." else "";
-    const system = try std.fmt.allocPrint(gpa, "You are a concise coding agent in {s}.{s}{s}{s}{s}{s} Verify material changes.{s}", .{ cwd, write_instructions, web_instructions, subagent_instructions, custom_instructions, permission_instructions, instructions });
+    const system = try std.fmt.allocPrint(gpa, "You are a concise coding agent in {s}. Runtime: provider={s}, model={s}.{s}{s}{s}{s}{s} Verify material changes.{s}", .{ cwd, @tagName(provider), model, write_instructions, web_instructions, subagent_instructions, custom_instructions, permission_instructions, instructions });
     defer gpa.free(system);
 
     var out: Io.Writer.Allocating = .init(gpa);
@@ -383,6 +383,20 @@ fn rawValue(js: *std.json.Stringify, value: []const u8) !void {
     try js.beginWriteRaw();
     try js.writer.writeAll(value);
     js.endWriteRaw();
+}
+
+test "system prompt includes runtime provider and model" {
+    const chatgpt = try build(std.testing.allocator, .chatgpt, "gpt-5.6-sol", null, false, .{ .include_builtin = false }, "/work", "", &.{});
+    defer std.testing.allocator.free(chatgpt);
+    try std.testing.expect(std.mem.indexOf(u8, chatgpt, "Runtime: provider=chatgpt, model=gpt-5.6-sol.") != null);
+
+    const claude = try build(std.testing.allocator, .claude, "claude-opus-5", null, false, .{ .include_builtin = false }, "/work", "", &.{});
+    defer std.testing.allocator.free(claude);
+    try std.testing.expect(std.mem.indexOf(u8, claude, "Runtime: provider=claude, model=claude-opus-5.") != null);
+
+    const grok = try build(std.testing.allocator, .grok, "grok-4.6", null, false, .{ .include_builtin = false }, "/work", "", &.{});
+    defer std.testing.allocator.free(grok);
+    try std.testing.expect(std.mem.indexOf(u8, grok, "Runtime: provider=grok, model=grok-4.6.") != null);
 }
 
 test "custom tools are serialized for both provider contracts" {
