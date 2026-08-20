@@ -6,6 +6,32 @@ pub const Header = struct { name: []const u8, value: []const u8 };
 pub const Response = struct { status: u16, body: []u8, retry_after_seconds: ?u64 = null };
 pub const StreamFn = *const fn (context: ?*anyopaque, line: []const u8) anyerror!void;
 
+/// Extract a display-safe candidate from the common JSON error shapes used by
+/// providers. Callers still need to filter terminal control sequences.
+pub fn errorMessage(gpa: std.mem.Allocator, body: []const u8) ?[]u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch return null;
+    defer parsed.deinit();
+    const object = switch (parsed.value) {
+        .object => |value| value,
+        else => return null,
+    };
+    for ([_][]const u8{ "error_description", "detail", "message", "error" }) |key| {
+        const value = object.get(key) orelse continue;
+        switch (value) {
+            .string => |text| return gpa.dupe(u8, text) catch null,
+            .object => |nested| {
+                const message = nested.get("message") orelse continue;
+                switch (message) {
+                    .string => |text| return gpa.dupe(u8, text) catch null,
+                    else => {},
+                }
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
 /// Small HTTPS transport. curl supplies platform TLS, but all sensitive
 /// headers travel through its stdin config rather than process arguments.
 pub fn post(gpa: std.mem.Allocator, io: Io, url: []const u8, content_type: []const u8, headers: []const Header, body: []const u8) !Response {
@@ -242,6 +268,16 @@ test "HTTP response helpers" {
     try std.testing.expectEqual(@as(?u16, 429), parseStatus("HTTP/2 429 Too Many Requests"));
     try std.testing.expectEqualStrings(" 7", headerValue("Retry-After: 7", "retry-after").?);
     try std.testing.expectEqual(@as(?[]const u8, null), headerValue("Content-Type: text/plain", "retry-after"));
+}
+
+test "provider error messages handle OAuth and nested API errors" {
+    const oauth = errorMessage(std.testing.allocator, "{\"error\":\"invalid_grant\",\"error_description\":\"Authorization code expired\"}").?;
+    defer std.testing.allocator.free(oauth);
+    try std.testing.expectEqualStrings("Authorization code expired", oauth);
+
+    const nested = errorMessage(std.testing.allocator, "{\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Try again later\"}}").?;
+    defer std.testing.allocator.free(nested);
+    try std.testing.expectEqualStrings("Try again later", nested);
 }
 
 test "curl config rejects header injection" {

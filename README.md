@@ -51,7 +51,7 @@ xaq login claude
 xaq login grok
 ```
 
-ChatGPT and Claude use browser login. If the localhost callback page fails to load, copy its full address-bar URL or the authorization code back into `xaq`. Grok uses device-code login.
+ChatGPT and Claude use browser login. ChatGPT may ask you to copy a localhost callback URL. Claude shows an authorization code on its callback page. Paste either value back into `xaq`. Grok uses device-code login.
 
 Already inside an interactive session? Run `/login` to connect or replace any provider login without leaving `xaq`.
 

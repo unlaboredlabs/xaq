@@ -43,6 +43,15 @@ const Store = struct {
 const openai_client = "app_EMoamEEZ73f0CkXaXp7hrann";
 const openai_redirect = "http://localhost:1455/auth/callback";
 const anthropic_client = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const anthropic_authorize = "https://claude.com/cai/oauth/authorize";
+const anthropic_redirect = "https://platform.claude.com/oauth/code/callback";
+const anthropic_token = "https://platform.claude.com/v1/oauth/token";
+const anthropic_scopes = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+const anthropic_refresh_scopes = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+const anthropic_oauth_headers = [_]transport.Header{
+    .{ .name = "Accept", .value = "application/json" },
+    .{ .name = "User-Agent", .value = "xaq/0.1" },
+};
 const xai_client = "b1a00492-073a-47ea-816f-4c329264a828";
 
 pub fn login(gpa: std.mem.Allocator, io: Io, home: []const u8, provider: Provider, input: *Io.Reader, output: *Io.Writer) !void {
@@ -184,9 +193,21 @@ fn set(store: *Store, provider: Provider, value: Credential) void {
     }
 }
 
-fn requireStatus(response: transport.Response) !void {
+fn requireStatus(gpa: std.mem.Allocator, response: transport.Response, output: ?*Io.Writer) !void {
     if (response.status < 200 or response.status >= 300) {
-        std.debug.print("provider HTTP {d}\n", .{response.status});
+        if (output) |writer| {
+            try writer.print("provider HTTP {d}", .{response.status});
+            if (transport.errorMessage(gpa, response.body)) |message| {
+                defer gpa.free(message);
+                try writer.writeAll(": ");
+                var safe: term.SafeWriter = .{ .output = writer };
+                try safe.write(message);
+            }
+            try writer.writeByte('\n');
+            try writer.flush();
+        } else {
+            std.debug.print("provider HTTP {d}\n", .{response.status});
+        }
         return error.ProviderRequestFailed;
     }
 }
@@ -270,10 +291,10 @@ fn loginChatGpt(gpa: std.mem.Allocator, io: Io, input: *Io.Reader, output: *Io.W
     }
     const code = try authorizationCode(gpa, submitted);
     try requireCodeShape(code);
-    return exchangeOpenAi(gpa, io, code, pair.verifier);
+    return exchangeOpenAi(gpa, io, code, pair.verifier, output);
 }
 
-fn exchangeOpenAi(gpa: std.mem.Allocator, io: Io, code: []const u8, verifier: []const u8) !Credential {
+fn exchangeOpenAi(gpa: std.mem.Allocator, io: Io, code: []const u8, verifier: []const u8, output: *Io.Writer) !Credential {
     const body = try transport.formEncode(gpa, &.{
         .{ "grant_type", "authorization_code" }, .{ "client_id", openai_client },      .{ "code", code },
         .{ "code_verifier", verifier },          .{ "redirect_uri", openai_redirect },
@@ -281,7 +302,7 @@ fn exchangeOpenAi(gpa: std.mem.Allocator, io: Io, code: []const u8, verifier: []
     defer gpa.free(body);
     const response = try transport.post(gpa, io, "https://auth.openai.com/oauth/token", "application/x-www-form-urlencoded", &.{}, body);
     defer gpa.free(response.body);
-    try requireStatus(response);
+    try requireStatus(gpa, response, output);
     var result = try tokenCredential(gpa, io, response.body, null);
     result.account_id = try accountId(gpa, result.access);
     return result;
@@ -342,16 +363,11 @@ fn openBrowser(gpa: std.mem.Allocator, io: Io, url: []const u8) void {
 
 fn loginClaude(gpa: std.mem.Allocator, io: Io, input: *Io.Reader, output: *Io.Writer) !Credential {
     const pair = try pkce(gpa, io);
-    const fields = [_]struct { []const u8, []const u8 }{
-        .{ "code", "true" },                                    .{ "client_id", anthropic_client },                                                                                         .{ "response_type", "code" },
-        .{ "redirect_uri", "http://localhost:53692/callback" }, .{ "scope", "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload" }, .{ "code_challenge", pair.challenge },
-        .{ "code_challenge_method", "S256" },                   .{ "state", pair.verifier },
-    };
-    const query = try transport.formEncode(gpa, &fields);
-    const url = try std.fmt.allocPrint(gpa, "https://claude.ai/oauth/authorize?{s}", .{query});
+    const url = try claudeAuthorizationUrl(gpa, pair.challenge, pair.verifier);
+    defer gpa.free(url);
     openBrowser(gpa, io, url);
     try output.print(
-        "Open this URL if your browser did not open:\n{s}\nThe localhost page may fail to load. Copy its full URL from the address bar.\n",
+        "Open this URL if your browser did not open:\n{s}\nCopy the authorization code from the callback page.\n",
         .{url},
     );
     try output.flush();
@@ -363,21 +379,39 @@ fn loginClaude(gpa: std.mem.Allocator, io: Io, input: *Io.Reader, output: *Io.Wr
         if (!std.mem.eql(u8, actual, pair.verifier)) return error.OAuthStateMismatch;
     }
     const code = try authorizationCode(gpa, submitted);
+    defer gpa.free(code);
     try requireCodeShape(code);
 
+    const body = try claudeExchangeBody(gpa, code, pair.verifier);
+    defer gpa.free(body);
+    const response = try transport.post(gpa, io, anthropic_token, "application/json", &anthropic_oauth_headers, body);
+    defer gpa.free(response.body);
+    try requireStatus(gpa, response, output);
+    return tokenCredential(gpa, io, response.body, null);
+}
+
+fn claudeAuthorizationUrl(gpa: std.mem.Allocator, challenge: []const u8, state: []const u8) ![]u8 {
+    const fields = [_]struct { []const u8, []const u8 }{
+        .{ "code", "true" },                     .{ "client_id", anthropic_client }, .{ "response_type", "code" },
+        .{ "redirect_uri", anthropic_redirect }, .{ "scope", anthropic_scopes },     .{ "code_challenge", challenge },
+        .{ "code_challenge_method", "S256" },    .{ "state", state },
+    };
+    const query = try transport.formEncode(gpa, &fields);
+    defer gpa.free(query);
+    return std.fmt.allocPrint(gpa, "{s}?{s}", .{ anthropic_authorize, query });
+}
+
+fn claudeExchangeBody(gpa: std.mem.Allocator, code: []const u8, verifier: []const u8) ![]u8 {
     var body: Io.Writer.Allocating = .init(gpa);
     defer body.deinit();
     var js: std.json.Stringify = .{ .writer = &body.writer };
     try js.beginObject();
-    inline for (.{ .{ "grant_type", "authorization_code" }, .{ "client_id", anthropic_client }, .{ "code", code }, .{ "state", pair.verifier }, .{ "redirect_uri", "http://localhost:53692/callback" }, .{ "code_verifier", pair.verifier } }) |field| {
+    inline for (.{ .{ "grant_type", "authorization_code" }, .{ "client_id", anthropic_client }, .{ "code", code }, .{ "state", verifier }, .{ "redirect_uri", anthropic_redirect }, .{ "code_verifier", verifier } }) |field| {
         try js.objectField(field[0]);
         try js.write(field[1]);
     }
     try js.endObject();
-    const response = try transport.post(gpa, io, "https://platform.claude.com/v1/oauth/token", "application/json", &.{.{ .name = "Accept", .value = "application/json" }}, body.written());
-    defer gpa.free(response.body);
-    try requireStatus(response);
-    return tokenCredential(gpa, io, response.body, null);
+    return body.toOwnedSlice();
 }
 
 /// Reject pastes that cannot be an authorization code before they reach
@@ -423,7 +457,7 @@ fn loginGrok(gpa: std.mem.Allocator, io: Io, output: *Io.Writer) !Credential {
     defer gpa.free(body);
     const response = try transport.post(gpa, io, "https://auth.x.ai/oauth2/device/code", "application/x-www-form-urlencoded", &.{}, body);
     defer gpa.free(response.body);
-    try requireStatus(response);
+    try requireStatus(gpa, response, output);
     var parsed = try parseJson(gpa, response.body);
     defer parsed.deinit();
     const device = try gpa.dupe(u8, try string(parsed.value, "device_code"));
@@ -452,7 +486,7 @@ fn loginGrok(gpa: std.mem.Allocator, io: Io, output: *Io.Writer) !Credential {
         defer problem.deinit();
         const kind = string(problem.value, "error") catch continue;
         if (std.mem.eql(u8, kind, "authorization_pending") or std.mem.eql(u8, kind, "slow_down")) continue;
-        try requireStatus(poll);
+        try requireStatus(gpa, poll, output);
     }
 }
 
@@ -474,7 +508,7 @@ fn waitForLoginPoll(io: Io, seconds: i64) !void {
 fn refresh(gpa: std.mem.Allocator, io: Io, provider: Provider, old: Credential) !Credential {
     const endpoint = switch (provider) {
         .chatgpt => "https://auth.openai.com/oauth/token",
-        .claude => "https://platform.claude.com/v1/oauth/token",
+        .claude => anthropic_token,
         .grok => "https://auth.x.ai/oauth2/token",
     };
     const client = switch (provider) {
@@ -488,19 +522,19 @@ fn refresh(gpa: std.mem.Allocator, io: Io, provider: Provider, old: Credential) 
         defer body.deinit();
         var js: std.json.Stringify = .{ .writer = &body.writer };
         try js.beginObject();
-        inline for (.{ .{ "grant_type", "refresh_token" }, .{ "client_id", client }, .{ "refresh_token", old.refresh } }) |field| {
+        inline for (.{ .{ "grant_type", "refresh_token" }, .{ "client_id", client }, .{ "refresh_token", old.refresh }, .{ "scope", anthropic_refresh_scopes } }) |field| {
             try js.objectField(field[0]);
             try js.write(field[1]);
         }
         try js.endObject();
-        response = try transport.post(gpa, io, endpoint, "application/json", &.{}, body.written());
+        response = try transport.post(gpa, io, endpoint, "application/json", &anthropic_oauth_headers, body.written());
     } else {
         const body = try transport.formEncode(gpa, &.{ .{ "grant_type", "refresh_token" }, .{ "client_id", client }, .{ "refresh_token", old.refresh } });
         defer gpa.free(body);
         response = try transport.post(gpa, io, endpoint, "application/x-www-form-urlencoded", &.{}, body);
     }
     defer gpa.free(response.body);
-    try requireStatus(response);
+    try requireStatus(gpa, response, null);
     var result = try tokenCredential(gpa, io, response.body, old.refresh);
     if (provider == .chatgpt) result.account_id = try accountId(gpa, result.access);
     return result;
@@ -563,6 +597,51 @@ test "authorization input parses browser callback" {
     defer gpa.free(state);
     try std.testing.expectEqualStrings("abc/123", code);
     try std.testing.expectEqualStrings("expected", state);
+}
+
+test "Claude manual OAuth uses the current provider callback" {
+    const gpa = std.testing.allocator;
+    const url = try claudeAuthorizationUrl(gpa, "challenge", "state");
+    defer gpa.free(url);
+    try std.testing.expect(std.mem.startsWith(u8, url, "https://claude.com/cai/oauth/authorize?"));
+    try std.testing.expect(std.mem.indexOf(u8, url, "redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback") != null);
+    try std.testing.expect(std.mem.indexOf(u8, url, "redirect_uri=http%3A%2F%2Flocalhost") == null);
+
+    const body = try claudeExchangeBody(gpa, "code", "verifier");
+    defer gpa.free(body);
+    var parsed = try parseJson(gpa, body);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("https://platform.claude.com/oauth/code/callback", try string(parsed.value, "redirect_uri"));
+    try std.testing.expectEqualStrings("code", try string(parsed.value, "code"));
+    try std.testing.expectEqualStrings("verifier", try string(parsed.value, "code_verifier"));
+    try std.testing.expectEqualStrings("verifier", try string(parsed.value, "state"));
+}
+
+test "Claude OAuth requests identify xaq instead of curl" {
+    try std.testing.expectEqualStrings("Accept", anthropic_oauth_headers[0].name);
+    try std.testing.expectEqualStrings("application/json", anthropic_oauth_headers[0].value);
+    try std.testing.expectEqualStrings("User-Agent", anthropic_oauth_headers[1].name);
+    try std.testing.expectEqualStrings("xaq/0.1", anthropic_oauth_headers[1].value);
+}
+
+test "login provider failures show the OAuth error description" {
+    const gpa = std.testing.allocator;
+    const body = try gpa.dupe(u8, "{\"error\":\"invalid_grant\",\"error_description\":\"Authorization code expired\"}");
+    defer gpa.free(body);
+    var buffer: [128]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buffer);
+    try std.testing.expectError(error.ProviderRequestFailed, requireStatus(gpa, .{ .status = 400, .body = body }, &writer));
+    try std.testing.expectEqualStrings("provider HTTP 400: Authorization code expired\n", writer.buffered());
+}
+
+test "Claude manual authorization code carries callback state" {
+    const gpa = std.testing.allocator;
+    const code = try authorizationCode(gpa, "authorization-code#expected-state");
+    defer gpa.free(code);
+    const state = (try authorizationState(gpa, "authorization-code#expected-state")).?;
+    defer gpa.free(state);
+    try std.testing.expectEqualStrings("authorization-code", code);
+    try std.testing.expectEqualStrings("expected-state", state);
 }
 
 test "credential strings outlive auth file buffer" {

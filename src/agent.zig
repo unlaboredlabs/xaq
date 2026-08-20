@@ -1331,7 +1331,7 @@ fn connectLogin(session: *Session, reader: *Io.Reader, provider: auth.Provider) 
     auth.login(scratch.allocator(), session.io, session.home, provider, reader, session.output) catch |err| {
         if (err == error.EndOfStream or err == error.Cancelled) {
             try session.output.writeAll("login cancelled\n");
-        } else {
+        } else if (err != error.ProviderRequestFailed) {
             const message: []const u8 = switch (err) {
                 error.OAuthStateMismatch => "callback from another login attempt",
                 error.InvalidAuthorizationInput => "invalid callback URL or code",
@@ -2454,7 +2454,7 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
         if (session.interactive) {
             try output.print("provider HTTP {d}: ", .{response.status});
             var safe: term.SafeWriter = .{ .output = output };
-            if (providerErrorMessage(session.gpa, response.body)) |message| {
+            if (transport.errorMessage(session.gpa, response.body)) |message| {
                 defer session.gpa.free(message);
                 try safe.write(message);
                 rememberProviderError(response.status, message);
@@ -2464,7 +2464,7 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
             }
             try output.writeByte('\n');
             try output.flush();
-        } else if (providerErrorMessage(session.gpa, response.body)) |message| {
+        } else if (transport.errorMessage(session.gpa, response.body)) |message| {
             defer session.gpa.free(message);
             rememberProviderError(response.status, message);
         } else {
@@ -2490,22 +2490,6 @@ fn interruptedRound(decoder: *Decoder, compacting: bool, transport_error: anyerr
     if (transport_error == error.Cancelled or transport_error == error.ProviderRequestFailed) return transport_error;
     if (!decoder.received or compacting) return null;
     return try finishRound(decoder, .stream_interrupted);
-}
-
-/// Extract the human-facing message from a JSON provider error body
-/// (`error.message`, `detail`, or `message`); null keeps the raw body.
-fn providerErrorMessage(gpa: std.mem.Allocator, body: []const u8) ?[]u8 {
-    var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch return null;
-    defer parsed.deinit();
-    for ([_][]const u8{ "error", "detail", "message" }) |key| {
-        const value = eventObject(parsed.value, key) orelse continue;
-        switch (value) {
-            .string => |text| return gpa.dupe(u8, text) catch null,
-            .object => if (eventString(value, "message")) |text| return gpa.dupe(u8, text) catch null,
-            else => {},
-        }
-    }
-    return null;
 }
 
 fn retryableTransport(err: anyerror) bool {
