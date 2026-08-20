@@ -10,13 +10,35 @@ const max_manifest_bytes = 64 * 1024;
 const ManifestAsset = struct {
     filename: []const u8,
     checksum: [64]u8,
+    release_sha: []const u8,
+    version: ?[]const u8,
 };
 
-pub fn run(gpa: std.mem.Allocator, io: Io) !void {
+pub const Status = enum { updated, already_current };
+
+pub const RunResult = struct {
+    status: Status,
+    version: ?[]u8,
+
+    pub fn deinit(self: *RunResult, gpa: std.mem.Allocator) void {
+        if (self.version) |version| gpa.free(version);
+        self.* = undefined;
+    }
+};
+
+pub fn run(gpa: std.mem.Allocator, io: Io, current_git_sha: []const u8) !RunResult {
     const asset = platformAsset() orelse return error.UnsupportedPlatform;
     const manifest = try download(gpa, io, manifest_url, max_manifest_bytes);
     defer gpa.free(manifest);
     const selected = try assetFromManifest(manifest, asset);
+    const release_version = if (selected.version) |version| try gpa.dupe(u8, version) else null;
+    errdefer if (release_version) |version| gpa.free(version);
+    if (std.mem.eql(u8, current_git_sha, selected.release_sha)) {
+        return .{
+            .status = .already_current,
+            .version = release_version,
+        };
+    }
     const asset_url = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ release_base, selected.filename });
     defer gpa.free(asset_url);
 
@@ -44,6 +66,10 @@ pub fn run(gpa: std.mem.Allocator, io: Io) !void {
     try file.setPermissions(io, @enumFromInt(0o755));
     try file.sync(io);
     try Io.Dir.renameAbsolute(temporary, executable, io);
+    return .{
+        .status = .updated,
+        .version = release_version,
+    };
 }
 
 fn platformAsset() ?[]const u8 {
@@ -103,7 +129,8 @@ fn assetFromManifest(contents: []const u8, asset: []const u8) !ManifestAsset {
         return error.MalformedManifest;
     }
 
-    var selected: ?ManifestAsset = null;
+    var selected: ?struct { filename: []const u8, checksum: [64]u8 } = null;
+    var release_version: ?[]const u8 = null;
     while (lines.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \t\r");
         if (line.len == 0) continue;
@@ -113,6 +140,15 @@ fn assetFromManifest(contents: []const u8, asset: []const u8) !ManifestAsset {
         const digest = fields.next() orelse return error.MalformedManifest;
         if (fields.next() != null or digest.len != 64 or !allLowerHex(digest)) {
             return error.MalformedManifest;
+        }
+        if (std.mem.eql(u8, logical, "version")) {
+            // The metadata uses the same three-field shape that old v1 clients
+            // already validate and ignore for unselected assets.
+            if (release_version != null or !validEdgeVersion(filename)) return error.MalformedManifest;
+            const version_digest = sha256(filename);
+            if (!std.mem.eql(u8, digest, &version_digest)) return error.MalformedManifest;
+            release_version = filename;
+            continue;
         }
         if (!std.mem.eql(u8, logical, asset)) continue;
         if (selected != null or filename.len != asset.len + 1 + release_sha.len or
@@ -125,7 +161,36 @@ fn assetFromManifest(contents: []const u8, asset: []const u8) !ManifestAsset {
         @memcpy(&checksum, digest);
         selected = .{ .filename = filename, .checksum = checksum };
     }
-    return selected orelse error.MissingAsset;
+    const found = selected orelse return error.MissingAsset;
+    return .{
+        .filename = found.filename,
+        .checksum = found.checksum,
+        .release_sha = release_sha,
+        .version = release_version,
+    };
+}
+
+fn validEdgeVersion(value: []const u8) bool {
+    if (value.len == 0 or value.len > 64) return false;
+    const marker = "-edge.";
+    const marker_index = std.mem.indexOf(u8, value, marker) orelse return false;
+    const base = value[0..marker_index];
+    const sequence = value[marker_index + marker.len ..];
+    if (!validDecimal(sequence, false)) return false;
+
+    var parts = std.mem.splitScalar(u8, base, '.');
+    var count: usize = 0;
+    while (parts.next()) |part| {
+        if (!validDecimal(part, true)) return false;
+        count += 1;
+    }
+    return count == 3;
+}
+
+fn validDecimal(value: []const u8, zero_allowed: bool) bool {
+    if (value.len == 0 or (value.len > 1 and value[0] == '0')) return false;
+    for (value) |byte| if (!std.ascii.isDigit(byte)) return false;
+    return zero_allowed or !std.mem.eql(u8, value, "0");
 }
 
 fn allLowerHex(value: []const u8) bool {
@@ -149,6 +214,17 @@ test "manifest selects an immutable asset and checksum" {
     const found = try assetFromManifest(manifest, "xaq-linux-x86_64");
     try std.testing.expectEqualStrings("xaq-linux-x86_64-0123456789abcdef0123456789abcdef01234567", found.filename);
     try std.testing.expectEqualStrings("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789", &found.checksum);
+    try std.testing.expectEqualStrings("0123456789abcdef0123456789abcdef01234567", found.release_sha);
+    try std.testing.expect(found.version == null);
+}
+
+test "manifest exposes numbered edge version" {
+    const manifest =
+        "xaq-edge-v1 0123456789abcdef0123456789abcdef01234567\n" ++
+        "version 0.1.0-edge.7 0e038f9b84ca5c860b8dd62dd9f4831e46c395d46e401fd16c2ea69e2215d9c4\n" ++
+        "xaq-linux-x86_64 xaq-linux-x86_64-0123456789abcdef0123456789abcdef01234567 abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789\n";
+    const found = try assetFromManifest(manifest, "xaq-linux-x86_64");
+    try std.testing.expectEqualStrings("0.1.0-edge.7", found.version.?);
 }
 
 test "manifest rejects mixed generations and duplicate assets" {
@@ -175,4 +251,24 @@ test "manifest rejects malformed and missing asset entries" {
 
     const missing = "xaq-edge-v1 0123456789abcdef0123456789abcdef01234567\n";
     try std.testing.expectError(error.MissingAsset, assetFromManifest(missing, "xaq-linux-x86_64"));
+
+    const malformed_version =
+        "xaq-edge-v1 0123456789abcdef0123456789abcdef01234567\n" ++
+        "version 0.1.0-edge.0 0e038f9b84ca5c860b8dd62dd9f4831e46c395d46e401fd16c2ea69e2215d9c4\n" ++
+        "xaq-linux-x86_64 xaq-linux-x86_64-0123456789abcdef0123456789abcdef01234567 abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789\n";
+    try std.testing.expectError(error.MalformedManifest, assetFromManifest(malformed_version, "xaq-linux-x86_64"));
+
+    const bad_version_digest =
+        "xaq-edge-v1 0123456789abcdef0123456789abcdef01234567\n" ++
+        "version 0.1.0-edge.7 0000000000000000000000000000000000000000000000000000000000000000\n" ++
+        "xaq-linux-x86_64 xaq-linux-x86_64-0123456789abcdef0123456789abcdef01234567 abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789\n";
+    try std.testing.expectError(error.MalformedManifest, assetFromManifest(bad_version_digest, "xaq-linux-x86_64"));
+}
+
+test "edge version validation follows release numbering" {
+    try std.testing.expect(validEdgeVersion("0.1.0-edge.1"));
+    try std.testing.expect(validEdgeVersion("12.34.56-edge.789"));
+    try std.testing.expect(!validEdgeVersion("0.1.0"));
+    try std.testing.expect(!validEdgeVersion("0.1.0-edge.0"));
+    try std.testing.expect(!validEdgeVersion("01.1.0-edge.1"));
 }

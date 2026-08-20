@@ -3,6 +3,11 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const version = b.option([]const u8, "version", "Version reported by xaq") orelse "0.1.0";
+    const git_sha = b.option([]const u8, "git-sha", "Source commit embedded in xaq") orelse "unknown";
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version);
+    build_options.addOption([]const u8, "git_sha", git_sha);
     const module = b.addModule("xaq", .{
         .root_source_file = b.path("src/embed.zig"),
         .target = target,
@@ -21,6 +26,7 @@ pub fn build(b: *std.Build) void {
             .unwind_tables = if (optimize == .ReleaseSmall) .none else null,
         }),
     });
+    exe.root_module.addOptions("build_options", build_options);
     b.installArtifact(exe);
 
     const run = b.addRunArtifact(exe);
@@ -57,6 +63,7 @@ pub fn build(b: *std.Build) void {
             .unwind_tables = .none,
         }),
     });
+    perf_target.root_module.addOptions("build_options", build_options);
     const perf_runner = b.addExecutable(.{
         .name = "xaq-perf",
         .root_module = b.createModule(.{

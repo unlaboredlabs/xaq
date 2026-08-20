@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const Io = std.Io;
 const agent = @import("agent.zig");
 const auth = @import("auth.zig");
@@ -10,7 +11,8 @@ const threads = @import("threads.zig");
 const tui = @import("tui.zig");
 const update = @import("update.zig");
 
-const version_string = "0.1.0";
+const version_string = build_options.version;
+const build_git_sha = build_options.git_sha;
 
 const OutputFormat = enum {
     plain,
@@ -255,6 +257,17 @@ fn writeStartupTime(output: *Io.Writer, elapsed_ns: i96) !void {
     try output.print("startup {d}.{d:0>2} ms", .{ hundredths / 100, hundredths % 100 });
 }
 
+fn writeUpdateSuccess(output: *Io.Writer, current_version: []const u8, status: update.Status, release_version: ?[]const u8) !void {
+    const target_version = release_version orelse current_version;
+    switch (status) {
+        .already_current => try output.print("xaq {s} is already up to date\n", .{target_version}),
+        .updated => if (release_version) |version|
+            try output.print("updated xaq {s} to {s}\n", .{ current_version, version })
+        else
+            try output.writeAll("updated xaq to the latest edge release\n"),
+    }
+}
+
 pub fn main(minimal: std.process.Init.Minimal) !void {
     const gpa = std.heap.smp_allocator;
     const early_action = findEarlyAction(minimal.args);
@@ -355,7 +368,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
     }
     if (args.len > 1 and std.mem.eql(u8, args[1], "update")) {
         if (args.len != 2) fatal(io, "update takes no arguments", .{});
-        update.run(gpa, io) catch |err| {
+        var update_result = update.run(gpa, io, build_git_sha) catch |err| {
             const message: []const u8 = switch (err) {
                 error.UnsupportedPlatform => "no edge build is available for this platform",
                 error.CurlNotFound => "curl is required to download the edge release",
@@ -371,7 +384,8 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
             errout.flush() catch {};
             std.process.exit(1);
         };
-        try output.writeAll("updated xaq to the latest edge release\n");
+        defer update_result.deinit(gpa);
+        try writeUpdateSuccess(output, version_string, update_result.status, update_result.version);
         return;
     }
 
@@ -711,6 +725,18 @@ test "startup environment keeps the last value and requires home" {
 
     const no_home = [_:null]?[*:0]const u8{"TERM=dumb"};
     try std.testing.expectError(error.HomeNotSet, scanStartupEnvironment(.{ .block = .{ .slice = &no_home } }));
+}
+
+test "update success reports numbered versions" {
+    var storage: [128]u8 = undefined;
+
+    var updated: Io.Writer = .fixed(&storage);
+    try writeUpdateSuccess(&updated, "0.1.0-edge.6", .updated, "0.1.0-edge.7");
+    try std.testing.expectEqualStrings("updated xaq 0.1.0-edge.6 to 0.1.0-edge.7\n", updated.buffered());
+
+    var current: Io.Writer = .fixed(&storage);
+    try writeUpdateSuccess(&current, "0.1.0-edge.7", .already_current, "0.1.0-edge.7");
+    try std.testing.expectEqualStrings("xaq 0.1.0-edge.7 is already up to date\n", current.buffered());
 }
 
 test "output formats parse only documented values" {

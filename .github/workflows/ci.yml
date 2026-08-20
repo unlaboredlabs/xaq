@@ -8,8 +8,42 @@ on:
 permissions:
   contents: read
 
+env:
+  EDGE_BASE_VERSION: 0.1.0
+
+concurrency:
+  group: ci-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'edge' || github.run_id }}
+  cancel-in-progress: false
+
 jobs:
+  metadata:
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    outputs:
+      publish: ${{ steps.resolve.outputs.publish }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Resolve build metadata
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          publish=true
+          version=$EDGE_BASE_VERSION
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+            publish=$(tools/check-edge-current.sh "$GITHUB_REPOSITORY" "$GITHUB_SHA")
+            if [ "$publish" = true ]; then
+              version=$(tools/next-edge-version.sh "$EDGE_BASE_VERSION" "$GITHUB_REPOSITORY" "$GITHUB_SHA")
+            else
+              printf 'Skipping stale edge run for %s\n' "$GITHUB_SHA"
+            fi
+          fi
+          printf 'publish=%s\n' "$publish" >> "$GITHUB_OUTPUT"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
   check:
+    needs: metadata
+    if: needs.metadata.outputs.publish == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -40,11 +74,14 @@ jobs:
           tests/edge_release_test.sh
           tests/install_test.sh
           tests/publish_edge_test.sh
+          tests/version_test.sh
       - name: Size and startup budget
         if: runner.os == 'Linux'
         run: zig build perf
 
   package:
+    needs: metadata
+    if: needs.metadata.outputs.publish == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -73,7 +110,7 @@ jobs:
         with:
           version: 0.16.0
       - name: Build edge package
-        run: tools/package-edge.sh "${{ matrix.platform }}" "${{ matrix.target }}" "${GITHUB_SHA}"
+        run: tools/package-edge.sh "${{ matrix.platform }}" "${{ matrix.target }}" "${GITHUB_SHA}" "${{ needs.metadata.outputs.version }}"
       - name: Upload edge binary
         uses: actions/upload-artifact@v7
         with:
@@ -90,51 +127,25 @@ jobs:
           retention-days: 1
 
   edge:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [check, package]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.metadata.outputs.publish == 'true'
+    needs: [metadata, check, package]
     runs-on: blacksmith-2vcpu-ubuntu-2404
-    env:
-      EDGE_BASE_VERSION: 0.1.0
-    concurrency:
-      group: edge
-      cancel-in-progress: false
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Check edge run freshness
-        id: edge_freshness
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          publish=$(tools/check-edge-current.sh "$GITHUB_REPOSITORY" "$GITHUB_SHA")
-          printf 'publish=%s\n' "$publish" >> "$GITHUB_OUTPUT"
-          if [ "$publish" = false ]; then
-            printf 'Skipping stale edge run for %s\n' "$GITHUB_SHA"
-          fi
       - name: Download edge builds
-        if: steps.edge_freshness.outputs.publish == 'true'
         uses: actions/download-artifact@v8
         with:
           # upload-artifact v7 names an archive:false artifact after its one file.
           pattern: xaq-*
           path: dist
           merge-multiple: true
-      - name: Choose edge version
-        if: steps.edge_freshness.outputs.publish == 'true'
-        id: edge_version
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          version=$(tools/next-edge-version.sh "$EDGE_BASE_VERSION" "$GITHUB_REPOSITORY" "$GITHUB_SHA")
-          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
       - name: Prepare edge manifest
-        if: steps.edge_freshness.outputs.publish == 'true'
-        run: tools/prepare-edge.sh dist "${GITHUB_SHA}"
+        run: tools/prepare-edge.sh dist "${GITHUB_SHA}" "${{ needs.metadata.outputs.version }}"
       - name: Publish edge release
-        if: steps.edge_freshness.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: tools/publish-edge.sh dist "${GITHUB_REPOSITORY}" "${GITHUB_SHA}" "${{ steps.edge_version.outputs.version }}"
+        run: tools/publish-edge.sh dist "${GITHUB_REPOSITORY}" "${GITHUB_SHA}" "${{ needs.metadata.outputs.version }}"

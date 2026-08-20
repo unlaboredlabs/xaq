@@ -11,6 +11,26 @@ fail() {
 
 command -v curl >/dev/null 2>&1 || fail 'curl is required'
 
+digest_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{ print $1 }'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{ print $1 }'
+    else
+        fail 'sha256sum or shasum is required'
+    fi
+}
+
+digest_text() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        printf '%s' "$1" | sha256sum | awk '{ print $1 }'
+    elif command -v shasum >/dev/null 2>&1; then
+        printf '%s' "$1" | shasum -a 256 | awk '{ print $1 }'
+    else
+        fail 'sha256sum or shasum is required'
+    fi
+}
+
 case "$(uname -s)/$(uname -m)" in
     Linux/x86_64|Linux/amd64) asset=xaq-linux-x86_64 ;;
     Linux/aarch64|Linux/arm64) asset=xaq-linux-aarch64 ;;
@@ -34,6 +54,27 @@ release_sha=$(awk 'NR == 1 && NF == 2 && $1 == "xaq-edge-v1" { print $2 }' "$dow
 [ "${#release_sha}" -eq 40 ] || fail 'edge manifest header is malformed'
 case "$release_sha" in *[!0-9a-f]*) fail 'edge manifest commit is malformed' ;; esac
 
+version_record=$(awk '
+    $1 == "version" {
+        if (NF != 3 || found) bad = 1
+        found = 1
+        value = $2 "\t" $3
+    }
+    END {
+        if (bad) exit 1
+        if (found) print value
+    }
+' "$download_dir/manifest") || fail 'edge manifest version is malformed'
+release_version=edge
+if [ -n "$version_record" ]; then
+    tab=$(printf '\t')
+    release_version=${version_record%%"$tab"*}
+    version_digest=${version_record#*"$tab"}
+    printf '%s\n' "$release_version" | awk '/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-edge\.[1-9][0-9]*$/ { found = 1 } END { exit !found }' || \
+        fail 'edge manifest version is malformed'
+    [ "$version_digest" = "$(digest_text "$release_version")" ] || fail 'edge manifest version digest is malformed'
+fi
+
 record=$(awk -v logical="$asset" '
     NR > 1 && $1 == logical {
         if (NF != 3 || found) bad = 1
@@ -54,13 +95,7 @@ case "$expected" in *[!0-9a-f]*) fail 'edge manifest checksum is malformed' ;; e
 
 curl -fsSL "$release_url/$filename" -o "$download_dir/$filename"
 
-if command -v sha256sum >/dev/null 2>&1; then
-    actual=$(sha256sum "$download_dir/$filename" | awk '{print $1}')
-elif command -v shasum >/dev/null 2>&1; then
-    actual=$(shasum -a 256 "$download_dir/$filename" | awk '{print $1}')
-else
-    fail 'sha256sum or shasum is required'
-fi
+actual=$(digest_file "$download_dir/$filename")
 [ "$actual" = "$expected" ] || fail 'downloaded edge binary failed checksum verification'
 
 mkdir -p "$install_dir"
@@ -69,7 +104,7 @@ install -m 755 "$download_dir/$filename" "$install_tmp"
 mv -f "$install_tmp" "$install_dir/xaq"
 install_tmp=
 
-printf 'installed xaq edge to %s/xaq\n' "$install_dir"
+printf 'installed xaq %s to %s/xaq\n' "$release_version" "$install_dir"
 case ":${PATH:-}:" in
     *:"$install_dir":*) ;;
     *) printf 'add %s to PATH to run xaq\n' "$install_dir" ;;

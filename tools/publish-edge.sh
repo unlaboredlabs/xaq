@@ -20,7 +20,7 @@ manifest="$dist/edge-manifest-$git_sha"
 [[ "$git_sha" =~ ^[0-9a-f]{40}$ ]] || fail 'GIT_SHA must contain 40 lowercase hexadecimal characters'
 [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-edge\.[1-9][0-9]*$ ]] || \
     fail 'VERSION must have semantic version form X.Y.Z-edge.N'
-tools/validate-edge-manifest.sh "$manifest"
+tools/validate-edge-manifest.sh "$manifest" "$version"
 
 scratch=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/xaq-edge-publish.XXXXXX")
 cleanup() {
@@ -102,7 +102,7 @@ if [[ -n "$old_ref" ]]; then
     git show "FETCH_HEAD:manifest" > "$previous_manifest"
     tools/validate-edge-manifest.sh "$previous_manifest"
 
-    awk 'NR > 1 { print $2 }' "$previous_manifest" >> "$keep"
+    awk 'NR > 1 && $1 != "version" { print $2 }' "$previous_manifest" >> "$keep"
     previous_sha=$(awk 'NR == 1 { print $2 }' "$previous_manifest")
     printf 'edge-manifest-%s\n' "$previous_sha" >> "$keep"
 
