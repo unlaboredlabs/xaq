@@ -6,7 +6,9 @@ fail() {
     exit 1
 }
 
-[ "$#" -ge 1 ] && [ "$#" -le 2 ] || fail 'usage: validate-edge-manifest.sh MANIFEST [VERSION]'
+if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+    fail 'usage: validate-edge-manifest.sh MANIFEST [VERSION]'
+fi
 manifest=$1
 expected_version=${2:-}
 [ -f "$manifest" ] || fail "missing manifest: $manifest"
