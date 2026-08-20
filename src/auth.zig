@@ -186,7 +186,7 @@ fn set(store: *Store, provider: Provider, value: Credential) void {
 
 fn requireStatus(response: transport.Response) !void {
     if (response.status < 200 or response.status >= 300) {
-        std.debug.print("provider HTTP {d}: {s}\n", .{ response.status, response.body });
+        std.debug.print("provider HTTP {d}\n", .{response.status});
         return error.ProviderRequestFailed;
     }
 }

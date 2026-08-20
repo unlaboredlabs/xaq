@@ -13,8 +13,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [blacksmith-2vcpu-ubuntu-2404, blacksmith-6vcpu-macos-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - os: linux
+            blacksmith: blacksmith-2vcpu-ubuntu-2404
+            hosted: ubuntu-latest
+          - os: macos
+            blacksmith: blacksmith-6vcpu-macos-latest
+            hosted: macos-latest
+    name: check (${{ matrix.os }})
+    # Fork PRs cannot reach org-billed Blacksmith runners; fall back to GitHub-hosted.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && matrix.hosted || matrix.blacksmith }}
     steps:
       - uses: actions/checkout@v7
       - uses: mlugg/setup-zig@v2
@@ -43,17 +51,22 @@ jobs:
         include:
           - platform: linux-x86_64
             target: x86_64-linux
-            os: blacksmith-2vcpu-ubuntu-2404
+            blacksmith: blacksmith-2vcpu-ubuntu-2404
+            hosted: ubuntu-latest
           - platform: linux-aarch64
             target: aarch64-linux
-            os: blacksmith-2vcpu-ubuntu-2404
+            blacksmith: blacksmith-2vcpu-ubuntu-2404
+            hosted: ubuntu-latest
           - platform: macos-x86_64
             target: x86_64-macos
-            os: blacksmith-6vcpu-macos-latest
+            blacksmith: blacksmith-6vcpu-macos-latest
+            hosted: macos-latest
           - platform: macos-aarch64
             target: aarch64-macos
-            os: blacksmith-6vcpu-macos-latest
-    runs-on: ${{ matrix.os }}
+            blacksmith: blacksmith-6vcpu-macos-latest
+            hosted: macos-latest
+    name: package (${{ matrix.platform }})
+    runs-on: ${{ github.event.pull_request.head.repo.fork && matrix.hosted || matrix.blacksmith }}
     steps:
       - uses: actions/checkout@v7
       - uses: mlugg/setup-zig@v2
