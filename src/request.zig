@@ -5,6 +5,8 @@ const models = @import("models.zig");
 const tools = @import("tools.zig");
 const types = @import("types.zig");
 
+const chatgpt_fast_service_tier = "priority";
+
 pub fn build(gpa: std.mem.Allocator, provider: auth.Provider, model: []const u8, effort: ?models.Effort, fast: bool, tool_options: tools.SchemaOptions, cwd: []const u8, instructions: []const u8, entries: []const types.Entry) ![]u8 {
     const write_instructions = if (!tool_options.include_builtin)
         ""
@@ -80,7 +82,7 @@ pub fn build(gpa: std.mem.Allocator, provider: auth.Provider, model: []const u8,
         if (provider == .chatgpt) {
             if (fast) {
                 try js.objectField("service_tier");
-                try js.write("fast");
+                try js.write(chatgpt_fast_service_tier);
             }
             try js.objectField("instructions");
             try js.write(system);
@@ -161,7 +163,7 @@ pub fn buildCompact(gpa: std.mem.Allocator, provider: auth.Provider, model: []co
         if (provider == .chatgpt) {
             if (fast) {
                 try js.objectField("service_tier");
-                try js.write("fast");
+                try js.write(chatgpt_fast_service_tier);
             }
             try js.objectField("instructions");
             try js.write(compact_system);
