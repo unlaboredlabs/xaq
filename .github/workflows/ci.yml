@@ -27,6 +27,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           shellcheck install.sh tools/*.sh tests/*.sh
+          tests/edge_version_test.sh
           tests/edge_release_test.sh
           tests/install_test.sh
           tests/publish_edge_test.sh
@@ -78,6 +79,8 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [check, package]
     runs-on: blacksmith-2vcpu-ubuntu-2404
+    env:
+      EDGE_BASE_VERSION: 0.1.0
     concurrency:
       group: edge
       cancel-in-progress: false
@@ -94,9 +97,16 @@ jobs:
           pattern: xaq-*
           path: dist
           merge-multiple: true
+      - name: Choose edge version
+        id: edge_version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(tools/next-edge-version.sh "$EDGE_BASE_VERSION" "$GITHUB_REPOSITORY" "$GITHUB_SHA")
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
       - name: Prepare edge manifest
         run: tools/prepare-edge.sh dist "${GITHUB_SHA}"
       - name: Publish edge release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: tools/publish-edge.sh dist "${GITHUB_REPOSITORY}" "${GITHUB_SHA}"
+        run: tools/publish-edge.sh dist "${GITHUB_REPOSITORY}" "${GITHUB_SHA}" "${{ steps.edge_version.outputs.version }}"
