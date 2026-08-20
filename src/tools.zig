@@ -8,6 +8,7 @@ pub const names = [_][]const u8{ "read", "bash", "edit", "write" };
 pub const web_names = [_][]const u8{ "web_fetch", "web_search" };
 pub const max_output = 50 * 1024;
 const output_payload = max_output - 512;
+const max_read_file_bytes = 16 * 1024 * 1024;
 const firecrawl_base_url = "https://api.firecrawl.dev/v2";
 
 /// A host-defined tool. `parameters_json` must be a JSON Schema object.
@@ -473,29 +474,52 @@ fn read(gpa: std.mem.Allocator, io: Io, args: std.json.Value, cwd: ?[]const u8) 
     const requested_path = try fieldString(args, "path");
     const resolved = try resolvePath(gpa, cwd, requested_path);
     defer resolved.deinit(gpa);
-    const bytes = try Io.Dir.cwd().readFileAlloc(io, resolved.value, gpa, .limited(16 * 1024 * 1024));
-    defer gpa.free(bytes);
     const offset: usize = @intCast(@max(optionalInt(args, "offset") orelse 1, 1));
     const limit: usize = @intCast(@max(optionalInt(args, "limit") orelse 2000, 1));
 
-    if (bytes.len == 0) return gpa.dupe(u8, "");
-    var line: usize = 1;
-    var start: usize = 0;
-    while (line < offset and start < bytes.len) : (line += 1) {
-        start = (std.mem.indexOfScalarPos(u8, bytes, start, '\n') orelse bytes.len - 1) + 1;
-    }
-    var end = start;
-    var taken: usize = 0;
-    while (taken < limit and end < bytes.len) : (taken += 1) {
-        end = (std.mem.indexOfScalarPos(u8, bytes, end, '\n') orelse bytes.len - 1) + 1;
-    }
-    const logical_end = @min(end, bytes.len);
-    end = @min(logical_end, @min(bytes.len, start + output_payload));
-    if (end == bytes.len and logical_end == bytes.len) return gpa.dupe(u8, bytes[start..end]);
-    var out: Io.Writer.Allocating = .init(gpa);
+    var file = try Io.Dir.cwd().openFile(io, resolved.value, .{});
+    defer file.close(io);
+    const stat = try file.stat(io);
+    if (stat.size > max_read_file_bytes) return error.StreamTooLong;
+
+    var read_buffer: [16 * 1024]u8 = undefined;
+    var file_reader: Io.File.Reader = .init(file, io, &read_buffer);
+    var chunk: [16 * 1024]u8 = undefined;
+    const initial_capacity: usize = @min(@as(usize, @intCast(stat.size)), output_payload);
+    var out: Io.Writer.Allocating = try .initCapacity(gpa, initial_capacity);
     defer out.deinit();
-    try out.writer.writeAll(bytes[start..end]);
-    const consumed_lines = std.mem.count(u8, bytes[start..end], "\n");
+    var source_line: usize = 1;
+    var selected_lines: usize = 0;
+    var selection_complete = false;
+    var truncated = false;
+
+    read_chunks: while (true) {
+        const count = try file_reader.interface.readSliceShort(&chunk);
+        if (count == 0) break;
+        for (chunk[0..count]) |byte| {
+            if (selection_complete) {
+                truncated = true;
+                break :read_chunks;
+            }
+            if (source_line < offset) {
+                if (byte == '\n') source_line += 1;
+                continue;
+            }
+            if (out.written().len == output_payload) {
+                truncated = true;
+                break :read_chunks;
+            }
+            try out.writer.writeByte(byte);
+            if (byte == '\n') {
+                source_line += 1;
+                selected_lines += 1;
+                if (selected_lines == limit) selection_complete = true;
+            }
+        }
+    }
+
+    if (!truncated) return out.toOwnedSlice();
+    const consumed_lines = std.mem.count(u8, out.written(), "\n");
     if (consumed_lines == 0) {
         // A single line larger than the output budget: advancing by zero
         // would make every continuation return the same prefix forever.
@@ -554,9 +578,9 @@ fn runBash(gpa: std.mem.Allocator, io: Io, command: []const u8, seconds: u64, to
     var out: Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
     if (capture.spill_path) |path| {
-        try out.writer.print("[output truncated: full output saved at {s}; showing last {d} bytes]\n", .{ path, capture.tail.items.len });
+        try out.writer.print("[output truncated: full output saved at {s}; showing last {d} bytes]\n", .{ path, capture.tailLen() });
     }
-    try out.writer.writeAll(capture.tail.items);
+    try capture.writeTail(&out.writer);
     if (timed_out.load(.seq_cst)) {
         try out.writer.print("\n[timeout after {d}s]", .{seconds});
     } else if (token.isRequested()) {
@@ -586,6 +610,7 @@ const Capture = struct {
     gpa: std.mem.Allocator,
     io: Io,
     tail: std.ArrayList(u8) = .empty,
+    tail_start: usize = 0,
     spill: ?Io.File = null,
     spill_path: ?[]u8 = null,
 
@@ -616,14 +641,29 @@ const Capture = struct {
         if (bytes.len >= output_payload) {
             self.tail.clearRetainingCapacity();
             try self.tail.appendSlice(self.gpa, bytes[bytes.len - output_payload ..]);
+            self.tail_start = 0;
             return;
         }
-        const overflow = (self.tail.items.len + bytes.len) -| output_payload;
-        if (overflow > 0) {
-            std.mem.copyForwards(u8, self.tail.items[0 .. self.tail.items.len - overflow], self.tail.items[overflow..]);
-            self.tail.items.len -= overflow;
+
+        const append_len = @min(output_payload - self.tail.items.len, bytes.len);
+        try self.tail.appendSlice(self.gpa, bytes[0..append_len]);
+        var remaining = bytes[append_len..];
+        while (remaining.len > 0) {
+            const copy_len = @min(remaining.len, output_payload - self.tail_start);
+            @memcpy(self.tail.items[self.tail_start..][0..copy_len], remaining[0..copy_len]);
+            self.tail_start = (self.tail_start + copy_len) % output_payload;
+            remaining = remaining[copy_len..];
         }
-        try self.tail.appendSlice(self.gpa, bytes);
+    }
+
+    fn tailLen(self: *const Capture) usize {
+        return self.tail.items.len;
+    }
+
+    fn writeTail(self: *const Capture, writer: *Io.Writer) !void {
+        if (self.tail_start == 0) return writer.writeAll(self.tail.items);
+        try writer.writeAll(self.tail.items[self.tail_start..]);
+        try writer.writeAll(self.tail.items[0..self.tail_start]);
     }
 
     fn startSpill(self: *Capture) !void {
@@ -637,7 +677,12 @@ const Capture = struct {
             .permissions = @enumFromInt(0o600),
         });
         errdefer file.close(self.io);
-        try file.writeStreamingAll(self.io, self.tail.items);
+        if (self.tail_start == 0) {
+            try file.writeStreamingAll(self.io, self.tail.items);
+        } else {
+            try file.writeStreamingAll(self.io, self.tail.items[self.tail_start..]);
+            try file.writeStreamingAll(self.io, self.tail.items[0..self.tail_start]);
+        }
         self.spill = file;
         self.spill_path = path;
     }
@@ -796,6 +841,65 @@ test "tool context anchors relative files and commands to its cwd" {
     const location = try executeWithContext(std.testing.allocator, std.testing.io, "bash", bash_args.value, .{ .cwd = cwd });
     defer std.testing.allocator.free(location);
     try std.testing.expect(std.mem.endsWith(u8, std.mem.trim(u8, location, "\n"), cwd));
+}
+
+test "read streams line windows without loading the whole file" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "lines.txt",
+        .data = "one\ntwo\nthree\nfour\n",
+    });
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/lines.txt", .{temporary.sub_path});
+    defer std.testing.allocator.free(path);
+    const arguments = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\",\"offset\":2,\"limit\":2}}", .{path});
+    defer std.testing.allocator.free(arguments);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, arguments, .{});
+    defer parsed.deinit();
+
+    const result = try execute(std.testing.allocator, std.testing.io, "read", parsed.value, null);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("two\nthree\n\n[truncated: continue with offset=4]", result);
+}
+
+test "read advances past a line larger than its output budget" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const contents = try std.testing.allocator.alloc(u8, output_payload + 31);
+    defer std.testing.allocator.free(contents);
+    @memset(contents, 'x');
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "long.txt", .data = contents });
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/long.txt", .{temporary.sub_path});
+    defer std.testing.allocator.free(path);
+    const arguments = try std.fmt.allocPrint(std.testing.allocator, "{{\"path\":\"{s}\"}}", .{path});
+    defer std.testing.allocator.free(arguments);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, arguments, .{});
+    defer parsed.deinit();
+
+    const result = try execute(std.testing.allocator, std.testing.io, "read", parsed.value, null);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualSlices(u8, contents[0..output_payload], result[0..output_payload]);
+    try std.testing.expect(std.mem.endsWith(u8, result, "[truncated: line 1 exceeds the output budget; offset=2 skips its remainder]"));
+}
+
+test "command capture retains its tail without shifting on every chunk" {
+    const contents = try std.testing.allocator.alloc(u8, output_payload + 19_321);
+    defer std.testing.allocator.free(contents);
+    for (contents, 0..) |*byte, index| byte.* = @intCast(index % 251);
+
+    var capture = Capture.init(std.testing.allocator, std.testing.io);
+    defer capture.deinit();
+    defer capture.discardSpill();
+    var cursor: usize = 0;
+    while (cursor < contents.len) {
+        const end = @min(contents.len, cursor + 997);
+        try capture.write(contents[cursor..end]);
+        cursor = end;
+    }
+    var tail: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer tail.deinit();
+    try capture.writeTail(&tail.writer);
+    try std.testing.expectEqualSlices(u8, contents[contents.len - output_payload ..], tail.written());
 }
 
 test "Firecrawl search results are formatted for the model" {

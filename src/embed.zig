@@ -384,7 +384,7 @@ pub const Agent = struct {
         var round: usize = 1;
         while (round <= self.max_tool_rounds) : (round += 1) {
             if (self.cancellation.isRequested()) return self.cancelled();
-            const answer = self.performRound(round, output) catch |err| {
+            const answer = self.performRound(round, output, prompt_allocator) catch |err| {
                 if (err == error.Cancelled) return self.cancelled();
                 return err;
             };
@@ -405,7 +405,7 @@ pub const Agent = struct {
             }
 
             tool_calls += answer.calls.len;
-            const results = try self.arena.allocator().alloc(ToolResult, answer.calls.len);
+            const results = try prompt_allocator.alloc(ToolResult, answer.calls.len);
             if (round == self.max_tool_rounds) {
                 for (answer.calls, 0..) |call, index| {
                     try self.emit(.{ .tool_skipped = call });
@@ -429,7 +429,7 @@ pub const Agent = struct {
                 try self.emit(.{ .tool_start = call });
                 results[index] = .{
                     .id = call.id,
-                    .text = try self.executeTool(call),
+                    .text = try self.executeTool(call, prompt_allocator),
                 };
                 try self.emit(.{ .tool_finish = .{ .call = call, .result = results[index].text } });
             }
@@ -458,7 +458,7 @@ pub const Agent = struct {
         if (self.events) |sink| try sink.emit(sink.context, event);
     }
 
-    fn performRound(self: *Agent, round: usize, output: *Io.Writer) !Assistant {
+    fn performRound(self: *Agent, round: usize, output: *Io.Writer, persist: std.mem.Allocator) !Assistant {
         var request_arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer request_arena.deinit();
         const body = try request_builder.build(
@@ -486,9 +486,10 @@ pub const Agent = struct {
             var decoder = stream.Decoder.init(
                 self.provider,
                 self.gpa,
-                self.arena.allocator(),
+                persist,
                 .{ .context = &delta_sink, .on_delta = emitDelta },
             );
+            defer decoder.deinit();
             const response = try self.send(request_arena.allocator(), credential, body, &decoder);
             defer request_arena.allocator().free(response.body);
             if (self.cancellation.isRequested()) return error.Cancelled;
@@ -558,19 +559,19 @@ pub const Agent = struct {
         };
     }
 
-    fn executeTool(self: *Agent, call: ToolCall) ![]const u8 {
+    fn executeTool(self: *Agent, call: ToolCall, persist: std.mem.Allocator) ![]const u8 {
         var scratch: std.heap.ArenaAllocator = .init(self.gpa);
         defer scratch.deinit();
         const allocator = scratch.allocator();
         var parsed = std.json.parseFromSlice(std.json.Value, allocator, call.arguments, .{}) catch |err|
-            return self.arena.allocator().dupe(u8, try std.fmt.allocPrint(allocator, "invalid tool arguments: {s}", .{@errorName(err)}));
+            return persist.dupe(u8, try std.fmt.allocPrint(allocator, "invalid tool arguments: {s}", .{@errorName(err)}));
         defer parsed.deinit();
 
         const custom = isCustomTool(self.tool_definitions, call.name);
         if (self.permissions) |permissions| {
             if (!try permissions.authorize(permissions.context, call, parsed.value, self.local_tools and isBuiltinTool(call.name))) {
                 try self.emit(.{ .tool_denied = call });
-                return self.arena.allocator().dupe(u8, "tool denied by host");
+                return persist.dupe(u8, "tool denied by host");
             }
         }
 
@@ -586,10 +587,10 @@ pub const Agent = struct {
             }) catch |err| try std.fmt.allocPrint(allocator, "tool error: {s}", .{@errorName(err)})
         else
             try std.fmt.allocPrint(allocator, "unknown tool: {s}", .{call.name});
-        if (result.len <= tool_runtime.max_output) return self.arena.allocator().dupe(u8, result);
+        if (result.len <= tool_runtime.max_output) return persist.dupe(u8, result);
         const suffix = "\n[host tool result truncated]";
         const keep = tool_runtime.max_output - suffix.len;
-        var bounded: Io.Writer.Allocating = .init(self.arena.allocator());
+        var bounded: Io.Writer.Allocating = .init(persist);
         try bounded.writer.writeAll(result[0..keep]);
         try bounded.writer.writeAll(suffix);
         return bounded.toOwnedSlice();
@@ -970,9 +971,23 @@ test "provider failures preserve diagnostics and roll back the turn" {
     try std.testing.expectEqual(@as(?u16, 403), embedded.last_http_status);
 }
 
-test "failed prompts release copied image payloads" {
+test "failed prompts release copied image and streamed response payloads" {
     const Fake = struct {
-        fn post(_: ?*anyopaque, gpa: std.mem.Allocator, _: Io, _: Request, _: ?*anyopaque, _: StreamLineFn) !Response {
+        fn post(_: ?*anyopaque, gpa: std.mem.Allocator, _: Io, _: Request, line_context: ?*anyopaque, on_line: StreamLineFn) !Response {
+            const delta = try gpa.alloc(u8, 512 * 1024);
+            defer gpa.free(delta);
+            @memset(delta, 'A');
+            var line: Io.Writer.Allocating = .init(gpa);
+            defer line.deinit();
+            var js: std.json.Stringify = .{ .writer = &line.writer };
+            try line.writer.writeAll("data: ");
+            try js.beginObject();
+            try js.objectField("type");
+            try js.write("response.output_text.delta");
+            try js.objectField("delta");
+            try js.write(delta);
+            try js.endObject();
+            try on_line(line_context, line.written());
             return .{ .status = 500, .body = try gpa.dupe(u8, "failed") };
         }
     };
@@ -995,7 +1010,7 @@ test "failed prompts release copied image payloads" {
     try std.testing.expectError(error.ProviderRequestFailed, embedded.prompt("inspect", .{ .images = &.{image} }));
     try std.testing.expectEqual(@as(usize, 0), embedded.history().len);
     try std.testing.expectEqual(@as(usize, 0), embedded.prompt_arenas.items.len);
-    try std.testing.expect(embedded.arena.queryCapacity() - base_capacity < payload.len);
+    try std.testing.expect(embedded.arena.queryCapacity() - base_capacity < 64 * 1024);
 }
 
 test "transport cancellation emits an event and rolls back the turn" {

@@ -136,7 +136,7 @@ const Session = struct {
     events: ?EventSink = null,
     subagent_manager: ?subagents.Manager = null,
     subagent_control: ?[]const u8 = null,
-    subagent_control_seen: usize = 0,
+    subagent_control_offset: u64 = 0,
 
     fn allocator(self: *Session) std.mem.Allocator {
         return self.arena.allocator();
@@ -756,20 +756,34 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
 /// file. Each message becomes a normal user entry before the next model turn.
 fn consumeSteering(session: *Session) !usize {
     const path = session.subagent_control orelse return 0;
-    const bytes = Io.Dir.cwd().readFileAlloc(session.io, path, session.gpa, .limited(1024 * 1024)) catch |err| switch (err) {
+    var file = Io.Dir.cwd().openFile(session.io, path, .{}) catch |err| switch (err) {
         error.FileNotFound => return 0,
         else => return err,
     };
+    defer file.close(session.io);
+    const stat = try file.stat(session.io);
+    if (stat.size > 1024 * 1024) return error.StreamTooLong;
+    if (session.subagent_control_offset > stat.size) session.subagent_control_offset = 0;
+    const unread: usize = @intCast(stat.size - session.subagent_control_offset);
+    if (unread == 0) return 0;
+    const bytes = try session.gpa.alloc(u8, unread);
     defer session.gpa.free(bytes);
-    var seen: usize = 0;
+    var read_buffer: [8192]u8 = undefined;
+    var reader: Io.File.Reader = .init(file, session.io, &read_buffer);
+    try reader.seekTo(session.subagent_control_offset);
+    try reader.interface.readSliceAll(bytes);
+
     var added: usize = 0;
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        if (seen < session.subagent_control_seen) {
-            seen += 1;
+    var consumed: usize = 0;
+    while (consumed < bytes.len) {
+        const end = std.mem.indexOfScalarPos(u8, bytes, consumed, '\n') orelse break;
+        const line = bytes[consumed..end];
+        const next = end + 1;
+        if (line.len == 0) {
+            consumed = next;
             continue;
         }
+        consumed = next;
         var parsed = std.json.parseFromSlice(std.json.Value, session.gpa, line, .{}) catch continue;
         defer parsed.deinit();
         const message = switch (parsed.value) {
@@ -777,10 +791,9 @@ fn consumeSteering(session: *Session) !usize {
             else => continue,
         };
         try session.appendUser(message);
-        seen += 1;
         added += 1;
     }
-    session.subagent_control_seen = seen;
+    session.subagent_control_offset += consumed;
     return added;
 }
 
@@ -2393,6 +2406,7 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
         const credential = try auth.credential(credential_arena.allocator(), session.io, session.home, session.provider);
         const compacting = std.mem.eql(u8, kind, "compact");
         var decoder = Decoder.init(session.provider, session.gpa, session.allocator(), output, if (compacting) null else session.events);
+        defer decoder.deinit();
         // A continuously animated placeholder covers the wait; it runs on
         // its own Io task, so it keeps moving even while the provider is
         // silent. Main rounds stop it just before the first visible
@@ -2578,6 +2592,10 @@ const Decoder = struct {
             .on_output = onOutput,
             .on_delta = onDelta,
         };
+    }
+
+    fn deinit(self: *Decoder) void {
+        self.core.deinit();
     }
 
     fn onOutput(raw: ?*anyopaque) !void {
@@ -2868,6 +2886,7 @@ test "decode Responses SSE" {
     var buffer: [128]u8 = undefined;
     var writer: Io.Writer = .fixed(&buffer);
     var decoder = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), &writer, null);
+    defer decoder.deinit();
     try decoder.feed("data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}");
     try decoder.feed("data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}");
     try decoder.feed("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":3},\"output_tokens\":5}}}");
@@ -2886,6 +2905,7 @@ test "decode Anthropic SSE" {
     var buffer: [128]u8 = undefined;
     var writer: Io.Writer = .fixed(&buffer);
     var decoder = Decoder.init(.claude, std.testing.allocator, arena.allocator(), &writer, null);
+    defer decoder.deinit();
     try decoder.feed("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}");
     try decoder.feed("data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"bash\",\"input\":{}}}");
     try decoder.feed("data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"pwd\\\"}\"}}");
@@ -2906,6 +2926,7 @@ test "stream decoder renders each Responses delta immediately" {
     var buffer: [128]u8 = undefined;
     var writer: Io.Writer = .fixed(&buffer);
     var decoder = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), &writer, null);
+    defer decoder.deinit();
     try decoder.feed("data: {\"type\":\"response.output_text.delta\",\"delta\":\"one\"}");
     try std.testing.expectEqualStrings("one", writer.buffered());
     try decoder.feed("data: {\"type\":\"response.output_text.delta\",\"delta\":\" two\"}");
@@ -2920,6 +2941,7 @@ test "interrupted stream keeps partial decoder output and stop reason" {
     var buffer: [128]u8 = undefined;
     var writer: Io.Writer = .fixed(&buffer);
     var decoder = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), &writer, null);
+    defer decoder.deinit();
     try decoder.feed("data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}");
 
     const result = (try interruptedRound(&decoder, false, error.TransportFailed)).?;
@@ -2938,6 +2960,7 @@ test "stream decoder identifies event sink failures as local" {
     var buffer: [128]u8 = undefined;
     var writer: Io.Writer = .fixed(&buffer);
     var decoder = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), &writer, .{ .emit = rejectTextDelta });
+    defer decoder.deinit();
 
     try std.testing.expectError(
         error.EventRejected,

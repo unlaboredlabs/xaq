@@ -20,7 +20,7 @@ const StreamingClaudeCall = struct {
 
 pub const Decoder = struct {
     provider: auth.Provider,
-    parse_gpa: std.mem.Allocator,
+    parse_arena: std.heap.ArenaAllocator,
     persist: std.mem.Allocator,
     hooks: Hooks,
     text: Io.Writer.Allocating,
@@ -33,11 +33,15 @@ pub const Decoder = struct {
     pub fn init(provider: auth.Provider, parse_gpa: std.mem.Allocator, persist: std.mem.Allocator, hooks: Hooks) Decoder {
         return .{
             .provider = provider,
-            .parse_gpa = parse_gpa,
+            .parse_arena = .init(parse_gpa),
             .persist = persist,
             .hooks = hooks,
             .text = .init(persist),
         };
+    }
+
+    pub fn deinit(self: *Decoder) void {
+        self.parse_arena.deinit();
     }
 
     fn beforeOutput(self: *Decoder) !void {
@@ -56,12 +60,14 @@ pub const Decoder = struct {
         if (!std.mem.startsWith(u8, line, "data:")) return;
         const data = std.mem.trimStart(u8, line[5..], " ");
         if (std.mem.eql(u8, data, "[DONE]") or data.len == 0) return;
-        var parsed = std.json.parseFromSlice(std.json.Value, self.parse_gpa, data, .{}) catch return;
-        defer parsed.deinit();
+        // Event values are only borrowed for this call. Reusing the arena
+        // avoids allocator churn across the many events in one response.
+        _ = self.parse_arena.reset(.{ .retain_with_limit = 256 * 1024 });
+        const parsed = std.json.parseFromSliceLeaky(std.json.Value, self.parse_arena.allocator(), data, .{}) catch return;
         if (self.provider == .claude) {
-            try self.feedClaude(parsed.value, data);
+            try self.feedClaude(parsed, data);
         } else {
-            try self.feedResponses(parsed.value, data);
+            try self.feedResponses(parsed, data);
         }
     }
 
@@ -198,6 +204,7 @@ test "decodes Responses text, calls, and usage" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var decoder = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), .{});
+    defer decoder.deinit();
     try decoder.feed("data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}");
     try decoder.feed("data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read\",\"arguments\":\"{}\"}}");
     try decoder.feed("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"input_tokens_details\":{\"cached_tokens\":3},\"output_tokens\":5}}}");
@@ -213,6 +220,7 @@ test "decodes Anthropic fragmented tool input" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var decoder = Decoder.init(.claude, std.testing.allocator, arena.allocator(), .{});
+    defer decoder.deinit();
     try decoder.feed("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}");
     try decoder.feed("data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"bash\",\"input\":{}}}");
     try decoder.feed("data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"pwd\\\"}\"}}");

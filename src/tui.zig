@@ -98,6 +98,10 @@ var input_cursor_col: usize = 0;
 // repaints can show an ellipsis instead of pretending the line is whole.
 var lines: [max_lines][]u8 = undefined;
 var lines_truncated: [max_lines]bool = undefined;
+var line_layouts: [max_lines]LineLayout = undefined;
+var line_layout_ptrs: [max_lines]usize = @splat(0);
+var line_layout_lengths: [max_lines]usize = @splat(0);
+var layout_cache_width: ?usize = null;
 var line_start: usize = 0;
 var line_count: usize = 0;
 var current: [max_line_bytes]u8 = undefined;
@@ -617,11 +621,38 @@ fn lineLayout(text: []const u8) LineLayout {
     return result;
 }
 
+fn invalidateLayoutCache() void {
+    layout_cache_width = null;
+}
+
+fn cacheLineLayout(slot: usize) void {
+    const text = lines[slot];
+    line_layouts[slot] = lineLayout(text);
+    line_layout_ptrs[slot] = @intFromPtr(text.ptr);
+    line_layout_lengths[slot] = text.len;
+}
+
+fn ensureLayoutCache() void {
+    const width = contentWidth();
+    var index: usize = 0;
+    while (index < line_count) : (index += 1) {
+        const slot = (line_start + index) % max_lines;
+        if (layout_cache_width != width or
+            line_layout_ptrs[slot] != @intFromPtr(lines[slot].ptr) or
+            line_layout_lengths[slot] != lines[slot].len)
+        {
+            cacheLineLayout(slot);
+        }
+    }
+    layout_cache_width = width;
+}
+
 fn visualRowCount() usize {
+    ensureLayoutCache();
     var count: usize = 0;
     var i: usize = 0;
     while (i < line_count) : (i += 1) {
-        count += lineLayout(lines[(line_start + i) % max_lines]).rows;
+        count += line_layouts[(line_start + i) % max_lines].rows;
     }
     // The live insertion line remains part of the viewport when empty. This
     // prevents the next streamed byte from overwriting the last committed row.
@@ -629,7 +660,7 @@ fn visualRowCount() usize {
     return count;
 }
 
-fn clampViewState() void {
+fn clampViewState(total_rows: usize) void {
     if (!layout_ready) {
         popup_rows = 0;
         scroll_offset = 0;
@@ -637,15 +668,13 @@ fn clampViewState() void {
     }
     popup_rows = @min(popup_rows, regionHeight() -| 1);
     const visible = viewportHeight();
-    scroll_offset = @min(scroll_offset, visualRowCount() -| visible);
+    scroll_offset = @min(scroll_offset, total_rows -| visible);
 }
 
-/// Render one logical line into the requested visual-row window. Stored
-/// history contains only SGR escapes, so forwarding them while skipped keeps
-/// style state correct when the viewport begins in the middle of a wrap.
-fn renderLogicalLine(out: *Io.Writer, text: []const u8, truncated: bool, base_row: usize, first_row: usize, end_row: usize) !usize {
+/// Render one logical line into the requested visual-row window.
+fn renderLogicalLine(out: *Io.Writer, text: []const u8, truncated: bool, layout: LineLayout, base_row: usize, first_row: usize, end_row: usize) !usize {
     const width = contentWidth();
-    const layout = lineLayout(text);
+    if (base_row + layout.rows <= first_row or base_row >= end_row) return base_row + layout.rows;
     var row_offset: usize = 0;
     var column: usize = 0;
     var positioned = false;
@@ -693,9 +722,9 @@ fn renderLogicalLine(out: *Io.Writer, text: []const u8, truncated: bool, base_ro
 /// leaving room for an overlay and preserving a blank live insertion row.
 fn repaint() !void {
     if (!layout_ready) return;
-    clampViewState();
-    const capacity = viewportHeight();
     const total = visualRowCount();
+    clampViewState(total);
+    const capacity = viewportHeight();
     const end = total - scroll_offset;
     const begin = end -| capacity;
     // Absolute positioning ignores the scroll region, so rows are
@@ -704,15 +733,16 @@ fn repaint() !void {
     while (row <= regionBottom()) : (row += 1) {
         try sink.print("\x1b[{d};1H\x1b[2K", .{row});
     }
+    try sink.writeAll("\x1b[0m");
     var virtual_row: usize = 0;
     var index: usize = 0;
     while (index < line_count) : (index += 1) {
         const slot = (line_start + index) % max_lines;
-        virtual_row = try renderLogicalLine(sink, lines[slot], lines_truncated[slot], virtual_row, begin, end);
+        virtual_row = try renderLogicalLine(sink, lines[slot], lines_truncated[slot], line_layouts[slot], virtual_row, begin, end);
     }
-    _ = try renderLogicalLine(sink, current[0..current_len], current_truncated, virtual_row, begin, end);
+    const current_layout = lineLayout(current[0..current_len]);
+    _ = try renderLogicalLine(sink, current[0..current_len], current_truncated, current_layout, virtual_row, begin, end);
     if (scroll_offset == 0) {
-        const current_layout = lineLayout(current[0..current_len]);
         region_row = regionTop() + @min(total - 1 - begin, capacity - 1);
         region_col = contentLeft() + current_layout.column;
     } else {
@@ -742,6 +772,7 @@ fn resizeMeasured(size: ?term.WindowSize) bool {
         if (rows != measured.rows or cols != measured.cols) {
             rows = measured.rows;
             cols = measured.cols;
+            invalidateLayoutCache();
             layout_dirty = true;
             changed = true;
         }
@@ -749,10 +780,11 @@ fn resizeMeasured(size: ?term.WindowSize) bool {
     if (!layout_dirty) return false;
 
     layout_ready = rows >= min_rows and cols >= min_cols;
-    clampViewState();
     if (!layout_ready) {
+        clampViewState(0);
         drawSuspended() catch return changed;
     } else {
+        clampViewState(visualRowCount());
         // Clearing first removes stale cells exposed by a grow and stale
         // chrome from the old coordinates after a shrink.
         sink.writeAll("\x1b[r\x1b[2J") catch return changed;
@@ -1367,6 +1399,7 @@ fn commit() void {
     const slot = (line_start + line_count) % max_lines;
     lines[slot] = copy;
     lines_truncated[slot] = current_truncated;
+    if (layout_cache_width == contentWidth()) cacheLineLayout(slot);
     current_truncated = false;
     line_count += 1;
 }
