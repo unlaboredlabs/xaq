@@ -1,10 +1,10 @@
 # xaq
 
-**A coding agent in 540 KiB, taking prompts 3 ms after you hit Enter.**
+**A coding agent in 540 KiB, taking prompts 3.14 ms after you hit Enter.**
 
 `xaq` is a single binary that talks straight to your ChatGPT, Claude, and Grok subscriptions. Nothing runs between your terminal and the model: no daemon, no proxy server, no package runtime, no plugin system. The agent gets one conversation and four local tools. Written in Zig, inspired by [Vercel's `fx`](https://github.com/vercel-labs/fx) and [Pi](https://github.com/earendil-works/pi).
 
-<sub>540 KiB and 3 ms measured on Linux, ReleaseSmall, warm cache. Run `zig build perf` to get your own numbers.</sub>
+<sub>540 KiB and 3.14 ms measured on Linux, ReleaseSmall, warm cache. Run `zig build perf` to get your own numbers.</sub>
 
 > [!WARNING]
 > `xaq` has the full permissions of the user who runs it. It can execute commands and read, create, or overwrite any accessible file. There is no approval prompt or internal sandbox. Use a container or restricted account when you need isolation.
