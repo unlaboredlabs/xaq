@@ -12,6 +12,7 @@ const models = @import("models.zig");
 const request = @import("request.zig");
 const settings_mod = @import("settings.zig");
 const spin = @import("spin.zig");
+const state_mod = @import("state.zig");
 const stream_decoder = @import("stream.zig");
 const subagents = @import("subagents.zig");
 const term = @import("term.zig");
@@ -1085,6 +1086,7 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
         } else {
             const was_fast = session.fast;
             try session.setModel(args);
+            persistSelection(session);
             try output.print("model set to {s}\n", .{session.model});
             if (was_fast and !session.fast) try output.writeAll("fast mode turned off; this model does not support it\n");
         },
@@ -1106,6 +1108,7 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
                 return true;
             };
             try session.setEffort(value);
+            persistSelection(session);
             try output.print("effort set to {s}\n", .{if (value) |effort| @tagName(effort) else "provider-default"});
         },
         .fast => {
@@ -1130,6 +1133,7 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
                 return true;
             }
             try session.setFast(enabled);
+            persistSelection(session);
             try output.print("fast mode {s}\n", .{if (enabled) "on" else "off"});
         },
         .verbose => {
@@ -1404,6 +1408,7 @@ fn pickModel(session: *Session, reader: *Io.Reader) !void {
         if (!std.mem.eql(u8, selected_model, session.model)) try session.setModel(selected_model);
         if (session.effort != preferences.effort) try session.setEffort(preferences.effort);
         if (session.fast != preferences.fast) try session.setFast(preferences.fast);
+        persistSelection(session);
         log.logf("agent", "event=model model={s}", .{session.model});
         if (models.supportsFast(session.provider, session.model)) {
             try output.print("model {s} \u{b7} effort {s} \u{b7} {s}\n", .{
@@ -1473,6 +1478,7 @@ fn pickEffort(session: *Session, reader: *Io.Reader) !void {
     if (try input_mod.pick(reader, session.output, labels[0..count], initial)) |index| {
         const value: ?Effort = if (index == 0) null else models.efforts(session.provider, session.model)[index - 1];
         try session.setEffort(value);
+        persistSelection(session);
         try session.output.print("effort {s}\n", .{labels[index]});
     } else {
         try session.output.print("effort {s} (unchanged)\n", .{if (session.effort) |effort| @tagName(effort) else "provider-default"});
@@ -1513,6 +1519,33 @@ fn printSettings(session: *Session) !void {
 
 fn saveSettings(session: *Session) !void {
     try settings_mod.save(session.gpa, session.io, session.home, session.settings.value);
+}
+
+/// Remember the tuple the user just confirmed so the next fresh session
+/// starts from it. Only explicit interactive selections land here: CLI
+/// flags and resumed threads are per-invocation and must not overwrite the
+/// preference. Ephemeral (--no-save) sessions leave no trace, and subagent
+/// workers must not clobber the interactive user's choice. State is
+/// cache-like, so a failed write degrades to a log line, not an error.
+fn persistSelection(session: *Session) void {
+    if (!session.save_thread or session.subagent_control != null) return;
+    writeSelection(session) catch |err| {
+        log.logf("agent", "event=state_save_failed error={s}", .{@errorName(err)});
+    };
+}
+
+fn writeSelection(session: *Session) !void {
+    // Reload before writing so a parallel session's selections for other
+    // providers survive; last writer wins only on the shared fields.
+    var loaded = try state_mod.load(session.gpa, session.io, session.home);
+    defer loaded.deinit();
+    loaded.value.provider = session.provider;
+    loaded.value.setSelection(session.provider, .{
+        .model = session.model,
+        .effort = session.effort,
+        .fast = session.fast,
+    });
+    try state_mod.save(session.gpa, session.io, session.home, loaded.value);
 }
 
 fn pickSettings(session: *Session, reader: *Io.Reader) !void {

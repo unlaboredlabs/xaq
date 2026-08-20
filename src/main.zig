@@ -6,6 +6,7 @@ const auth = @import("auth.zig");
 const image_input = @import("image.zig");
 const input_mod = @import("input.zig");
 const log = @import("log.zig");
+const state_mod = @import("state.zig");
 const term = @import("term.zig");
 const threads = @import("threads.zig");
 const tui = @import("tui.zig");
@@ -46,9 +47,42 @@ const usage =
     \\ctrl-d leaves.
     \\Use --no-save for an interactive conversation that stays in memory.
     \\Output formats for one-shot runs: plain (default), json, streaming-json.
-    \\Defaults: provider=chatgpt; model follows the provider.
+    \\Defaults: the last selection made interactively via /model, /effort,
+    \\or /fast (initially provider=chatgpt with its default model); flags
+    \\override for one invocation without changing what is remembered.
     \\
 ;
+
+const ResolvedSelection = struct {
+    model: ?[]const u8,
+    effort: ?agent.Effort,
+    fast: bool,
+};
+
+/// Flags beat memory; memory beats built-in defaults. The remembered effort
+/// and fast flag belong to the remembered model, so an explicit --model
+/// keeps them out of the resolution.
+fn applyRememberedSelection(remembered: ?state_mod.Selection, model: ?[]const u8, effort: ?agent.Effort, fast: bool) ResolvedSelection {
+    const as_given: ResolvedSelection = .{ .model = model, .effort = effort, .fast = fast };
+    if (model != null) return as_given;
+    const selection = remembered orelse return as_given;
+    return .{
+        .model = selection.model,
+        .effort = effort orelse selection.effort,
+        .fast = fast or selection.fast,
+    };
+}
+
+/// A remembered provider whose login has since been removed must not turn
+/// every new session into a startup error; prefer a still-connected one.
+/// Credential-store read failures fall through to the remembered choice.
+fn connectedProvider(gpa: std.mem.Allocator, io: Io, home: []const u8, last: auth.Provider) auth.Provider {
+    if (auth.isLoggedIn(gpa, io, home, last) catch true) return last;
+    for (std.enums.values(auth.Provider)) |candidate| {
+        if (auth.isLoggedIn(gpa, io, home, candidate) catch false) return candidate;
+    }
+    return last;
+}
 
 /// Options whose next argument is a value, for the help/version pre-scan.
 fn takesValue(argument: []const u8) bool {
@@ -389,7 +423,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
         return;
     }
 
-    var provider: auth.Provider = .chatgpt;
+    var provider_arg: ?auth.Provider = null;
     var model: ?[]const u8 = null;
     var effort: ?agent.Effort = null;
     var fast = false;
@@ -409,7 +443,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
         if (std.mem.eql(u8, args[i], "--provider")) {
             i += 1;
             if (i >= args.len) fatal(io, "--provider needs a value", .{});
-            provider = auth.Provider.parse(args[i]) orelse
+            provider_arg = auth.Provider.parse(args[i]) orelse
                 fatal(io, "unknown provider '{s}' (chatgpt, claude, or grok)", .{args[i]});
         } else if (std.mem.eql(u8, args[i], "--model")) {
             i += 1;
@@ -471,6 +505,22 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
         } else {
             fatal(io, "unexpected argument '{s}' (prompt already given)", .{args[i]});
         }
+    }
+
+    // Fresh sessions start from the last explicit interactive selection.
+    // Flags override without changing the memory, and a resumed thread
+    // restores its own model/effort/fast, so memory stays out of resumes.
+    var remembered = try state_mod.load(gpa, io, home);
+    defer remembered.deinit();
+    var provider: auth.Provider = provider_arg orelse .chatgpt;
+    if (resume_id == null) {
+        if (provider_arg == null) {
+            if (remembered.value.provider) |last| provider = connectedProvider(gpa, io, home, last);
+        }
+        const resolved = applyRememberedSelection(remembered.value.selection(provider), model, effort, fast);
+        model = resolved.model;
+        effort = resolved.effort;
+        fast = resolved.fast;
     }
 
     const stdin_tty = Io.File.stdin().isTty(io) catch false;
@@ -674,6 +724,7 @@ test {
     _ = @import("models.zig");
     _ = @import("settings.zig");
     _ = @import("spin.zig");
+    _ = @import("state.zig");
     _ = @import("term.zig");
     _ = @import("tools.zig");
     _ = @import("transport.zig");
@@ -707,6 +758,35 @@ test "early action preserves option-value and delimiter semantics" {
 
     const empty = [_][*:0]const u8{};
     try std.testing.expectEqual(EarlyAction.invalid_arguments, findEarlyAction(.{ .vector = &empty }));
+}
+
+test "remembered selection yields to flags and fills unset dimensions" {
+    const remembered: state_mod.Selection = .{ .model = "claude-fable-5", .effort = .high, .fast = true };
+
+    // No flags: the whole remembered tuple applies.
+    const from_memory = applyRememberedSelection(remembered, null, null, false);
+    try std.testing.expectEqualStrings("claude-fable-5", from_memory.model.?);
+    try std.testing.expectEqual(agent.Effort.high, from_memory.effort.?);
+    try std.testing.expect(from_memory.fast);
+
+    // --model pins the whole tuple to the flags; remembered effort/fast
+    // belong to the remembered model and must not leak onto another one.
+    const flagged_model = applyRememberedSelection(remembered, "claude-sonnet-5", null, false);
+    try std.testing.expectEqualStrings("claude-sonnet-5", flagged_model.model.?);
+    try std.testing.expectEqual(null, flagged_model.effort);
+    try std.testing.expect(!flagged_model.fast);
+
+    // --effort overrides just that dimension of the remembered tuple.
+    const flagged_effort = applyRememberedSelection(remembered, null, .low, false);
+    try std.testing.expectEqualStrings("claude-fable-5", flagged_effort.model.?);
+    try std.testing.expectEqual(agent.Effort.low, flagged_effort.effort.?);
+    try std.testing.expect(flagged_effort.fast);
+
+    // Nothing remembered: flags pass through untouched.
+    const no_memory = applyRememberedSelection(null, null, .medium, true);
+    try std.testing.expectEqual(null, no_memory.model);
+    try std.testing.expectEqual(agent.Effort.medium, no_memory.effort.?);
+    try std.testing.expect(no_memory.fast);
 }
 
 test "startup environment keeps the last value and requires home" {

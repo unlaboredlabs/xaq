@@ -101,6 +101,12 @@ pub fn validFirecrawlApiKey(key: []const u8) bool {
 pub fn save(gpa: std.mem.Allocator, io: Io, home: []const u8, value: Config) !void {
     const path = try pathFor(gpa, home);
     defer gpa.free(path);
+    try saveJsonFile(gpa, io, path, value);
+}
+
+/// Atomically replace `path` (absolute) with pretty-printed JSON: exclusive
+/// temp file, fsync, rename. Shared by settings and cross-session state.
+pub fn saveJsonFile(gpa: std.mem.Allocator, io: Io, path: []const u8, value: anytype) !void {
     if (std.fs.path.dirname(path)) |parent| try Io.Dir.cwd().createDirPath(io, parent);
 
     var out: Io.Writer.Allocating = .init(gpa);
