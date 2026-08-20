@@ -61,9 +61,12 @@ Start an interactive session:
 
 ```sh
 xaq
+xaq 'summarize this repository'
 xaq --provider claude
 xaq --provider grok
 ```
+
+A positional prompt opens the interactive session and submits the first turn immediately.
 
 On a capable terminal, `xaq` opens a compact fullscreen view with a scrolling transcript, fixed prompt, status bars, command completion, and thread picker. While the agent is running, Enter steers it at the next safe model boundary and Alt+Enter queues a follow-up for after the current exchange. Both queues are FIFO; the status bar shows their pending counts. Mid-run input is a fullscreen feature; `--plain` and `XAQ_PLAIN=1` retain terminal type-ahead. Up and Down search prompt history using the text already typed, and Down restores the draft after the newest match. `ctrl-c` clears the prompt or interrupts active work; `ctrl-d` exits.
 
@@ -98,9 +101,9 @@ Type `/` to browse local commands:
 Run one prompt without opening a session:
 
 ```sh
-xaq 'summarize this repository'
+xaq -p 'summarize this repository'
 xaq --provider grok -p 'find and fix the failing test'
-git diff | xaq 'review this patch'
+git diff | xaq -p 'review this patch'
 ```
 
 Attach images with `-i` or `--image`. Repeat the option to send up to four images with one prompt:
@@ -112,12 +115,12 @@ xaq -i before.png -i after.png 'compare these layouts'
 
 In an interactive session, press `Ctrl-V` to attach an image from the desktop clipboard, or drop an image file into the prompt. Attached paths collapse to numbered markers such as `[Image #1]`. Linux clipboard paste uses `wl-paste` or `xclip`; dropped paths work without either utility. You can also type a path, prefixing a relative path with `@` when it could be mistaken for normal text, such as `@screenshots/error.png`. PNG, JPEG, GIF, and WebP files up to 5 MiB each are supported. Grok accepts PNG and JPEG only. Image attachments are saved in thread history, so resumed conversations keep them.
 
-When plain one-shot stdout is piped or redirected, it contains only the answer and tool traces go to stderr. On a terminal, a plain one-shot writes both to stdout. A bare argument and `-p PROMPT` are equivalent; use `--` before a prompt that starts with `-`.
+Use `-p PROMPT` or `--prompt PROMPT` for a one-shot run. Piped stdin also selects one-shot mode and combines its contents with the option prompt. When stdout is piped or redirected, it contains only the answer and tool traces go to stderr. On a terminal, a plain one-shot writes both to stdout. Use `--` before a positional prompt that starts with `-`.
 
 Use `--output-format json` when a script needs the final answer and run metadata as one JSON object:
 
 ```sh
-xaq --output-format json 'review the staged changes' | jq -r '.text'
+xaq --output-format json -p 'review the staged changes' | jq -r '.text'
 ```
 
 The object includes `text`, `stop_reason`, `provider`, `model`, `thread_id`, token `usage`, `num_turns`, and `tool_calls`. `stop_reason` is `completed` unless a transport failure leaves a saved partial answer, which reports `stream_interrupted`. Use `--output-format streaming-json` for live JSONL events. Its event types are `start`, `turn_start`, `text`, `tool_call`, `tool_result`, `usage`, `end`, and `error`; `end` is the authoritative final result. Structured formats work only on one-shot runs and keep tool traces on stderr.

@@ -37,10 +37,11 @@ const usage =
     \\  xaq --version
     \\
     \\Attach up to four PNG, JPEG, GIF, or WebP files with repeated
-    \\-i/--image options. A PROMPT argument (or -p PROMPT), or piped stdin,
-    \\runs once; use `--` before a prompt that starts with a dash.
-    \\Without a prompt, xaq starts an interactive session: /help lists
-    \\commands; /exit or ctrl-d leaves.
+    \\-i/--image options. A positional PROMPT starts an interactive session
+    \\and submits it. -p/--prompt PROMPT or piped stdin runs once. Use `--`
+    \\before a positional prompt that starts with a dash. Without a prompt,
+    \\xaq starts an interactive session: /help lists commands; /exit or
+    \\ctrl-d leaves.
     \\Use --no-save for an interactive conversation that stays in memory.
     \\Output formats for one-shot runs: plain (default), json, streaming-json.
     \\Defaults: provider=chatgpt; model follows the provider.
@@ -288,6 +289,7 @@ pub fn main(init: std.process.Init) !void {
     var effort: ?agent.Effort = null;
     var fast = false;
     var prompt: ?[]const u8 = null;
+    var run_once = false;
     var resume_id: ?[]const u8 = null;
     var subagent_control: ?[]const u8 = null;
     var output_format: OutputFormat = .plain;
@@ -343,6 +345,7 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             if (i >= args.len) fatal(io, "{s} needs a value", .{args[i - 1]});
             prompt = args[i];
+            run_once = true;
         } else if (std.mem.eql(u8, args[i], "--")) {
             // Everything after `--` is the prompt, even if it starts with a dash.
             i += 1;
@@ -371,6 +374,7 @@ pub fn main(init: std.process.Init) !void {
     var combined_prompt: ?[]u8 = null;
     defer if (combined_prompt) |value| gpa.free(value);
     if (!stdin_tty) {
+        run_once = true;
         // Limit + 1 so input of exactly the limit is accepted; the limit
         // firing without the extra byte cannot distinguish "full" from
         // "overfull".
@@ -399,8 +403,8 @@ pub fn main(init: std.process.Init) !void {
     }
     if (prompt == null and !stdin_tty) prompt = "";
 
-    const interactive = prompt == null;
-    if (interactive and output_format != .plain) fatal(io, "--output-format only works with a one-shot prompt", .{});
+    const interactive = !run_once;
+    if (interactive and output_format != .plain) fatal(io, "--output-format requires -p/--prompt or piped input", .{});
     if (!save_thread and resume_id != null) fatal(io, "--no-save cannot be combined with --continue or --resume", .{});
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd_len = try std.process.currentPath(io, &cwd_buf);
