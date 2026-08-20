@@ -149,12 +149,22 @@ digest_file() {
     fi
 }
 
+digest_text() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        printf '%s' "$1" | sha256sum | awk '{ print $1 }'
+    else
+        printf '%s' "$1" | shasum -a 256 | awk '{ print $1 }'
+    fi
+}
+
 make_dist() {
     destination=$1
     git_sha=$2
+    version=$3
     mkdir -p "$destination"
     manifest="$destination/edge-manifest-$git_sha"
     printf 'xaq-edge-v1 %s\n' "$git_sha" > "$manifest"
+    printf 'version %s %s\n' "$version" "$(digest_text "$version")" >> "$manifest"
     for platform in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64; do
         base="xaq-$platform"
         binary="$destination/$base-$git_sha"
@@ -172,7 +182,7 @@ edge_assets="$store/releases/edge/assets"
 printf 'legacy checksums\n' > "$edge_assets/SHA256SUMS"
 printf 'legacy Linux archive\n' > "$edge_assets/xaq-linux-x86_64.tar.gz"
 printf 'legacy macOS archive\n' > "$edge_assets/xaq-macos-aarch64.tar.gz"
-make_dist "$work/old-dist" "$old_sha"
+make_dist "$work/old-dist" "$old_sha" 0.1.0-edge.1
 (
     cd "$work"
     PATH="$mock_bin:$PATH" RELEASE_STORE="$store" \
@@ -194,7 +204,7 @@ versioned="$store/releases/v0.1.0-edge.1"
 [ "$(find "$versioned/assets" -type f | wc -l | tr -d ' ')" -eq 9 ] || \
     fail 'numbered edge release does not contain the complete asset set'
 
-make_dist "$work/new-dist" "$new_sha"
+make_dist "$work/new-dist" "$new_sha" 0.1.0-edge.2
 if (
     cd "$work"
     PATH="$mock_bin:$PATH" RELEASE_STORE="$store" GH_FAIL_NAME="xaq-macos-x86_64-$new_sha" \
@@ -205,13 +215,13 @@ fi
 
 [ "$(git --git-dir="$remote" rev-parse refs/heads/edge-channel)" = "$old_ref" ] || \
     fail 'failed publication moved the channel manifest'
-awk 'NR > 1 { print $2 }' "$scratch/active-manifest" | while IFS= read -r name; do
+awk 'NR > 1 && $1 != "version" { print $2 }' "$scratch/active-manifest" | while IFS= read -r name; do
     [ -f "$edge_assets/$name" ] || fail "failed publication removed active asset $name"
 done
 [ -f "$store/releases/v0.1.0-edge.2/draft" ] || fail 'failed numbered release is not a draft'
 
 signal_sha=fedcba9876543210fedcba9876543210fedcba98
-make_dist "$work/signal-dist" "$signal_sha"
+make_dist "$work/signal-dist" "$signal_sha" 0.1.0-edge.3
 signal_marker="$scratch/signal-started"
 signal_temp="$scratch/signal-temp"
 mkdir -p "$signal_temp"

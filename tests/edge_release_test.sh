@@ -14,6 +14,7 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 git_sha=0123456789abcdef0123456789abcdef01234567
+version=0.1.0-edge.7
 dist="$scratch/dist"
 mkdir -p "$dist"
 for platform in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64; do
@@ -44,19 +45,33 @@ if grep -Fq 'name: edge-' "$workflow"; then
 fi
 grep -Fq "tools/next-edge-version.sh \"\$EDGE_BASE_VERSION\"" "$workflow" || \
     fail 'workflow does not choose a numbered edge version'
-grep -Fq 'steps.edge_version.outputs.version' "$workflow" || \
+grep -Fq "tools/package-edge.sh \"\${{ matrix.platform }}\" \"\${{ matrix.target }}\" \"\${GITHUB_SHA}\" \"\${{ needs.metadata.outputs.version }}\"" "$workflow" || \
+    fail 'workflow does not embed the numbered version in edge binaries'
+grep -Fq "tools/prepare-edge.sh dist \"\${GITHUB_SHA}\" \"\${{ needs.metadata.outputs.version }}\"" "$workflow" || \
+    fail 'workflow does not pass the numbered version to the manifest'
+grep -Fq "tools/publish-edge.sh dist \"\${GITHUB_REPOSITORY}\" \"\${GITHUB_SHA}\" \"\${{ needs.metadata.outputs.version }}\"" "$workflow" || \
     fail 'workflow does not pass the numbered version to the publisher'
 grep -Fq "tools/check-edge-current.sh \"\$GITHUB_REPOSITORY\" \"\$GITHUB_SHA\"" "$workflow" || \
     fail 'workflow does not check the live main tip before publishing'
-[ "$(grep -Fc "if: steps.edge_freshness.outputs.publish == 'true'" "$workflow")" -eq 4 ] || \
-    fail 'workflow does not skip every release step for a stale run'
+grep -Fq "group: ci-\${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'edge' || github.run_id }}" "$workflow" || \
+    fail 'workflow does not serialize version selection through publication'
 
-"$repo/tools/prepare-edge.sh" "$dist" "$git_sha"
+"$repo/tools/prepare-edge.sh" "$dist" "$git_sha" "$version"
 manifest="$dist/edge-manifest-$git_sha"
-"$repo/tools/validate-edge-manifest.sh" "$manifest"
+"$repo/tools/validate-edge-manifest.sh" "$manifest" "$version"
 grep -Fx "xaq-edge-v1 $git_sha" "$manifest" >/dev/null || fail 'manifest header differs'
+grep -F "version $version " "$manifest" >/dev/null || fail 'manifest lacks the numbered edge version'
 grep -F "xaq-linux-aarch64-$git_sha" "$manifest" >/dev/null || fail 'manifest lacks Linux aarch64'
 grep -F "xaq-macos-x86_64-$git_sha" "$manifest" >/dev/null || fail 'manifest lacks macOS x86_64'
+
+sed '2d' "$manifest" > "$scratch/legacy-manifest"
+"$repo/tools/validate-edge-manifest.sh" "$scratch/legacy-manifest"
+if "$repo/tools/validate-edge-manifest.sh" "$scratch/legacy-manifest" "$version" >/dev/null 2>&1; then
+    fail 'validator accepted a legacy manifest for a numbered release'
+fi
+if "$repo/tools/validate-edge-manifest.sh" "$manifest" 0.1.0-edge.8 >/dev/null 2>&1; then
+    fail 'validator accepted the wrong release version'
+fi
 
 cp "$manifest" "$scratch/bad-manifest"
 printf 'xaq-linux-x86_64 xaq-linux-x86_64-%s %064d\n' "$git_sha" 0 >> "$scratch/bad-manifest"
@@ -66,6 +81,6 @@ fi
 
 printf 'not a tar archive\n' > "$dist/xaq-linux-x86_64-$git_sha.tar.gz"
 rm -f "$manifest"
-if "$repo/tools/prepare-edge.sh" "$dist" "$git_sha" >/dev/null 2>&1; then
+if "$repo/tools/prepare-edge.sh" "$dist" "$git_sha" "$version" >/dev/null 2>&1; then
     fail 'preparation accepted a corrupt archive'
 fi

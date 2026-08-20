@@ -25,7 +25,7 @@ The installer verifies the release manifest and SHA-256 checksum, then writes th
 xaq update
 ```
 
-For now, both commands use the rolling [edge release](https://github.com/unlaboredlabs/xaq/releases/tag/edge). Edge tracks the latest successful `main` build and may change without notice. Each promoted build also has an immutable prerelease tag such as `v0.1.0-edge.1`. Keep `curl` on `PATH`; the installed binary uses it for provider HTTPS requests and updates.
+For now, both commands use the rolling [edge release](https://github.com/unlaboredlabs/xaq/releases/tag/edge). Edge tracks the latest successful `main` build and may change without notice. Each promoted build also has an immutable prerelease tag such as `v0.1.0-edge.1`. The installer and updater print that numbered version, and `xaq --version` reports it afterward. Keep `curl` on `PATH`; the installed binary uses it for provider HTTPS requests and updates.
 
 ## Build
 
