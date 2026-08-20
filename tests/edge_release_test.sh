@@ -46,6 +46,10 @@ grep -Fq "tools/next-edge-version.sh \"\$EDGE_BASE_VERSION\"" "$workflow" || \
     fail 'workflow does not choose a numbered edge version'
 grep -Fq 'steps.edge_version.outputs.version' "$workflow" || \
     fail 'workflow does not pass the numbered version to the publisher'
+grep -Fq "tools/check-edge-current.sh \"\$GITHUB_REPOSITORY\" \"\$GITHUB_SHA\"" "$workflow" || \
+    fail 'workflow does not check the live main tip before publishing'
+[ "$(grep -Fc "if: steps.edge_freshness.outputs.publish == 'true'" "$workflow")" -eq 4 ] || \
+    fail 'workflow does not skip every release step for a stale run'
 
 "$repo/tools/prepare-edge.sh" "$dist" "$git_sha"
 manifest="$dist/edge-manifest-$git_sha"
