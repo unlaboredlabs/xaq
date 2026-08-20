@@ -57,6 +57,86 @@ fn takesValue(argument: []const u8) bool {
     return false;
 }
 
+const StartupEnvironment = struct {
+    home: []const u8,
+    log_value: ?[]const u8,
+    log_scopes: ?[]const u8,
+    no_color: ?[]const u8,
+    term: ?[]const u8,
+    plain: ?[]const u8,
+};
+
+/// Read only the six environment values xaq uses. The full Init path copies
+/// every environment entry into a hash map before main; avoiding that work is
+/// especially valuable for commands which immediately print and exit.
+fn scanStartupEnvironment(environ: std.process.Environ) !StartupEnvironment {
+    var home: ?[]const u8 = null;
+    var log_value: ?[]const u8 = null;
+    var log_scopes: ?[]const u8 = null;
+    var no_color: ?[]const u8 = null;
+    var terminal: ?[]const u8 = null;
+    var plain: ?[]const u8 = null;
+
+    for (environ.block.view().slice) |entry_z| {
+        const entry = std.mem.span(entry_z);
+        const equals = std.mem.findScalar(u8, entry, '=') orelse continue;
+        const name = entry[0..equals];
+        const value = entry[equals + 1 ..];
+        if (std.mem.eql(u8, name, "HOME")) {
+            home = value;
+        } else if (std.mem.eql(u8, name, "XAQ_LOG")) {
+            log_value = value;
+        } else if (std.mem.eql(u8, name, "XAQ_LOG_SCOPES")) {
+            log_scopes = value;
+        } else if (std.mem.eql(u8, name, "NO_COLOR")) {
+            no_color = value;
+        } else if (std.mem.eql(u8, name, "TERM")) {
+            terminal = value;
+        } else if (std.mem.eql(u8, name, "XAQ_PLAIN")) {
+            plain = value;
+        }
+    }
+
+    return .{
+        .home = home orelse return error.HomeNotSet,
+        .log_value = log_value,
+        .log_scopes = log_scopes,
+        .no_color = no_color,
+        .term = terminal,
+        .plain = plain,
+    };
+}
+
+const EarlyAction = enum { invalid_arguments, continue_startup, help, version };
+
+fn findEarlyAction(args: std.process.Args) EarlyAction {
+    var iterator = std.process.Args.Iterator.init(args);
+    if (!iterator.skip()) return .invalid_arguments;
+    while (iterator.next()) |argument| {
+        if (std.mem.eql(u8, argument, "--")) break;
+        if (takesValue(argument)) {
+            _ = iterator.skip();
+            continue;
+        }
+        if (std.mem.eql(u8, argument, "-h") or std.mem.eql(u8, argument, "--help")) return .help;
+        if (std.mem.eql(u8, argument, "-V") or std.mem.eql(u8, argument, "--version")) return .version;
+    }
+    return .continue_startup;
+}
+
+fn writeEarlyAction(io: Io, action: EarlyAction) !void {
+    var buffer: [4096]u8 = undefined;
+    var stdout_file: Io.File.Writer = .init(.stdout(), io, &buffer);
+    const output = &stdout_file.interface;
+    switch (action) {
+        .help => try output.writeAll(usage),
+        .version => try output.print("xaq {s}\n", .{version_string}),
+        else => unreachable,
+    }
+    // Match the regular path's deferred best-effort flush (notably EPIPE).
+    output.flush() catch {};
+}
+
 const JsonOutput = struct {
     output: *Io.Writer,
     format: OutputFormat,
@@ -175,16 +255,27 @@ fn writeStartupTime(output: *Io.Writer, elapsed_ns: i96) !void {
     try output.print("startup {d}.{d:0>2} ms", .{ hundredths / 100, hundredths % 100 });
 }
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(minimal: std.process.Init.Minimal) !void {
     const gpa = std.heap.smp_allocator;
-    const io = init.io;
+    const early_action = findEarlyAction(minimal.args);
+    if (early_action == .invalid_arguments) return error.InvalidArguments;
+    const environment = try scanStartupEnvironment(minimal.environ);
+
+    var threaded: Io.Threaded = .init(gpa, .{
+        .argv0 = .init(minimal.args),
+        .environ = minimal.environ,
+    });
+    defer threaded.deinit();
+    const io = threaded.io();
+    if (early_action != .continue_startup and !log.requested(environment.log_value)) {
+        return writeEarlyAction(io, early_action);
+    }
+
     const startup_start = Io.Clock.now(.awake, io);
-    const args = try init.minimal.args.toSlice(gpa);
+    const args = try minimal.args.toSlice(gpa);
     defer gpa.free(args);
-    // A parent can legally execve with an empty argv; args[1..] would trap.
-    if (args.len == 0) return error.InvalidArguments;
-    const home = init.environ_map.get("HOME") orelse return error.HomeNotSet;
-    log.init(gpa, io, home, init.environ_map.get("XAQ_LOG"), init.environ_map.get("XAQ_LOG_SCOPES"));
+    const home = environment.home;
+    log.init(gpa, io, home, environment.log_value, environment.log_scopes);
     defer log.shutdown();
 
     var stdout_buffer: [4096]u8 = undefined;
@@ -227,7 +318,7 @@ pub fn main(init: std.process.Init) !void {
             // polling; login otherwise never reaches the interactive setup.
             const stdout_tty = Io.File.stdout().isTty(io) catch false;
             const stdin_tty = Io.File.stdin().isTty(io) catch false;
-            term.detect(stdout_tty, init.environ_map.get("NO_COLOR"), init.environ_map.get("TERM"));
+            term.detect(stdout_tty, environment.no_color, environment.term);
             input_mod.interactive = stdout_tty and stdin_tty;
             auth.login(gpa, io, home, provider, input, output) catch |err| switch (err) {
                 error.EndOfStream => fatal(io, "login cancelled (no input)", .{}),
@@ -296,7 +387,7 @@ pub fn main(init: std.process.Init) !void {
     var save_thread = true;
     var image_paths: std.ArrayList([]const u8) = .empty;
     defer image_paths.deinit(gpa);
-    var plain = if (init.environ_map.get("XAQ_PLAIN")) |value| log.isTruthy(std.mem.trim(u8, value, " \t")) else false;
+    var plain = if (environment.plain) |value| log.isTruthy(std.mem.trim(u8, value, " \t")) else false;
     var dash_prompt: ?[]u8 = null;
     defer if (dash_prompt) |value| gpa.free(value);
     var i: usize = 1;
@@ -422,7 +513,7 @@ pub fn main(init: std.process.Init) !void {
     // Styling follows stdout alone so one-shot runs on a terminal are
     // dimmed consistently; the raw-mode editor still needs both ends.
     const stdout_tty = Io.File.stdout().isTty(io) catch false;
-    term.detect(stdout_tty and output_format == .plain, init.environ_map.get("NO_COLOR"), init.environ_map.get("TERM"));
+    term.detect(stdout_tty and output_format == .plain, environment.no_color, environment.term);
     var discard_buffer: [1024]u8 = undefined;
     var discard: Io.Writer.Discarding = .init(&discard_buffer);
     var agent_output: *Io.Writer = if (output_format == .plain) output else &discard.writer;
@@ -585,6 +676,41 @@ test "startup time has two decimal places in milliseconds" {
     try writeStartupTime(&output, 12_349_999);
 
     try std.testing.expectEqualStrings("startup 12.34 ms", output.buffered());
+}
+
+test "early action preserves option-value and delimiter semantics" {
+    const help = [_][*:0]const u8{ "xaq", "--help" };
+    try std.testing.expectEqual(EarlyAction.help, findEarlyAction(.{ .vector = &help }));
+
+    const version_first = [_][*:0]const u8{ "xaq", "--version", "--help" };
+    try std.testing.expectEqual(EarlyAction.version, findEarlyAction(.{ .vector = &version_first }));
+
+    const prompt_value = [_][*:0]const u8{ "xaq", "-p", "--help" };
+    try std.testing.expectEqual(EarlyAction.continue_startup, findEarlyAction(.{ .vector = &prompt_value }));
+
+    const delimiter = [_][*:0]const u8{ "xaq", "--", "--help" };
+    try std.testing.expectEqual(EarlyAction.continue_startup, findEarlyAction(.{ .vector = &delimiter }));
+
+    const empty = [_][*:0]const u8{};
+    try std.testing.expectEqual(EarlyAction.invalid_arguments, findEarlyAction(.{ .vector = &empty }));
+}
+
+test "startup environment keeps the last value and requires home" {
+    const entries = [_:null]?[*:0]const u8{
+        "HOME=/first",
+        "TERM=dumb",
+        "HOME=/last",
+        "XAQ_LOG=off",
+        "XAQ_PLAIN=1",
+    };
+    const environment = try scanStartupEnvironment(.{ .block = .{ .slice = &entries } });
+    try std.testing.expectEqualStrings("/last", environment.home);
+    try std.testing.expectEqualStrings("dumb", environment.term.?);
+    try std.testing.expectEqualStrings("off", environment.log_value.?);
+    try std.testing.expectEqualStrings("1", environment.plain.?);
+
+    const no_home = [_:null]?[*:0]const u8{"TERM=dumb"};
+    try std.testing.expectError(error.HomeNotSet, scanStartupEnvironment(.{ .block = .{ .slice = &no_home } }));
 }
 
 test "output formats parse only documented values" {

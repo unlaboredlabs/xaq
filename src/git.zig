@@ -27,19 +27,35 @@ pub const Status = struct {
 /// Return null outside a repository or when Git is unavailable. Status
 /// failures still return the discovered worktree instead of hiding it.
 pub fn inspect(gpa: std.mem.Allocator, io: Io, cwd: []const u8) ?Status {
-    const root_result = run(gpa, io, cwd, &.{ "git", "--no-optional-locks", "rev-parse", "--show-toplevel" }) catch return null;
+    const status_argv = &.{
+        "git", "--no-optional-locks", "status", "--porcelain=v2", "--branch", "--no-ahead-behind", "--untracked-files=normal",
+    };
+    // Both commands are read-only and independent. In the CLI, gpa is the SMP
+    // allocator, so their bounded output collection can safely overlap.
+    var status_future = io.concurrent(run, .{ gpa, io, cwd, status_argv }) catch null;
+    const root_result = run(gpa, io, cwd, &.{ "git", "--no-optional-locks", "rev-parse", "--show-toplevel" }) catch {
+        if (status_future) |*future| discardFuture(gpa, io, future);
+        return null;
+    };
     defer gpa.free(root_result.stdout);
     defer gpa.free(root_result.stderr);
-    if (!exitedZero(root_result.term)) return null;
+    if (!exitedZero(root_result.term)) {
+        if (status_future) |*future| discardFuture(gpa, io, future);
+        return null;
+    }
 
     const root = std.mem.trimEnd(u8, root_result.stdout, "\r\n");
-    if (root.len == 0) return null;
+    if (root.len == 0) {
+        if (status_future) |*future| discardFuture(gpa, io, future);
+        return null;
+    }
     var result: Status = .{ .present = true };
     result.worktree_len = copySafe(&result.worktree_buffer, std.fs.path.basename(root));
 
-    const status_result = run(gpa, io, cwd, &.{
-        "git", "--no-optional-locks", "status", "--porcelain=v2", "--branch", "--no-ahead-behind", "--untracked-files=normal",
-    }) catch |err| {
+    const status_result = (if (status_future) |*future|
+        future.await(io)
+    else
+        run(gpa, io, cwd, status_argv)) catch |err| {
         if (err == error.StreamTooLong) result.dirty = true;
         fillBranchFallback(gpa, io, cwd, &result);
         return result;
@@ -49,6 +65,12 @@ pub fn inspect(gpa: std.mem.Allocator, io: Io, cwd: []const u8) ?Status {
     if (exitedZero(status_result.term)) parsePorcelain(&result, status_result.stdout);
     if (result.branch_len == 0) fillBranchFallback(gpa, io, cwd, &result);
     return result;
+}
+
+fn discardFuture(gpa: std.mem.Allocator, io: Io, future: anytype) void {
+    const result = future.cancel(io) catch return;
+    gpa.free(result.stdout);
+    gpa.free(result.stderr);
 }
 
 fn run(gpa: std.mem.Allocator, io: Io, cwd: []const u8, argv: []const []const u8) !std.process.RunResult {

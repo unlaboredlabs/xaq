@@ -112,10 +112,17 @@ fn scopeAllowed(list: []const u8, scope: []const u8) bool {
 
 /// Returns the owned log path, or null when logging stays disabled.
 fn choosePath(gpa: std.mem.Allocator, home: []const u8, env_value: ?[]const u8) !?[]u8 {
-    const raw = std.mem.trim(u8, env_value orelse return null, " \t\r\n");
-    if (raw.len == 0 or isFalsy(raw)) return null;
+    if (!requested(env_value)) return null;
+    const raw = std.mem.trim(u8, env_value.?, " \t\r\n");
     if (isTruthy(raw)) return try std.fs.path.join(gpa, &.{ home, ".config", "xaq", "trace.log" });
     return try gpa.dupe(u8, raw);
+}
+
+/// Whether XAQ_LOG activates logging. Startup uses this to keep the help and
+/// version fast path behavior-identical when logging is explicitly enabled.
+pub fn requested(env_value: ?[]const u8) bool {
+    const raw = std.mem.trim(u8, env_value orelse return false, " \t\r\n");
+    return raw.len > 0 and !isFalsy(raw);
 }
 
 /// Shared by other environment toggles such as XAQ_PLAIN.
@@ -166,6 +173,14 @@ test "choosePath honors truthy, falsy, and explicit values" {
     const explicit = (try choosePath(gpa, "/home/u", " /tmp/xaq.log\n")).?;
     defer gpa.free(explicit);
     try std.testing.expectEqualStrings("/tmp/xaq.log", explicit);
+}
+
+test "requested matches logging activation" {
+    try std.testing.expect(!requested(null));
+    try std.testing.expect(!requested(" \t"));
+    try std.testing.expect(!requested("off"));
+    try std.testing.expect(requested("1"));
+    try std.testing.expect(requested(" /tmp/xaq.log\n"));
 }
 
 test "scope filter matches trimmed comma-separated entries" {
