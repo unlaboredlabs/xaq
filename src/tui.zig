@@ -18,10 +18,11 @@
 //! input row and popup through explicit chrome calls—never `ESC[J`—so
 //! the borders and bars are safe by construction.
 //!
-//! Activity comes from the spinner facade: in fullscreen the animated
-//! task never starts (a concurrent writer would interleave with chrome);
-//! the label shows statically in the info bar instead. `--plain`,
-//! pipes, one-shots, and small terminals keep the inline flow.
+//! Activity comes from the spinner facade: in fullscreen its frames are
+//! routed through the live transcript row (`spinnerFrame`/`spinnerClear`)
+//! under the render mutex, and the label also shows statically in the
+//! info bar. `--plain`, pipes, one-shots, and small terminals keep the
+//! inline flow on the raw fd.
 
 const std = @import("std");
 const Io = std.Io;
@@ -483,6 +484,40 @@ pub fn setActivity(label: ?[]const u8) void {
     defer render_mutex.unlock(io_state);
     activity_len = if (label) |text| copyInto(&activity_buffer, text) else 0;
     renderInfoLocked();
+}
+
+/// One spinner frame at the live insertion row of the transcript: a
+/// carriage return rewinds the previous frame, then the dim glyph and
+/// label, clipped to one content row so the rewind never spans a wrap.
+/// Skipped while scrolled back — the live row is off-screen there, and
+/// every forwarded write would trigger a full repaint.
+pub fn spinnerFrame(glyph: []const u8, label: []const u8) void {
+    if (!active) return;
+    render_mutex.lockUncancelable(io_state);
+    defer render_mutex.unlock(io_state);
+    _ = resizeIfNeededLocked();
+    if (!layout_ready or scroll_offset != 0) return;
+    var buffer: [512]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buffer);
+    writer.writeByte('\r') catch return;
+    writer.writeAll(term.dim()) catch return;
+    writer.writeAll(glyph) catch return;
+    writer.writeByte(' ') catch return;
+    writeClipped(&writer, label, contentWidth() -| 2) catch return;
+    writer.writeAll(term.reset()) catch return;
+    writeLiveLocked(writer.buffered());
+}
+
+/// Erase the spinner from the live row and the in-progress ring line.
+/// Unlike frames this runs even while scrolled back, so both planes are
+/// consistent when the next output lands.
+pub fn spinnerClear() void {
+    if (!active) return;
+    render_mutex.lockUncancelable(io_state);
+    defer render_mutex.unlock(io_state);
+    _ = resizeIfNeededLocked();
+    if (!layout_ready) return;
+    writeLiveLocked("\r\x1b[K");
 }
 
 /// Draw a completion popup overlaying the bottom of the transcript,
@@ -1019,15 +1054,34 @@ fn visibleColumns(text: []const u8) usize {
     return count;
 }
 
+/// Position at the tracked region cursor. Explicit wrapping keeps this
+/// coordinate valid even when the prior flush ended exactly at the
+/// content boundary.
+fn seekLiveRow() !void {
+    if (layout_ready) try sink.print("\x1b[{d};{d}H", .{ region_row, region_col });
+}
+
+fn restoreEditorCursor() !void {
+    if (input_active and layout_ready) {
+        try sink.print("\x1b[{d};{d}H", .{ input_cursor_row, input_cursor_col });
+        try sink.flush();
+    }
+}
+
+/// Forward spinner-facade bytes to the live row with the same positioning
+/// and editor-cursor discipline as `drain`. Caller holds `render_mutex`.
+fn writeLiveLocked(bytes: []const u8) void {
+    seekLiveRow() catch return;
+    forward(bytes) catch return;
+    sink.flush() catch return;
+    restoreEditorCursor() catch return;
+}
+
 fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
     render_mutex.lockUncancelable(io_state);
     defer render_mutex.unlock(io_state);
     _ = resizeIfNeededLocked();
-    if (layout_ready) {
-        // Explicit wrapping keeps this coordinate valid even when the prior
-        // flush ended exactly at the content boundary.
-        sink.print("\x1b[{d};{d}H", .{ region_row, region_col }) catch return error.WriteFailed;
-    }
+    seekLiveRow() catch return error.WriteFailed;
     const buffered = w.buffer[0..w.end];
     if (buffered.len > 0) {
         forward(buffered) catch return error.WriteFailed;
@@ -1044,10 +1098,7 @@ fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!
         consumed += data[data.len - 1].len;
     }
     sink.flush() catch return error.WriteFailed;
-    if (input_active and layout_ready) {
-        sink.print("\x1b[{d};{d}H", .{ input_cursor_row, input_cursor_col }) catch return error.WriteFailed;
-        sink.flush() catch return error.WriteFailed;
-    }
+    restoreEditorCursor() catch return error.WriteFailed;
     return consumed;
 }
 
@@ -1484,6 +1535,48 @@ test "startup hint is drawn in the input box and can be dismissed" {
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "startup 12.34 ms") != null);
     try std.testing.expect(dismissStartupHint());
     try std.testing.expect(startupHint() == null);
+}
+
+test "spinner frames rewind in place and clear erases the live row" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    io_state = threaded.io();
+    sink = &output.writer;
+    gpa_state = std.testing.allocator;
+    rows = 24;
+    cols = 80;
+    active = true;
+    layout_ready = true;
+    defer {
+        active = false;
+        layout_ready = false;
+        current_len = 0;
+        pending_cr = false;
+        scroll_offset = 0;
+        region_row = regionTop();
+        region_col = contentLeft();
+    }
+
+    spinnerFrame("⠋", "thinking");
+    try std.testing.expect(std.mem.indexOf(u8, current[0..current_len], "⠋ thinking") != null);
+    spinnerFrame("⠙", "thinking");
+    try std.testing.expect(std.mem.indexOf(u8, current[0..current_len], "⠙ thinking") != null);
+    try std.testing.expect(std.mem.indexOf(u8, current[0..current_len], "⠋") == null);
+    // Frames rewind the in-progress line; nothing is ever committed.
+    try std.testing.expectEqual(0, line_count);
+
+    // Scrolled back, the live row is off-screen: the frame is skipped.
+    const drawn = output.written().len;
+    scroll_offset = 1;
+    spinnerFrame("⠹", "thinking");
+    try std.testing.expectEqual(drawn, output.written().len);
+    scroll_offset = 0;
+
+    spinnerClear();
+    try std.testing.expectEqual(0, current_len);
+    try std.testing.expect(std.mem.endsWith(u8, output.written(), "\x1b[K"));
 }
 
 test "fullscreen startup requires a measured minimum size" {
