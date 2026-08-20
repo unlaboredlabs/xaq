@@ -6,6 +6,9 @@ Landing page for `xaq`, built with Next.js 16 (App Router, Turbopack) and Tailwi
 pnpm install            # from repo root
 pnpm dev                # http://localhost:3000
 pnpm dev --host         # bind 0.0.0.0 (also --host <addr>)
+pnpm lint
+pnpm typecheck
+pnpm test
 pnpm build
 ```
 

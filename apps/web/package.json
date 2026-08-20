@@ -2,11 +2,14 @@
   "name": "@xaq/web",
   "version": "0.0.1",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "typecheck": "next typegen && tsc --noEmit",
+    "test": "node --test --experimental-strip-types lib/use-copy.test.ts scripts/dev.test.mjs"
   },
   "dependencies": {
     "geist": "^1.5.1",

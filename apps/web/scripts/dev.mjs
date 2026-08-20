@@ -28,7 +28,34 @@ const child = spawn("next", ["dev", ...mapped], {
   shell: process.platform === "win32",
 });
 
-child.on("exit", (code, signal) => {
+const forwardedSignals = ["SIGINT", "SIGTERM", "SIGHUP"];
+const signalHandlers = new Map();
+let childExited = false;
+
+for (const signal of forwardedSignals) {
+  const handler = () => {
+    if (!childExited) child.kill(signal);
+  };
+  signalHandlers.set(signal, handler);
+  process.on(signal, handler);
+}
+
+function removeSignalHandlers() {
+  for (const [signal, handler] of signalHandlers) {
+    process.off(signal, handler);
+  }
+}
+
+child.once("error", (error) => {
+  childExited = true;
+  removeSignalHandlers();
+  console.error(`could not start next dev: ${error.message}`);
+  process.exit(1);
+});
+
+child.once("exit", (code, signal) => {
+  childExited = true;
+  removeSignalHandlers();
   if (signal) process.kill(process.pid, signal);
-  else process.exit(code ?? 0);
+  else process.exit(code ?? 1);
 });

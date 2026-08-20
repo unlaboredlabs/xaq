@@ -30,3 +30,9 @@ body {
 .cursor-blink {
   animation: blink 1.1s step-end infinite;
 }
+
+@media (prefers-reduced-motion: reduce) {
+  .cursor-blink {
+    animation: none;
+  }
+}
