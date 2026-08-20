@@ -29,6 +29,10 @@ done
 [ "$(find "$dist" -mindepth 1 -maxdepth 1 -type f -name 'xaq-*' | wc -l | tr -d ' ')" -eq 8 ] || \
     fail 'xaq-* did not select all eight non-archived artifacts'
 workflow="$repo/.github/workflows/ci.yml"
+base_version=$(awk -F'"' '/^[[:space:]]*\.version = "/ { print $2; exit }' "$repo/build.zig.zon")
+[ -n "$base_version" ] || fail 'could not read the package version'
+grep -Fq "EDGE_BASE_VERSION: $base_version" "$workflow" || \
+    fail 'workflow edge base differs from the package version'
 [ "$(grep -Fc 'archive: false' "$workflow")" -eq 2 ] || fail 'workflow must have two single-file uploads'
 [ "$(grep -Ec '^[[:space:]]+path: dist/xaq-.*matrix\.platform.*github\.sha' "$workflow")" -eq 2 ] || \
     fail 'workflow upload paths changed'
@@ -38,6 +42,14 @@ grep -Fq 'pattern: xaq-*' "$workflow" || fail 'download pattern does not match a
 if grep -Fq 'name: edge-' "$workflow"; then
     fail 'workflow relies on a custom archive:false artifact name'
 fi
+grep -Fq "tools/next-edge-version.sh \"\$EDGE_BASE_VERSION\"" "$workflow" || \
+    fail 'workflow does not choose a numbered edge version'
+grep -Fq 'steps.edge_version.outputs.version' "$workflow" || \
+    fail 'workflow does not pass the numbered version to the publisher'
+grep -Fq "tools/check-edge-current.sh \"\$GITHUB_REPOSITORY\" \"\$GITHUB_SHA\"" "$workflow" || \
+    fail 'workflow does not check the live main tip before publishing'
+[ "$(grep -Fc "if: steps.edge_freshness.outputs.publish == 'true'" "$workflow")" -eq 4 ] || \
+    fail 'workflow does not skip every release step for a stale run'
 
 "$repo/tools/prepare-edge.sh" "$dist" "$git_sha"
 manifest="$dist/edge-manifest-$git_sha"

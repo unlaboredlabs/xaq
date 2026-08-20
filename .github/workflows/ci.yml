@@ -27,6 +27,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           shellcheck install.sh tools/*.sh tests/*.sh
+          tests/edge_freshness_test.sh
+          tests/edge_version_test.sh
           tests/edge_release_test.sh
           tests/install_test.sh
           tests/publish_edge_test.sh
@@ -78,6 +80,8 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [check, package]
     runs-on: blacksmith-2vcpu-ubuntu-2404
+    env:
+      EDGE_BASE_VERSION: 0.1.0
     concurrency:
       group: edge
       cancel-in-progress: false
@@ -87,16 +91,37 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+      - name: Check edge run freshness
+        id: edge_freshness
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          publish=$(tools/check-edge-current.sh "$GITHUB_REPOSITORY" "$GITHUB_SHA")
+          printf 'publish=%s\n' "$publish" >> "$GITHUB_OUTPUT"
+          if [ "$publish" = false ]; then
+            printf 'Skipping stale edge run for %s\n' "$GITHUB_SHA"
+          fi
       - name: Download edge builds
+        if: steps.edge_freshness.outputs.publish == 'true'
         uses: actions/download-artifact@v8
         with:
           # upload-artifact v7 names an archive:false artifact after its one file.
           pattern: xaq-*
           path: dist
           merge-multiple: true
-      - name: Prepare edge manifest
-        run: tools/prepare-edge.sh dist "${GITHUB_SHA}"
-      - name: Publish edge release
+      - name: Choose edge version
+        if: steps.edge_freshness.outputs.publish == 'true'
+        id: edge_version
         env:
           GH_TOKEN: ${{ github.token }}
-        run: tools/publish-edge.sh dist "${GITHUB_REPOSITORY}" "${GITHUB_SHA}"
+        run: |
+          version=$(tools/next-edge-version.sh "$EDGE_BASE_VERSION" "$GITHUB_REPOSITORY" "$GITHUB_SHA")
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+      - name: Prepare edge manifest
+        if: steps.edge_freshness.outputs.publish == 'true'
+        run: tools/prepare-edge.sh dist "${GITHUB_SHA}"
+      - name: Publish edge release
+        if: steps.edge_freshness.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: tools/publish-edge.sh dist "${GITHUB_REPOSITORY}" "${GITHUB_SHA}" "${{ steps.edge_version.outputs.version }}"
