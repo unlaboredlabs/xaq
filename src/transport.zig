@@ -6,6 +6,9 @@ pub const Header = struct { name: []const u8, value: []const u8 };
 pub const Response = struct { status: u16, body: []u8, retry_after_seconds: ?u64 = null };
 pub const StreamFn = *const fn (context: ?*anyopaque, line: []const u8) anyerror!void;
 
+const response_read_buffer_bytes = 16 * 1024;
+const max_response_line_bytes = 8 * 1024 * 1024;
+
 /// Small HTTPS transport. curl supplies platform TLS, but all sensitive
 /// headers travel through its stdin config rather than process arguments.
 pub fn post(gpa: std.mem.Allocator, io: Io, url: []const u8, content_type: []const u8, headers: []const Header, body: []const u8) !Response {
@@ -98,20 +101,21 @@ pub fn postStreamWithToken(
     child.stdin.?.close(io);
     child.stdin = null;
 
-    // Heap buffer: a single SSE line carries whole tool-call items, so a
-    // large write/edit argument payload can far exceed 64 KiB; a line
-    // that cannot fit still fails, but only past this bound.
-    const read_buffer = try gpa.alloc(u8, 8 * 1024 * 1024);
-    defer gpa.free(read_buffer);
-    var file_reader: Io.File.Reader = .init(child.stdout.?, io, read_buffer);
+    // Most SSE lines are small. Grow a retained line buffer only when a tool
+    // call actually carries a large argument instead of reserving 8 MiB for
+    // every request.
+    var read_buffer: [response_read_buffer_bytes]u8 = undefined;
+    var file_reader: Io.File.Reader = .init(child.stdout.?, io, &read_buffer);
     const reader = &file_reader.interface;
+    var response_line: Io.Writer.Allocating = .init(gpa);
+    defer response_line.deinit();
     var status: u16 = 0;
     var retry_after: ?u64 = null;
     var in_headers = true;
     var error_body: Io.Writer.Allocating = .init(gpa);
     defer error_body.deinit();
 
-    while (reader.takeDelimiter('\n') catch |err| {
+    while (nextResponseLine(reader, &response_line) catch |err| {
         // SIGINT terminates curl and can make its stdout pipe report a read
         // failure rather than EOF. Cancellation must win over that transport
         // detail so the interactive loop can restore the prompt.
@@ -165,6 +169,18 @@ pub fn postStreamWithToken(
         .body = try error_body.toOwnedSlice(),
         .retry_after_seconds = retry_after,
     };
+}
+
+fn nextResponseLine(reader: *Io.Reader, line: *Io.Writer.Allocating) !?[]const u8 {
+    line.clearRetainingCapacity();
+    _ = try reader.streamDelimiterLimit(&line.writer, '\n', .limited(max_response_line_bytes + 1));
+    if (line.written().len > max_response_line_bytes) return error.StreamTooLong;
+    const delimiter = reader.takeByte() catch |err| switch (err) {
+        error.EndOfStream => return if (line.written().len == 0) null else line.written(),
+        else => return err,
+    };
+    std.debug.assert(delimiter == '\n');
+    return line.written();
 }
 
 fn requestFile(gpa: std.mem.Allocator, io: Io, body: []const u8) ![]u8 {
@@ -246,4 +262,32 @@ test "HTTP response helpers" {
 
 test "curl config rejects header injection" {
     try std.testing.expectError(error.InvalidHeader, tryHeader(std.testing.allocator, "Authorization", "x\ny"));
+}
+
+test "response lines retain capacity and include an unterminated tail" {
+    var reader: Io.Reader = .fixed("one\ntwo\n\ntail");
+    var line: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer line.deinit();
+
+    try std.testing.expectEqualStrings("one", (try nextResponseLine(&reader, &line)).?);
+    const capacity = line.writer.buffer.len;
+    try std.testing.expectEqualStrings("two", (try nextResponseLine(&reader, &line)).?);
+    try std.testing.expect(line.writer.buffer.len >= capacity);
+    try std.testing.expectEqualStrings("", (try nextResponseLine(&reader, &line)).?);
+    try std.testing.expectEqualStrings("tail", (try nextResponseLine(&reader, &line)).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), try nextResponseLine(&reader, &line));
+}
+
+test "response lines grow beyond the fixed read buffer" {
+    const input = try std.testing.allocator.alloc(u8, response_read_buffer_bytes * 2 + 1);
+    defer std.testing.allocator.free(input);
+    @memset(input, 'x');
+    input[input.len - 1] = '\n';
+    var reader: Io.Reader = .fixed(input);
+    var line: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer line.deinit();
+
+    const result = (try nextResponseLine(&reader, &line)).?;
+    try std.testing.expectEqual(input.len - 1, result.len);
+    try std.testing.expectEqualSlices(u8, input[0 .. input.len - 1], result);
 }

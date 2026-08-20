@@ -1,13 +1,7 @@
-"use client";
-
 import { site } from "@/lib/content";
-import { useCopy } from "@/lib/use-copy";
+import CopyCommand from "@/components/copy-command";
 
 export default function Landing() {
-  const { status, copy } = useCopy(site.install);
-  const copyStatus =
-    status === "copied" ? "copied" : status === "failed" ? "copy failed" : "";
-
   return (
     <main className="flex min-h-screen items-center bg-[#0a0a0a] font-mono text-[13px] leading-[1.9] text-neutral-400">
       <div className="mx-auto w-full max-w-[560px] px-6 py-24">
@@ -20,31 +14,7 @@ export default function Landing() {
         <p className="mt-6 text-neutral-100">{site.tagline}</p>
         <p className="mt-4">{site.description}</p>
 
-        <div className="mt-8 flex items-baseline gap-3">
-          <button
-            type="button"
-            onClick={() => void copy()}
-            className="group min-w-0 text-left focus-visible:rounded-sm focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-neutral-200"
-            aria-label="Copy install command"
-            aria-describedby="copy-status"
-            title="Copy install command"
-          >
-            <span aria-hidden="true" className="text-neutral-600">
-              $ {""}
-            </span>
-            <span className="text-neutral-100 underline decoration-neutral-700 underline-offset-4 group-hover:decoration-neutral-400">
-              {site.install}
-            </span>
-          </button>
-          <span
-            id="copy-status"
-            role="status"
-            aria-live="polite"
-            className="shrink-0 text-neutral-400"
-          >
-            {copyStatus}
-          </span>
-        </div>
+        <CopyCommand command={site.install} />
 
         <p className="mt-10 text-neutral-400">
           <a

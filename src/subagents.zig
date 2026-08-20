@@ -454,11 +454,21 @@ pub const Manager = struct {
     }
 
     fn readCapped(self: *Manager, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-        const bytes = try Io.Dir.cwd().readFileAlloc(self.io, path, gpa, .limited(4 * 1024 * 1024));
-        if (bytes.len <= result_limit) return bytes;
+        var file = try Io.Dir.cwd().openFile(self.io, path, .{});
+        defer file.close(self.io);
+        const stat = try file.stat(self.io);
+        if (stat.size > 4 * 1024 * 1024) return error.StreamTooLong;
+        const truncated = stat.size > result_limit;
+        const read_len: usize = @intCast(if (truncated) result_limit - 96 else stat.size);
+        const bytes = try gpa.alloc(u8, read_len);
+        errdefer gpa.free(bytes);
+        var read_buffer: [8192]u8 = undefined;
+        var reader: Io.File.Reader = .init(file, self.io, &read_buffer);
+        try reader.interface.readSliceAll(bytes);
+        if (!truncated) return bytes;
         var out: Io.Writer.Allocating = .init(gpa);
         defer out.deinit();
-        try out.writer.writeAll(bytes[0 .. result_limit - 96]);
+        try out.writer.writeAll(bytes);
         try out.writer.print("\n[truncated; full subagent output: {s}]", .{path});
         gpa.free(bytes);
         return out.toOwnedSlice();
@@ -551,6 +561,24 @@ test "briefings include the self-contained task" {
     defer std.testing.allocator.free(text);
     try std.testing.expect(std.mem.indexOf(u8, text, "inspect and edit files") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "change auth") != null);
+}
+
+test "capped result reads allocate only the returned prefix" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const contents = try std.testing.allocator.alloc(u8, result_limit + 4096);
+    defer std.testing.allocator.free(contents);
+    for (contents, 0..) |*byte, index| byte.* = @intCast(index % 251);
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "result.txt", .data = contents });
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/result.txt", .{temporary.sub_path});
+    defer std.testing.allocator.free(path);
+    var manager = try Manager.init(std.testing.allocator, std.testing.io, "/tmp", .{});
+    defer manager.deinit();
+
+    const result = try manager.readCapped(std.testing.allocator, path);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualSlices(u8, contents[0 .. result_limit - 96], result[0 .. result_limit - 96]);
+    try std.testing.expect(std.mem.endsWith(u8, result, "]"));
 }
 
 test "manager config disables launches and changes the background default" {

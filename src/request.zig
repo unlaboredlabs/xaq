@@ -91,7 +91,7 @@ pub fn build(gpa: std.mem.Allocator, provider: auth.Provider, model: []const u8,
             try js.endObject();
         }
         try js.objectField("input");
-        try writeResponsesInput(gpa, &js, entries, if (provider == .grok) system else null, null);
+        try writeResponsesInput(&js, entries, if (provider == .grok) system else null, null);
         try js.objectField("tools");
         try tools.schemasWithOptions(&js, tool_options);
         try js.objectField("tool_choice");
@@ -172,13 +172,13 @@ pub fn buildCompact(gpa: std.mem.Allocator, provider: auth.Provider, model: []co
             try js.endObject();
         }
         try js.objectField("input");
-        try writeResponsesInput(gpa, &js, entries, if (provider == .grok) compact_system else null, compact_prompt);
+        try writeResponsesInput(&js, entries, if (provider == .grok) compact_system else null, compact_prompt);
     }
     try js.endObject();
     return out.toOwnedSlice();
 }
 
-fn writeResponsesInput(gpa: std.mem.Allocator, js: *std.json.Stringify, entries: []const types.Entry, system: ?[]const u8, final_user: ?[]const u8) !void {
+fn writeResponsesInput(js: *std.json.Stringify, entries: []const types.Entry, system: ?[]const u8, final_user: ?[]const u8) !void {
     try js.beginArray();
     if (system) |text| {
         try js.beginObject();
@@ -200,9 +200,13 @@ fn writeResponsesInput(gpa: std.mem.Allocator, js: *std.json.Stringify, entries:
                 try js.objectField("type");
                 try js.write("input_image");
                 try js.objectField("image_url");
-                const data_url = try std.fmt.allocPrint(gpa, "data:{s};base64,{s}", .{ image.media_type, image.data });
-                defer gpa.free(data_url);
-                try js.write(data_url);
+                try js.beginWriteRaw();
+                try js.writer.writeAll("\"data:");
+                try std.json.Stringify.encodeJsonStringChars(image.media_type, js.options, js.writer);
+                try js.writer.writeAll(";base64,");
+                try std.json.Stringify.encodeJsonStringChars(image.data, js.options, js.writer);
+                try js.writer.writeByte('"');
+                js.endWriteRaw();
                 try js.objectField("detail");
                 try js.write("auto");
                 try js.endObject();

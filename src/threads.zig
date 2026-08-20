@@ -8,8 +8,10 @@ pub const Thread = struct {
     io: Io,
     id: []u8,
     path: []u8,
+    scratch: Io.Writer.Allocating,
 
     pub fn deinit(self: *Thread) void {
+        self.scratch.deinit();
         self.gpa.free(self.id);
         self.gpa.free(self.path);
         self.* = undefined;
@@ -24,11 +26,11 @@ pub const Thread = struct {
     }
 
     pub fn appendEntry(self: *Thread, entry: types.Entry) !void {
-        var out: Io.Writer.Allocating = .init(self.gpa);
-        defer out.deinit();
-        var js: std.json.Stringify = .{ .writer = &out.writer };
-        try writeEntryLine(&js, &out.writer, entry);
-        try append(self.io, self.path, out.written());
+        self.scratch.clearRetainingCapacity();
+        defer self.recycleScratch();
+        var js: std.json.Stringify = .{ .writer = &self.scratch.writer };
+        try writeEntryLine(&js, &self.scratch.writer, entry);
+        try append(self.io, self.path, self.scratch.written());
     }
 
     /// Replace the whole file atomically with a fresh meta line plus the
@@ -113,28 +115,37 @@ pub const Thread = struct {
     }
 
     pub fn appendFast(self: *Thread, enabled: bool) !void {
-        var out: Io.Writer.Allocating = .init(self.gpa);
-        defer out.deinit();
-        var js: std.json.Stringify = .{ .writer = &out.writer };
+        self.scratch.clearRetainingCapacity();
+        defer self.recycleScratch();
+        var js: std.json.Stringify = .{ .writer = &self.scratch.writer };
         try js.beginObject();
         try field(&js, "type", "fast");
         try js.objectField("fast");
         try js.write(enabled);
         try js.endObject();
-        try out.writer.writeByte('\n');
-        try append(self.io, self.path, out.written());
+        try self.scratch.writer.writeByte('\n');
+        try append(self.io, self.path, self.scratch.written());
     }
 
     fn appendSetting(self: *Thread, kind: []const u8, name: []const u8, value: []const u8) !void {
-        var out: Io.Writer.Allocating = .init(self.gpa);
-        defer out.deinit();
-        var js: std.json.Stringify = .{ .writer = &out.writer };
+        self.scratch.clearRetainingCapacity();
+        defer self.recycleScratch();
+        var js: std.json.Stringify = .{ .writer = &self.scratch.writer };
         try js.beginObject();
         try field(&js, "type", kind);
         try field(&js, name, value);
         try js.endObject();
-        try out.writer.writeByte('\n');
-        try append(self.io, self.path, out.written());
+        try self.scratch.writer.writeByte('\n');
+        try append(self.io, self.path, self.scratch.written());
+    }
+
+    fn recycleScratch(self: *Thread) void {
+        if (self.scratch.writer.buffer.len > 128 * 1024) {
+            self.scratch.deinit();
+            self.scratch = .init(self.gpa);
+        } else {
+            self.scratch.clearRetainingCapacity();
+        }
     }
 };
 
@@ -342,7 +353,7 @@ pub fn create(gpa: std.mem.Allocator, io: Io, home: []const u8, cwd: []const u8,
         .data = out.written(),
         .flags = .{ .exclusive = true, .permissions = @enumFromInt(0o600) },
     });
-    return .{ .gpa = gpa, .io = io, .id = try gpa.dupe(u8, id), .path = jsonl_path };
+    return .{ .gpa = gpa, .io = io, .id = try gpa.dupe(u8, id), .path = jsonl_path, .scratch = .init(gpa) };
 }
 
 /// Load an explicit thread ID, or the most recently modified thread for cwd.
@@ -411,7 +422,7 @@ pub fn load(gpa: std.mem.Allocator, entry_gpa: std.mem.Allocator, io: Io, home: 
         }
     }
     return .{
-        .thread = .{ .gpa = gpa, .io = io, .id = id, .path = path },
+        .thread = .{ .gpa = gpa, .io = io, .id = id, .path = path, .scratch = .init(gpa) },
         .provider = provider orelse return error.InvalidThread,
         .model = model orelse return error.InvalidThread,
         .effort = effort,
@@ -644,8 +655,10 @@ test "thread JSONL resumes state after the last reset" {
         try std.testing.expect(initial.fast);
     }
     try thread.appendEntry(.{ .user = .{ .text = "old" } });
+    const scratch_capacity = thread.scratch.writer.buffer.len;
     try thread.appendReset();
     try thread.appendEntry(.{ .user = .{ .text = "new" } });
+    try std.testing.expectEqual(scratch_capacity, thread.scratch.writer.buffer.len);
     try thread.appendFast(false);
     const summaries = try list(std.testing.allocator, std.testing.io, home, "/work/project", null, 8);
     defer freeSummaries(std.testing.allocator, summaries);
