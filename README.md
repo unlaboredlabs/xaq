@@ -2,9 +2,7 @@
 
 **A coding agent in 540 KiB, taking prompts 3 ms after you hit Enter.**
 
-**1** binary · **3** providers · **4** tools · **0** daemons
-
-`xaq` talks straight to your ChatGPT, Claude, and Grok subscriptions — no proxy server, no package runtime, no plugin system, nothing between your terminal and the model. Written in Zig, inspired by [Vercel's `fx`](https://github.com/vercel-labs/fx) and [Pi](https://github.com/earendil-works/pi).
+`xaq` is a single binary that talks straight to your ChatGPT, Claude, and Grok subscriptions. Nothing runs between your terminal and the model: no daemon, no proxy server, no package runtime, no plugin system. The agent gets one conversation and four local tools. Written in Zig, inspired by [Vercel's `fx`](https://github.com/vercel-labs/fx) and [Pi](https://github.com/earendil-works/pi).
 
 <sub>540 KiB and 3 ms measured on Linux, ReleaseSmall, warm cache. Run `zig build perf` to get your own numbers.</sub>
 
