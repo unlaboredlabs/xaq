@@ -10,7 +10,8 @@ permissions:
 
 jobs:
   check:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    # Fork PRs cannot reach org-billed Blacksmith runners; fall back to GitHub-hosted.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-latest' || 'blacksmith-2vcpu-ubuntu-2404' }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
