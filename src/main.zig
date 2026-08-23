@@ -596,7 +596,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
         // Fullscreen is the default session view on a terminal; --plain or
         // XAQ_PLAIN=1 keeps the classic inline flow, and any error falls
         // back to it silently.
-        if (input_mod.interactive and !plain) {
+        if (shouldEnterFullscreen(input_mod.interactive, plain)) {
             if (tui.enter(gpa, io, output)) |tee| {
                 agent_output = tee;
             } else |err| switch (err) {
@@ -610,7 +610,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
         if (input_mod.interactive and save_thread) input_mod.initHistory(gpa, io, home);
         const startup_elapsed = Io.Clock.now(.awake, io).nanoseconds - startup_start.nanoseconds;
         if (tui.active) {
-            try agent_output.print("{s}/help for commands · ctrl-v or drop images · pgup/pgdn history · ctrl-d exits{s}\n", .{ term.dim(), term.reset() });
+            try agent_output.print("{s}/help for commands · ctrl-v or drop images · wheel or pgup/pgdn history · ctrl-d exits{s}\n", .{ term.dim(), term.reset() });
         } else {
             try agent_output.print("{s}xaq · {s}/{s} · {s}{s}\n{s}/help for commands · ctrl-v or drop images · ctrl-d exits{s}\n", .{
                 term.bold(),  @tagName(provider), model orelse agent.defaultModel(provider),
@@ -722,6 +722,21 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
             else => return err,
         }
     };
+}
+
+fn shouldEnterFullscreen(interactive: bool, plain: bool) bool {
+    return interactive and term.presentation and !plain;
+}
+
+test "fullscreen requires terminal presentation support" {
+    const previous = term.presentation;
+    defer term.presentation = previous;
+
+    term.presentation = true;
+    try std.testing.expect(shouldEnterFullscreen(true, false));
+    try std.testing.expect(!shouldEnterFullscreen(true, true));
+    term.presentation = false;
+    try std.testing.expect(!shouldEnterFullscreen(true, false));
 }
 
 test {
