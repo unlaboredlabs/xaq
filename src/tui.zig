@@ -18,11 +18,10 @@
 //! input row and popup through explicit chrome calls—never `ESC[J`—so
 //! the borders and bars are safe by construction.
 //!
-//! Activity comes from the spinner facade: in fullscreen its frames are
-//! routed through the live transcript row (`spinnerFrame`/`spinnerClear`)
-//! under the render mutex, and the label also shows statically in the
-//! info bar. `--plain`, pipes, one-shots, and small terminals keep the
-//! inline flow on the raw fd.
+//! Activity comes from the spinner facade. Frames always animate in the info
+//! bar and also use the live transcript row before response text occupies it.
+//! `--plain`, pipes, one-shots, and small terminals keep the inline flow on
+//! the raw fd.
 
 const std = @import("std");
 const Io = std.Io;
@@ -81,6 +80,8 @@ var detail_buffer: [48]u8 = undefined;
 var detail_len: usize = 0;
 var activity_buffer: [48]u8 = undefined;
 var activity_len: usize = 0;
+var activity_glyph_buffer: [4]u8 = undefined;
+var activity_glyph_len: usize = 0;
 var tokens_in: u64 = 0;
 var tokens_out: u64 = 0;
 var context_percent: u8 = 0;
@@ -188,6 +189,7 @@ pub fn exit() void {
     sink.flush() catch {};
     resetTranscriptLocked();
     activity_len = 0;
+    activity_glyph_len = 0;
     agents_running = 0;
     agents_queued = 0;
     steering_queued = 0;
@@ -483,6 +485,18 @@ pub fn setActivity(label: ?[]const u8) void {
     render_mutex.lockUncancelable(io_state);
     defer render_mutex.unlock(io_state);
     activity_len = if (label) |text| copyInto(&activity_buffer, text) else 0;
+    activity_glyph_len = 0;
+    renderInfoLocked();
+}
+
+/// Animate ongoing activity in the info bar once response text occupies the
+/// transcript's live row.
+pub fn spinnerStatusFrame(glyph: []const u8) void {
+    if (!active) return;
+    render_mutex.lockUncancelable(io_state);
+    defer render_mutex.unlock(io_state);
+    if (activity_len == 0) return;
+    activity_glyph_len = copyInto(&activity_glyph_buffer, glyph);
     renderInfoLocked();
 }
 
@@ -946,7 +960,9 @@ fn renderInfoTo(out: *Io.Writer) !void {
     if (steering_queued > 0) writer.print(" \u{b7} steer {d}", .{steering_queued}) catch {};
     if (follow_ups_queued > 0) writer.print(" \u{b7} next {d}", .{follow_ups_queued}) catch {};
     if (activity_len > 0) {
-        writer.print(" \u{b7} {s}\u{2026}", .{activity_buffer[0..activity_len]}) catch {};
+        writer.writeAll(" \u{b7} ") catch {};
+        if (activity_glyph_len > 0) writer.print("{s} ", .{activity_glyph_buffer[0..activity_glyph_len]}) catch {};
+        writer.print("{s}\u{2026}", .{activity_buffer[0..activity_len]}) catch {};
     } else switch (state) {
         .idle => writer.writeAll(" \u{b7} ready") catch {},
         .thinking => writer.writeAll(" \u{b7} thinking\u{2026}") catch {},
@@ -1439,8 +1455,18 @@ test "info bar text shows usage, activity, and hints" {
     try std.testing.expect(std.mem.find(u8, text, "12.3k") != null);
     try std.testing.expect(std.mem.find(u8, text, "Running zig build test…") != null);
     try std.testing.expect(std.mem.find(u8, text, "[Running zig build test]") == null);
+
+    var activity_output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer activity_output.deinit();
+    activity_len = copyInto(&activity_buffer, "thinking");
+    activity_glyph_len = copyInto(&activity_glyph_buffer, "⠋");
+    try renderInfoTo(&activity_output.writer);
+    try std.testing.expect(std.mem.find(u8, activity_output.written(), "⠋ thinking…") != null);
+
     state = .idle;
     detail_len = 0;
+    activity_len = 0;
+    activity_glyph_len = 0;
 }
 
 test "top bar aligns git identity and collapses on narrow terminals" {
