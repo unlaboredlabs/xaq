@@ -48,6 +48,16 @@ const file_index_bytes_max = 512 * 1024;
 const file_index_depth_max = 16;
 pub const max_input_bytes = 4 * 1024 * 1024;
 const full_echo_max = 4 * 1024;
+/// A bracketed paste at least this large is stashed out of the visible line
+/// and stands in as a numbered `[Pasted text #N +M lines]` placeholder until
+/// submission, as other agent input bars do.
+const paste_stash_min_bytes = 1000;
+const paste_stash_min_lines = 10;
+
+const PastedText = struct {
+    placeholder: []u8,
+    text: []u8,
+};
 
 pub const SubmissionKind = enum { steer, follow_up };
 
@@ -163,7 +173,7 @@ pub fn readSecret(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer
                 }
                 if (final == '~' and parameter == 200) {
                     var cursor = buffer.items.len;
-                    _ = try pasteInto(gpa, &buffer, &cursor, reader, null);
+                    _ = try pasteInto(gpa, &buffer, &cursor, reader, null, 0);
                     try drawSecret(output, label, buffer.items.len);
                 }
             },
@@ -251,6 +261,15 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
     var files: FileIndex = .{ .gpa = gpa, .context = paths };
     defer files.deinit();
     var pasted_image_paths: std.ArrayList([]u8) = .empty;
+    var pasted_texts: std.ArrayList(PastedText) = .empty;
+    var paste_seq: usize = 0;
+    defer {
+        for (pasted_texts.items) |paste| {
+            gpa.free(paste.placeholder);
+            gpa.free(paste.text);
+        }
+        pasted_texts.deinit(gpa);
+    }
     var preserve_clipboard_files = false;
     defer {
         for (pasted_image_paths.items) |path| {
@@ -318,7 +337,7 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                 .stop => {
                     if (options.draft) |draft| {
                         discardUnusedClipboardImages(gpa, files.context, buffer.items, &pasted_image_paths);
-                        draft.* = try gpa.dupe(u8, buffer.items);
+                        draft.* = try expandPastedTexts(gpa, buffer.items, pasted_texts.items);
                         preserve_clipboard_files = true;
                     }
                     try endEditor(output, popup_rows);
@@ -393,7 +412,7 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                     try output.print("{s}[input limited to 4 MiB]{s}\n", .{ term.dim(), term.reset() });
                     try output.flush();
                 }
-                const submitted = try gpa.dupe(u8, trimmed);
+                const submitted = try expandPastedTexts(gpa, trimmed, pasted_texts.items);
                 discardUnusedClipboardImages(gpa, files.context, buffer.items, &pasted_image_paths);
                 preserve_clipboard_files = submitted.len > 0 and submitted[0] != '/' and submitted[0] != '!';
                 return .{ .kind = submission_kind, .text = submitted };
@@ -637,8 +656,13 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                         },
                         200 => {
                             const paste_start = cursor;
-                            input_truncated = !(try pasteInto(gpa, &buffer, &cursor, reader, options.stop)) or input_truncated;
-                            try notePastedImagePaths(gpa, paths, buffer.items[paste_start..cursor], &pasted_image_paths);
+                            discardUnusedPastedTexts(gpa, buffer.items, &pasted_texts);
+                            input_truncated = !(try pasteInto(gpa, &buffer, &cursor, reader, options.stop, totalStashedBytes(pasted_texts.items))) or input_truncated;
+                            if (shouldStashPaste(buffer.items[paste_start..cursor])) {
+                                try stashPastedText(gpa, &buffer, &cursor, paste_start, &paste_seq, &pasted_texts);
+                            } else {
+                                try notePastedImagePaths(gpa, paths, buffer.items[paste_start..cursor], &pasted_image_paths);
+                            }
                             selected = 0;
                             hist_pos = null;
                             dirty = true;
@@ -810,14 +834,16 @@ fn load(gpa: std.mem.Allocator, buffer: *std.ArrayList(u8), text: []const u8) !b
 /// spaces. The paste is collected and inserted in one operation so inserting
 /// a large block in the middle of a prompt remains linear. False means the
 /// input limit was reached; the rest is still consumed through the terminator.
-fn pasteInto(gpa: std.mem.Allocator, buffer: *std.ArrayList(u8), cursor: *usize, reader: *Io.Reader, stop: ?*const std.atomic.Value(bool)) !bool {
+/// `reserved` counts bytes already stashed out of the buffer (placeholder
+/// pastes), so the expanded submission also respects the input limit.
+fn pasteInto(gpa: std.mem.Allocator, buffer: *std.ArrayList(u8), cursor: *usize, reader: *Io.Reader, stop: ?*const std.atomic.Value(bool), reserved: usize) !bool {
     const terminator = "\x1b[201~";
     var pasted: std.ArrayList(u8) = .empty;
     defer pasted.deinit(gpa);
     var matched: usize = 0;
     var previous: u8 = 0;
     var complete = true;
-    const available = max_input_bytes - buffer.items.len;
+    const available = max_input_bytes -| (buffer.items.len + reserved);
     while (true) {
         const byte = (try takeByteStopping(reader, stop)) orelse {
             for (terminator[0..matched]) |held| try appendPasteByte(gpa, &pasted, held, &previous, available, &complete);
@@ -848,6 +874,95 @@ fn pasteInto(gpa: std.mem.Allocator, buffer: *std.ArrayList(u8), cursor: *usize,
     try buffer.insertSlice(gpa, cursor.*, pasted.items[0..keep]);
     cursor.* += keep;
     return complete;
+}
+
+/// Big pastes read better as a placeholder than as a wall of text in a
+/// single-row editor. The 64-byte floor guarantees the placeholder is
+/// shorter than the paste it replaces.
+fn shouldStashPaste(pasted: []const u8) bool {
+    if (pasted.len <= 64) return false;
+    if (pasted.len >= paste_stash_min_bytes) return true;
+    return std.mem.count(u8, pasted, "\n") + 1 >= paste_stash_min_lines;
+}
+
+fn countPastedLines(text: []const u8) usize {
+    if (text.len == 0) return 0;
+    var lines = std.mem.count(u8, text, "\n") + 1;
+    if (text[text.len - 1] == '\n') lines -= 1;
+    return lines;
+}
+
+/// Move the just-pasted region out of the editor buffer and leave a numbered
+/// placeholder in its place. The stashed text returns at submission through
+/// `expandPastedTexts`. `seq` numbers placeholders monotonically for the
+/// lifetime of the editor so a recycled number can never alias a live
+/// placeholder after stale entries are dropped.
+fn stashPastedText(gpa: std.mem.Allocator, buffer: *std.ArrayList(u8), cursor: *usize, start: usize, seq: *usize, pastes: *std.ArrayList(PastedText)) !void {
+    const region_len = cursor.* - start;
+    const text = try gpa.dupe(u8, buffer.items[start..cursor.*]);
+    errdefer gpa.free(text);
+    const placeholder = try std.fmt.allocPrint(gpa, "[Pasted text #{d} +{d} lines]", .{ seq.* + 1, countPastedLines(text) });
+    errdefer gpa.free(placeholder);
+    if (placeholder.len >= region_len) {
+        gpa.free(placeholder);
+        gpa.free(text);
+        return;
+    }
+    try buffer.replaceRange(gpa, start, region_len, placeholder);
+    cursor.* = start + placeholder.len;
+    try pastes.append(gpa, .{ .placeholder = placeholder, .text = text });
+    seq.* += 1;
+}
+
+/// Drop stashed pastes whose placeholder no longer appears in the buffer
+/// (deleted or cleared with the line), so abandoned pastes neither hold
+/// memory nor eat the input budget of later pastes.
+fn discardUnusedPastedTexts(gpa: std.mem.Allocator, text: []const u8, pastes: *std.ArrayList(PastedText)) void {
+    var index: usize = 0;
+    while (index < pastes.items.len) {
+        const paste = pastes.items[index];
+        if (std.mem.indexOf(u8, text, paste.placeholder) != null) {
+            index += 1;
+            continue;
+        }
+        gpa.free(paste.placeholder);
+        gpa.free(paste.text);
+        _ = pastes.orderedRemove(index);
+    }
+}
+
+fn totalStashedBytes(pastes: []const PastedText) usize {
+    var total: usize = 0;
+    for (pastes) |paste| total += paste.text.len;
+    return total;
+}
+
+/// Rebuild outgoing text with every stashed paste restored in place of its
+/// placeholder. Unrecognized bracketed text passes through untouched.
+fn expandPastedTexts(gpa: std.mem.Allocator, text: []const u8, pastes: []const PastedText) ![]u8 {
+    if (pastes.len == 0) return gpa.dupe(u8, text);
+    var expanded: Io.Writer.Allocating = .init(gpa);
+    defer expanded.deinit();
+    var offset: usize = 0;
+    while (offset < text.len) {
+        const bracket = std.mem.indexOfScalarPos(u8, text, offset, '[') orelse {
+            try expanded.writer.writeAll(text[offset..]);
+            break;
+        };
+        try expanded.writer.writeAll(text[offset..bracket]);
+        offset = bracket;
+        const match = for (pastes) |paste| {
+            if (std.mem.startsWith(u8, text[offset..], paste.placeholder)) break paste;
+        } else null;
+        if (match) |paste| {
+            try expanded.writer.writeAll(paste.text);
+            offset += paste.placeholder.len;
+        } else {
+            try expanded.writer.writeByte('[');
+            offset += 1;
+        }
+    }
+    return expanded.toOwnedSlice();
 }
 
 /// Remember image paths from a bracketed paste so the editor can draw the
@@ -2153,7 +2268,7 @@ test "bracketed paste grows beyond the old editor buffer and inserts once" {
     try buffer.appendSlice(std.testing.allocator, "tail");
     var cursor: usize = 0;
 
-    try std.testing.expect(try pasteInto(std.testing.allocator, &buffer, &cursor, &reader, null));
+    try std.testing.expect(try pasteInto(std.testing.allocator, &buffer, &cursor, &reader, null, 0));
     try std.testing.expectEqual(paste_len, cursor);
     try std.testing.expectEqual(paste_len + "tail".len, buffer.items.len);
     try std.testing.expectEqualStrings("tail", buffer.items[paste_len..]);
@@ -2165,7 +2280,7 @@ test "bracketed paste normalizes line endings and control bytes" {
     defer buffer.deinit(std.testing.allocator);
     var cursor: usize = 0;
 
-    try std.testing.expect(try pasteInto(std.testing.allocator, &buffer, &cursor, &reader, null));
+    try std.testing.expect(try pasteInto(std.testing.allocator, &buffer, &cursor, &reader, null, 0));
     try std.testing.expectEqualStrings("a\nb c", buffer.items);
 }
 
@@ -2178,10 +2293,106 @@ test "bracketed paste consumes excess input and reports the hard limit" {
     @memset(buffer.items, 'z');
     var cursor = buffer.items.len;
 
-    try std.testing.expect(!try pasteInto(std.testing.allocator, &buffer, &cursor, &reader, null));
+    try std.testing.expect(!try pasteInto(std.testing.allocator, &buffer, &cursor, &reader, null, 0));
     try std.testing.expectEqual(max_input_bytes, buffer.items.len);
     try std.testing.expectEqualStrings("ab", buffer.items[buffer.items.len - 2 ..]);
     try std.testing.expectEqual(source.len, reader.seek);
+}
+
+test "large pastes collapse to a placeholder and expand on submit" {
+    const gpa = std.testing.allocator;
+    var pastes: std.ArrayList(PastedText) = .empty;
+    defer {
+        for (pastes.items) |paste| {
+            gpa.free(paste.placeholder);
+            gpa.free(paste.text);
+        }
+        pastes.deinit(gpa);
+    }
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(gpa);
+    const body = "line!\n" ** 12;
+    try buffer.appendSlice(gpa, "review " ++ body ++ " please");
+    var cursor: usize = "review ".len + body.len;
+    var seq: usize = 0;
+
+    try std.testing.expect(shouldStashPaste(body));
+    try stashPastedText(gpa, &buffer, &cursor, "review ".len, &seq, &pastes);
+    try std.testing.expectEqualStrings("review [Pasted text #1 +12 lines] please", buffer.items);
+    try std.testing.expectEqual("review [Pasted text #1 +12 lines]".len, cursor);
+    try std.testing.expectEqual(@as(usize, 1), seq);
+
+    const expanded = try expandPastedTexts(gpa, buffer.items, pastes.items);
+    defer gpa.free(expanded);
+    try std.testing.expectEqualStrings("review " ++ body ++ " please", expanded);
+
+    // Unknown bracketed text is preserved; only stashed placeholders expand.
+    const partial = try expandPastedTexts(gpa, "[Pasted text #2] [Pasted text #1 +12 lines]", pastes.items);
+    defer gpa.free(partial);
+    try std.testing.expectEqualStrings("[Pasted text #2] " ++ body, partial);
+}
+
+test "small pastes stay inline" {
+    try std.testing.expect(!shouldStashPaste("short text"));
+    try std.testing.expect(!shouldStashPaste("a\nb\nc"));
+    try std.testing.expect(shouldStashPaste("x" ** paste_stash_min_bytes));
+
+    // Too small for the placeholder to shrink the line: keep the raw paste.
+    const gpa = std.testing.allocator;
+    var pastes: std.ArrayList(PastedText) = .empty;
+    defer pastes.deinit(gpa);
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(gpa);
+    try buffer.appendSlice(gpa, "\n" ** 12);
+    var cursor: usize = buffer.items.len;
+    var seq: usize = 0;
+    try stashPastedText(gpa, &buffer, &cursor, 0, &seq, &pastes);
+    try std.testing.expectEqual(@as(usize, 0), pastes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), seq);
+    try std.testing.expectEqualStrings("\n" ** 12, buffer.items);
+}
+
+test "abandoned stashed pastes are dropped and numbering never aliases" {
+    const gpa = std.testing.allocator;
+    var pastes: std.ArrayList(PastedText) = .empty;
+    defer {
+        for (pastes.items) |paste| {
+            gpa.free(paste.placeholder);
+            gpa.free(paste.text);
+        }
+        pastes.deinit(gpa);
+    }
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(gpa);
+    var seq: usize = 0;
+    const body = "data\n" ** 20;
+
+    try buffer.appendSlice(gpa, body);
+    var cursor: usize = buffer.items.len;
+    try stashPastedText(gpa, &buffer, &cursor, 0, &seq, &pastes);
+    try std.testing.expectEqualStrings("[Pasted text #1 +20 lines]", buffer.items);
+
+    // The line is cleared (ctrl-c): the stash is stale and gets dropped,
+    // but the next paste still takes a fresh number.
+    buffer.clearRetainingCapacity();
+    discardUnusedPastedTexts(gpa, buffer.items, &pastes);
+    try std.testing.expectEqual(@as(usize, 0), pastes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), totalStashedBytes(pastes.items));
+
+    try buffer.appendSlice(gpa, body);
+    cursor = buffer.items.len;
+    try stashPastedText(gpa, &buffer, &cursor, 0, &seq, &pastes);
+    try std.testing.expectEqualStrings("[Pasted text #2 +20 lines]", buffer.items);
+}
+
+test "stashed bytes count against the paste budget" {
+    var reader = Io.Reader.fixed("abcd\x1b[201~");
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(std.testing.allocator);
+    var cursor: usize = 0;
+
+    try std.testing.expect(!try pasteInto(std.testing.allocator, &buffer, &cursor, &reader, null, max_input_bytes - 2));
+    try std.testing.expectEqualStrings("ab", buffer.items);
 }
 
 test "large submitted prompts use a compact terminal echo" {
@@ -2353,7 +2564,7 @@ test "busy escape and paste continuations honor stop requests" {
     var buffer: std.ArrayList(u8) = .empty;
     defer buffer.deinit(std.testing.allocator);
     var cursor: usize = 0;
-    try std.testing.expect(try pasteInto(std.testing.allocator, &buffer, &cursor, &reader, &stop));
+    try std.testing.expect(try pasteInto(std.testing.allocator, &buffer, &cursor, &reader, &stop, 0));
     try std.testing.expectEqual(@as(usize, 0), buffer.items.len);
     try std.testing.expectEqual(@as(usize, 0), cursor);
 }
