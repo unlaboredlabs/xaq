@@ -6,6 +6,7 @@ const auth = @import("auth.zig");
 const image_input = @import("image.zig");
 const input_mod = @import("input.zig");
 const log = @import("log.zig");
+const models = @import("models.zig");
 const state_mod = @import("state.zig");
 const term = @import("term.zig");
 const threads = @import("threads.zig");
@@ -50,6 +51,8 @@ const usage =
     \\Defaults: the last selection made interactively via /model, /effort,
     \\or /fast (initially provider=chatgpt with its default model); flags
     \\override for one invocation without changing what is remembered.
+    \\A recognized --model ID implies its provider, so --provider is only
+    \\needed for model IDs xaq does not know.
     \\
 ;
 
@@ -515,7 +518,14 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
     var provider: auth.Provider = provider_arg orelse .chatgpt;
     if (resume_id == null) {
         if (provider_arg == null) {
-            if (remembered.value.provider) |last| provider = connectedProvider(gpa, io, home, last);
+            // A catalog --model ID names its provider; treat the pair as
+            // one choice. Unknown IDs keep the remembered provider so
+            // snapshot names remain usable.
+            if (if (model) |id| models.findAny(id) else null) |profile| {
+                provider = profile.provider;
+            } else if (remembered.value.provider) |last| {
+                provider = connectedProvider(gpa, io, home, last);
+            }
         }
         const resolved = applyRememberedSelection(remembered.value.selection(provider), model, effort, fast);
         model = resolved.model;

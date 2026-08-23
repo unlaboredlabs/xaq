@@ -86,6 +86,17 @@ pub fn find(provider: auth.Provider, id: []const u8) ?*const Profile {
     return null;
 }
 
+/// Catalog model IDs are globally unique, so a bare ID also names its
+/// provider. This is what lets /model and --model switch providers without
+/// a separate provider argument. Unknown IDs return null and stay with the
+/// caller's provider.
+pub fn findAny(id: []const u8) ?*const Profile {
+    for (&profiles) |*profile| {
+        if (std.mem.eql(u8, profile.id, id)) return profile;
+    }
+    return null;
+}
+
 pub fn contextWindow(provider: auth.Provider, id: []const u8) u32 {
     if (find(provider, id)) |profile| return profile.context_tokens;
     return switch (provider) {
@@ -113,6 +124,13 @@ pub fn supportsFast(provider: auth.Provider, id: []const u8) bool {
         (std.mem.startsWith(u8, id, "claude-opus-5-") or
             std.mem.eql(u8, id, "claude-opus-4-8") or
             std.mem.startsWith(u8, id, "claude-opus-4-8-"));
+}
+
+test "catalog model IDs resolve their provider" {
+    try std.testing.expectEqual(auth.Provider.chatgpt, findAny("gpt-5.4-mini").?.provider);
+    try std.testing.expectEqual(auth.Provider.claude, findAny("claude-opus-5").?.provider);
+    try std.testing.expectEqual(auth.Provider.grok, findAny("grok-4.6").?.provider);
+    try std.testing.expectEqual(@as(?*const Profile, null), findAny("gpt-6-unknown"));
 }
 
 test "subscription profiles preserve product-specific context windows" {
