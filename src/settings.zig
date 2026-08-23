@@ -11,6 +11,7 @@ pub const Config = struct {
     subagents_enabled: bool = true,
     subagent_max_concurrent: u8 = 4,
     subagent_default_background: bool = true,
+    subagent_panel: bool = true,
     firecrawl_api_key: ?[]const u8 = null,
 
     pub const ProviderModels = struct {
@@ -150,6 +151,7 @@ test "settings round trip provider-specific compaction choices" {
     value.subagents_enabled = false;
     value.subagent_max_concurrent = 2;
     value.subagent_default_background = false;
+    value.subagent_panel = false;
     value.firecrawl_api_key = "fc-test-key";
     try save(std.testing.allocator, std.testing.io, home, value);
     var loaded = try load(std.testing.allocator, std.testing.io, home);
@@ -161,6 +163,7 @@ test "settings round trip provider-specific compaction choices" {
     try std.testing.expect(!loaded.value.subagents_enabled);
     try std.testing.expectEqual(@as(u8, 2), loaded.value.subagent_max_concurrent);
     try std.testing.expect(!loaded.value.subagent_default_background);
+    try std.testing.expect(!loaded.value.subagent_panel);
     try std.testing.expectEqualStrings("fc-test-key", loaded.value.firecrawl_api_key.?);
 }
 

@@ -89,7 +89,7 @@ fn connectedProvider(gpa: std.mem.Allocator, io: Io, home: []const u8, last: aut
 
 /// Options whose next argument is a value, for the help/version pre-scan.
 fn takesValue(argument: []const u8) bool {
-    const value_options = [_][]const u8{ "--provider", "--model", "--image", "-i", "--effort", "--output-format", "--resume", "--subagent-control", "-p", "--prompt" };
+    const value_options = [_][]const u8{ "--provider", "--model", "--image", "-i", "--effort", "--output-format", "--resume", "--subagent-control", "--subagent-status", "-p", "--prompt" };
     for (value_options) |option| {
         if (std.mem.eql(u8, argument, option)) return true;
     }
@@ -434,6 +434,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
     var run_once = false;
     var resume_id: ?[]const u8 = null;
     var subagent_control: ?[]const u8 = null;
+    var subagent_status: ?[]const u8 = null;
     var output_format: OutputFormat = .plain;
     var save_thread = true;
     var image_paths: std.ArrayList([]const u8) = .empty;
@@ -483,6 +484,10 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
             i += 1;
             if (i >= args.len) fatal(io, "--subagent-control needs a path", .{});
             subagent_control = args[i];
+        } else if (std.mem.eql(u8, args[i], "--subagent-status")) {
+            i += 1;
+            if (i >= args.len) fatal(io, "--subagent-status needs a path", .{});
+            subagent_status = args[i];
         } else if (std.mem.eql(u8, args[i], "-p") or std.mem.eql(u8, args[i], "--prompt")) {
             i += 1;
             if (i >= args.len) fatal(io, "{s} needs a value", .{args[i - 1]});
@@ -650,6 +655,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
         .resume_id = resume_id,
         .save_thread = save_thread,
         .subagent_control = subagent_control,
+        .subagent_status = subagent_status,
         .events = if (output_format == .plain) null else .{ .context = &json_output, .emit = JsonOutput.event },
     }) catch |err| {
         // The catch may end in process.exit, which skips defers: leave

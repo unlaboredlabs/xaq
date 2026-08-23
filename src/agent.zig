@@ -101,6 +101,7 @@ pub const Options = struct {
     save_thread: bool = true,
     /// Hidden worker controls used by subagent child processes.
     subagent_control: ?[]const u8 = null,
+    subagent_status: ?[]const u8 = null,
     events: ?EventSink = null,
 };
 
@@ -138,6 +139,7 @@ const Session = struct {
     subagent_manager: ?subagents.Manager = null,
     subagent_control: ?[]const u8 = null,
     subagent_control_offset: u64 = 0,
+    subagent_status: ?[]const u8 = null,
 
     fn allocator(self: *Session) std.mem.Allocator {
         return self.arena.allocator();
@@ -380,6 +382,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
             .background_by_default = user_settings.value.subagent_default_background,
         }) else null,
         .subagent_control = options.subagent_control,
+        .subagent_status = options.subagent_status,
         .arena = .init(gpa),
         .instructions = try context.load(gpa, io, options.home, options.cwd),
         .settings = user_settings,
@@ -389,6 +392,17 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
     defer session.deinit();
     var signal_scope = cancel.Scope.install();
     defer signal_scope.deinit();
+
+    // Keep the agents panel and info-bar counts fresh while the user sits
+    // at the prompt; the foreground editor fires this on its idle poll.
+    if (options.input != null) {
+        input_mod.idle_tick = agentIdleTick;
+        input_mod.idle_tick_context = &session;
+    }
+    defer {
+        input_mod.idle_tick = null;
+        input_mod.idle_tick_context = null;
+    }
 
     if (options.resume_id) |id| {
         try session.resumeThread(if (id.len == 0) null else id);
@@ -475,6 +489,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
         run_rounds += 1;
         try session.emit(.{ .round_start = .{ .number = run_rounds } });
         tui.noteState(.thinking, "");
+        writeWorkerStatus(&session, "thinking", "");
         const round_result = performRound(&session) catch |err| switch (err) {
             error.NotLoggedIn => {
                 session.turn -|= 1;
@@ -680,6 +695,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
                 var activity: Io.Writer = .fixed(&activity_buffer);
                 try writeToolDescription(&activity, call.name, parsed, .running, null);
                 tui.noteState(.tooling, activity.buffered());
+                writeWorkerStatus(&session, "tooling", activity.buffered());
                 spin.start(io, activity.buffered());
                 defer spin.stop();
                 const result = tools.executeWithContext(scratch_gpa, io, call.name, parsed, .{
@@ -1655,7 +1671,7 @@ fn effectiveCompactEffort(session: *const Session) ?Effort {
 fn printSettings(session: *Session) !void {
     const configured_model = configuredCompactModel(session);
     try session.output.print(
-        "  auto compact       {s}\n  threshold          {d}%\n  compaction model   {s}\n  compaction effort  {s}\n  subagents          {s}\n  agent concurrency  {d}\n  agent default      {s}\n",
+        "  auto compact       {s}\n  threshold          {d}%\n  compaction model   {s}\n  compaction effort  {s}\n  subagents          {s}\n  agent concurrency  {d}\n  agent default      {s}\n  agent panel        {s}\n",
         .{
             if (session.settings.value.auto_compact) "on" else "off",
             session.settings.value.compact_threshold_percent,
@@ -1664,6 +1680,7 @@ fn printSettings(session: *Session) !void {
             if (session.settings.value.subagents_enabled) "on" else "off",
             session.settings.value.subagent_max_concurrent,
             if (session.settings.value.subagent_default_background) "background" else "foreground",
+            if (session.settings.value.subagent_panel) "on" else "off",
         },
     );
 }
@@ -1701,7 +1718,7 @@ fn writeSelection(session: *Session) !void {
 
 fn pickSettings(session: *Session, reader: *Io.Reader) !void {
     while (true) {
-        var storage: [7][160]u8 = undefined;
+        var storage: [8][160]u8 = undefined;
         const items = [_][]const u8{
             try std.fmt.bufPrint(&storage[0], "auto compact       {s}", .{if (session.settings.value.auto_compact) "on" else "off"}),
             try std.fmt.bufPrint(&storage[1], "threshold          {d}%", .{session.settings.value.compact_threshold_percent}),
@@ -1710,6 +1727,7 @@ fn pickSettings(session: *Session, reader: *Io.Reader) !void {
             try std.fmt.bufPrint(&storage[4], "subagents          {s}", .{if (session.settings.value.subagents_enabled) "on" else "off"}),
             try std.fmt.bufPrint(&storage[5], "agent concurrency  {d}", .{session.settings.value.subagent_max_concurrent}),
             try std.fmt.bufPrint(&storage[6], "agent default      {s}", .{if (session.settings.value.subagent_default_background) "background" else "foreground"}),
+            try std.fmt.bufPrint(&storage[7], "agent panel        {s}", .{if (session.settings.value.subagent_panel) "on" else "off"}),
         };
         try session.output.print("{s}settings for {s} \u{b7} enter edits \u{b7} esc/q closes{s}\r\n", .{ term.dim(), @tagName(session.provider), term.reset() });
         try session.output.flush();
@@ -1806,6 +1824,17 @@ fn pickSettings(session: *Session, reader: *Io.Reader) !void {
                     session.settings.value.subagent_default_background = index == 0;
                     try saveSettings(session);
                     try applySubagentSettings(session);
+                }
+            },
+            7 => {
+                const labels = [_][]const u8{ "on", "off" };
+                const initial: usize = if (session.settings.value.subagent_panel) 0 else 1;
+                try session.output.print("{s}show live subagents above the info bar (fullscreen){s}\r\n", .{ term.dim(), term.reset() });
+                try session.output.flush();
+                if (try input_mod.pick(reader, session.output, &labels, initial)) |index| {
+                    session.settings.value.subagent_panel = index == 0;
+                    try saveSettings(session);
+                    syncTui(session);
                 }
             },
             else => unreachable,
@@ -2402,11 +2431,94 @@ fn syncTui(session: *Session) void {
     );
     tui.noteUsage(session.usage.input, session.usage.output, percent);
     if (session.subagent_manager) |*manager| {
+        syncAgentsPanel(session, manager);
         const agent_counts = manager.counts();
         tui.noteAgents(agent_counts.running, agent_counts.queued);
     } else {
         tui.noteAgents(0, 0);
+        tui.noteAgentsPanel(&.{}, 0);
     }
+}
+
+var idle_tick_last_ms: i64 = 0;
+
+/// Foreground-editor idle callback: refresh subagent chrome twice a second
+/// while any agent is visible. Runs on the agent's own thread, so touching
+/// the manager here cannot race a tool round.
+fn agentIdleTick(opaque_session: *anyopaque) void {
+    const session: *Session = @ptrCast(@alignCast(opaque_session));
+    if (!tui.active) return;
+    const manager = if (session.subagent_manager) |*manager| manager else return;
+    if (!manager.hasVisibleAgents()) return;
+    const now = Io.Clock.real.now(session.io).toMilliseconds();
+    if (now - idle_tick_last_ms < 500) return;
+    idle_tick_last_ms = now;
+    syncAgentsPanel(session, manager);
+    const agent_counts = manager.counts();
+    tui.noteAgents(agent_counts.running, agent_counts.queued);
+}
+
+/// Push the manager's live agents into the fullscreen panel. Slices point
+/// at record memory; the TUI copies them into fixed buffers under its lock.
+fn syncAgentsPanel(session: *Session, manager: *subagents.Manager) void {
+    if (!session.settings.value.subagent_panel) {
+        tui.noteAgentsPanel(&.{}, 0);
+        return;
+    }
+    var infos: [4]subagents.PanelInfo = undefined;
+    const counts = manager.panelSnapshot(&infos);
+    var panel_rows: [4]tui.AgentPanelRow = undefined;
+    for (infos[0..counts.shown], 0..) |info, index| {
+        panel_rows[index] = .{
+            .id = info.id,
+            .status = switch (info.status) {
+                .queued => .queued,
+                .running => .running,
+                .completed => .completed,
+                .failed => .failed,
+                .stopped => .stopped,
+            },
+            .started_ms = info.started_ms,
+            .completed_ms = info.completed_ms,
+            .model = info.model,
+            .effort = info.effort orelse "",
+            .detail = if (info.status == .failed and info.failure.len > 0)
+                info.failure
+            else if (info.activity.len > 0)
+                info.activity
+            else
+                info.description,
+        };
+    }
+    tui.noteAgentsPanel(panel_rows[0..counts.shown], counts.total);
+}
+
+/// Subagent workers report a small heartbeat file that the parent renders
+/// in its agents panel. Best effort: visibility must never fail the worker.
+fn writeWorkerStatus(session: *Session, state: []const u8, activity: []const u8) void {
+    const path = session.subagent_status orelse return;
+    var buffer: [1536]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buffer);
+    var js: std.json.Stringify = .{ .writer = &writer };
+    writeWorkerStatusJson(&js, state, activity, session.turn, session.usage, contextPercent(session)) catch return;
+    subagents.atomicWrite(session.gpa, session.io, path, writer.buffered()) catch {};
+}
+
+fn writeWorkerStatusJson(js: *std.json.Stringify, state: []const u8, activity: []const u8, turn: u64, used: Usage, percent: usize) !void {
+    try js.beginObject();
+    try js.objectField("state");
+    try js.write(state);
+    try js.objectField("activity");
+    try js.write(activity);
+    try js.objectField("turn");
+    try js.write(turn);
+    try js.objectField("input");
+    try js.write(used.input);
+    try js.objectField("output");
+    try js.write(used.output);
+    try js.objectField("percent");
+    try js.write(percent);
+    try js.endObject();
 }
 
 fn refreshGit(session: *Session) void {

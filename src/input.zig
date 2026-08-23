@@ -1877,6 +1877,14 @@ const InputEvent = union(enum) {
     stop,
 };
 
+/// Optional hook fired on the foreground editor's 100 ms idle poll. It
+/// never fires from the concurrent busy editor (which always passes a stop
+/// flag), so the callback runs on the agent's own thread. The agent
+/// installs it to keep background-subagent chrome fresh while the user
+/// sits at the prompt.
+pub var idle_tick: ?*const fn (context: *anyopaque) void = null;
+pub var idle_tick_context: ?*anyopaque = null;
+
 const ResizeWait = struct {
     size: ?term.WindowSize,
 
@@ -1904,6 +1912,18 @@ const ResizeWait = struct {
             }};
             if (try std.posix.poll(&descriptors, 100) > 0) {
                 return if (try takeByteOrNull(reader)) |byte| .{ .byte = byte } else .end;
+            }
+            if (stop == null) {
+                if (idle_tick) |hook| {
+                    if (idle_tick_context) |context| hook(context);
+                }
+                // A panel height change defers its relayout while the
+                // editor owns the cursor; apply it here and repaint.
+                if (tui.checkResize()) return .resize;
+            } else {
+                // The busy editor keeps agent elapsed times ticking; the
+                // call touches only TUI state under the render mutex.
+                tui.agentsPanelTick();
             }
             if (tui.expireStartupHint()) return .resize;
             const next_size = term.windowSizeRaw();

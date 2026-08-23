@@ -88,6 +88,44 @@ var agents_queued: u8 = 0;
 var steering_queued: u8 = 0;
 var follow_ups_queued: u8 = 0;
 
+// Agents panel: a strip of chrome rows directly above the info bar, one
+// per live or unseen subagent. Zero rows when no agents exist, so the
+// chrome is unchanged for sessions that never launch one.
+const panel_max_rows = 4;
+const panel_min_terminal_rows = 16;
+
+pub const AgentPanelStatus = enum { queued, running, completed, failed, stopped };
+
+pub const AgentPanelRow = struct {
+    id: []const u8,
+    status: AgentPanelStatus,
+    started_ms: i64,
+    completed_ms: ?i64 = null,
+    model: []const u8,
+    effort: []const u8 = "",
+    detail: []const u8 = "",
+};
+
+const PanelSlot = struct {
+    id_buffer: [24]u8 = undefined,
+    id_len: usize = 0,
+    status: AgentPanelStatus = .queued,
+    started_ms: i64 = 0,
+    completed_ms: ?i64 = null,
+    model_buffer: [32]u8 = undefined,
+    model_len: usize = 0,
+    effort_buffer: [12]u8 = undefined,
+    effort_len: usize = 0,
+    detail_buffer: [128]u8 = undefined,
+    detail_len: usize = 0,
+};
+
+var panel_slots: [panel_max_rows]PanelSlot = .{ .{}, .{}, .{}, .{} };
+var panel_count: usize = 0;
+var panel_total: usize = 0;
+var panel_height: usize = 0;
+var panel_last_tick_s: i64 = 0;
+
 // Transcript writes restore this cursor while the concurrent editor owns the
 // fixed input row.
 var input_cursor_row: usize = 0;
@@ -164,6 +202,9 @@ fn enterMeasured(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, measured: ?ter
     layout_ready = true;
     layout_dirty = false;
     startup_hint_len = 0;
+    panel_count = 0;
+    panel_total = 0;
+    panel_height = 0;
     errdefer rollbackEnter();
     try out.writeAll("\x1b[?1049h\x1b[2J");
     try armRegion(out);
@@ -195,6 +236,9 @@ pub fn exit() void {
     agents_queued = 0;
     steering_queued = 0;
     follow_ups_queued = 0;
+    panel_count = 0;
+    panel_total = 0;
+    panel_height = 0;
     input_active = false;
     startup_hint_len = 0;
     layout_ready = false;
@@ -470,6 +514,45 @@ pub fn noteAgents(running: usize, queued: usize) void {
     renderInfoLocked();
 }
 
+/// Replace the agents panel contents. `entries` carries up to four agents
+/// in launch order; `total` includes any overflow beyond the shown rows.
+/// A height change relayouts the chrome through the resize path; a
+/// content-only change redraws the panel rows in place.
+pub fn noteAgentsPanel(entries: []const AgentPanelRow, total: usize) void {
+    if (!active) return;
+    render_mutex.lockUncancelable(io_state);
+    defer render_mutex.unlock(io_state);
+    panel_count = @min(entries.len, panel_max_rows);
+    for (entries[0..panel_count], 0..) |entry, index| {
+        const slot = &panel_slots[index];
+        slot.id_len = copyInto(&slot.id_buffer, entry.id);
+        slot.status = entry.status;
+        slot.started_ms = entry.started_ms;
+        slot.completed_ms = entry.completed_ms;
+        slot.model_len = copyInto(&slot.model_buffer, entry.model);
+        slot.effort_len = copyInto(&slot.effort_buffer, entry.effort);
+        slot.detail_len = copyInto(&slot.detail_buffer, entry.detail);
+    }
+    panel_total = total;
+    const previous_rows = panelRows();
+    panel_height = panelTargetHeight(total, panel_height);
+    if (panelRows() != previous_rows) {
+        layout_dirty = true;
+        // The editor owns the cursor during input phases; the dirty flag
+        // is applied on its next frame poll, like a deferred resize.
+        if (!input_active) _ = resizeIfNeededLocked();
+        return;
+    }
+    renderPanelLocked();
+}
+
+/// Panel height grows immediately but only collapses once every agent is
+/// gone, so trickling completions do not churn the transcript layout.
+fn panelTargetHeight(total: usize, held: usize) usize {
+    if (total == 0) return 0;
+    return @min(@max(total, held), panel_max_rows);
+}
+
 pub fn noteQueue(steering: usize, follow_ups: usize) void {
     if (!active) return;
     render_mutex.lockUncancelable(io_state);
@@ -489,6 +572,25 @@ pub fn setActivity(label: ?[]const u8) void {
     renderInfoLocked();
 }
 
+/// Re-render the agents panel at most once per second while an agent is
+/// running, so elapsed times tick between manager snapshots. Touches only
+/// TUI state under the render mutex, so any thread's poll loop may call it.
+pub fn agentsPanelTick() void {
+    if (!active) return;
+    render_mutex.lockUncancelable(io_state);
+    defer render_mutex.unlock(io_state);
+    if (!layout_ready or panelRows() == 0) return;
+    var running = false;
+    for (panel_slots[0..panel_count]) |slot| {
+        if (slot.status == .running) running = true;
+    }
+    if (!running) return;
+    const now_s = @divTrunc(Io.Clock.real.now(io_state).toMilliseconds(), 1000);
+    if (now_s == panel_last_tick_s) return;
+    panel_last_tick_s = now_s;
+    renderPanelTo(sink) catch return;
+    sink.flush() catch {};
+}
 /// Draw a completion popup overlaying the bottom of the transcript,
 /// `count` rows tall. Rows are then filled with `popupLine`. When the
 /// popup shrinks or closes, the transcript is repainted from the ring.
@@ -567,7 +669,14 @@ fn inputContentRow() usize {
 }
 
 fn inputBottomRow() usize {
-    return infoBarRow() - status_gap - 1;
+    return infoBarRow() - status_gap - 1 - panelRows();
+}
+
+/// Rows the agents panel currently occupies, directly above the info bar.
+/// Small terminals suppress the panel; the info bar counts remain.
+fn panelRows() usize {
+    if (rows < panel_min_terminal_rows) return 0;
+    return panel_height;
 }
 
 fn infoBarRow() usize {
@@ -589,7 +698,56 @@ fn armRegion(out: *Io.Writer) !void {
 fn drawChrome(out: *Io.Writer) !void {
     try renderTopTo(out);
     try renderBoxTo(out);
+    try renderPanelTo(out);
     try renderInfoTo(out);
+}
+
+fn renderPanelLocked() void {
+    _ = resizeIfNeededLocked();
+    if (!layout_ready) return;
+    renderPanelTo(sink) catch {};
+    sink.flush() catch {};
+}
+
+fn renderPanelTo(out: *Io.Writer) !void {
+    const height = panelRows();
+    if (height == 0) return;
+    const now_ms = Io.Clock.real.now(io_state).toMilliseconds();
+    const overflow = panel_total > height;
+    const shown = if (overflow) height - 1 else @min(panel_count, height);
+    var index: usize = 0;
+    while (index < height) : (index += 1) {
+        const row = infoBarRow() - height + index;
+        var buffer: [256]u8 = undefined;
+        var writer: Io.Writer = .fixed(&buffer);
+        if (index < shown) {
+            writePanelLine(&writer, &panel_slots[index], now_ms) catch {};
+        } else if (overflow and index == height - 1) {
+            writer.print(" + {d} more · /agents", .{panel_total - shown}) catch {};
+        }
+        try renderBar(out, row, writer.buffered());
+    }
+}
+
+fn writePanelLine(writer: *Io.Writer, slot: *const PanelSlot, now_ms: i64) !void {
+    try writer.print(" {s:<18} {s:<9} ", .{ slot.id_buffer[0..slot.id_len], @tagName(slot.status) });
+    var elapsed_buffer: [16]u8 = undefined;
+    const elapsed = switch (slot.status) {
+        .queued => "-",
+        .running => formatPanelDuration(&elapsed_buffer, now_ms - slot.started_ms),
+        else => if (slot.completed_ms) |finished| formatPanelDuration(&elapsed_buffer, finished - slot.started_ms) else "-",
+    };
+    try writer.print("{s:>6}  ", .{elapsed});
+    try writer.writeAll(slot.model_buffer[0..slot.model_len]);
+    if (slot.effort_len > 0) try writer.print("/{s}", .{slot.effort_buffer[0..slot.effort_len]});
+    if (slot.detail_len > 0) try writer.print("  {s}", .{slot.detail_buffer[0..slot.detail_len]});
+}
+
+fn formatPanelDuration(buffer: []u8, milliseconds: i64) []const u8 {
+    const clamped = @max(milliseconds, 0);
+    if (clamped < 1000) return "<1s";
+    if (clamped < 60_000) return std.fmt.bufPrint(buffer, "{d}s", .{@divTrunc(clamped, 1000)}) catch "?";
+    return std.fmt.bufPrint(buffer, "{d}m{d}s", .{ @divTrunc(clamped, 60_000), @divTrunc(@mod(clamped, 60_000), 1000) }) catch "?";
 }
 
 fn viewportHeight() usize {
@@ -957,7 +1115,8 @@ fn renderInfoTo(out: *Io.Writer) !void {
     } else {
         writer.writeAll(" \u{b7} enter steers \u{b7} alt-enter next \u{b7} ctrl-c stops") catch {};
     }
-    try clearRow(out, infoBarRow() - 1);
+    // The gap row sits above the panel when one is open.
+    try clearRow(out, infoBarRow() - 1 - panelRows());
     try renderBar(out, infoBarRow(), writer.buffered());
     try clearRow(out, rows);
 }
@@ -1490,6 +1649,100 @@ test "fullscreen layout leaves margins around chrome and status" {
     try std.testing.expectEqual(21, inputBottomRow());
     try std.testing.expectEqual(23, infoBarRow());
     try std.testing.expectEqual(InputArea{ .row = 20, .col = 6, .width = 72 }, inputArea());
+}
+
+test "agents panel reserves rows above the info bar" {
+    rows = 24;
+    cols = 80;
+    layout_ready = true;
+    panel_height = 2;
+    defer {
+        layout_ready = false;
+        panel_height = 0;
+    }
+    try std.testing.expectEqual(2, panelRows());
+    try std.testing.expectEqual(23, infoBarRow());
+    try std.testing.expectEqual(19, inputBottomRow());
+    try std.testing.expectEqual(18, inputContentRow());
+    try std.testing.expectEqual(17, inputTopRow());
+    try std.testing.expectEqual(16, regionBottom());
+
+    // Small terminals keep the classic chrome; counts stay in the info bar.
+    rows = 12;
+    try std.testing.expectEqual(0, panelRows());
+    try std.testing.expectEqual(9, inputBottomRow());
+}
+
+test "panel height grows eagerly and collapses only when empty" {
+    try std.testing.expectEqual(0, panelTargetHeight(0, 3));
+    try std.testing.expectEqual(2, panelTargetHeight(2, 0));
+    try std.testing.expectEqual(3, panelTargetHeight(1, 3));
+    try std.testing.expectEqual(4, panelTargetHeight(9, 2));
+}
+
+test "panel lines show status, elapsed, model, and detail" {
+    var slot: PanelSlot = .{};
+    slot.id_len = copyInto(&slot.id_buffer, "agent-3f9a2c");
+    slot.status = .running;
+    slot.started_ms = 0;
+    slot.model_len = copyInto(&slot.model_buffer, "gpt-5.2");
+    slot.effort_len = copyInto(&slot.effort_buffer, "medium");
+    slot.detail_len = copyInto(&slot.detail_buffer, "Editing src/auth.zig · turn 3");
+    var buffer: [256]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buffer);
+    try writePanelLine(&writer, &slot, 134_000);
+    const line = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, line, "agent-3f9a2c") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "running") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "2m14s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "gpt-5.2/medium") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line, "Editing src/auth.zig · turn 3") != null);
+
+    slot.status = .failed;
+    slot.completed_ms = 41_000;
+    slot.detail_len = copyInto(&slot.detail_buffer, "[exit 1] token limit");
+    var failed_buffer: [256]u8 = undefined;
+    var failed_writer: Io.Writer = .fixed(&failed_buffer);
+    try writePanelLine(&failed_writer, &slot, 134_000);
+    try std.testing.expect(std.mem.indexOf(u8, failed_writer.buffered(), "failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed_writer.buffered(), "41s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failed_writer.buffered(), "[exit 1] token limit") != null);
+}
+
+test "panel render fills its rows and reports overflow" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    io_state = threaded.io();
+    rows = 24;
+    cols = 80;
+    layout_ready = true;
+    panel_count = 4;
+    panel_total = 6;
+    panel_height = 4;
+    for (&panel_slots) |*slot| {
+        slot.id_len = copyInto(&slot.id_buffer, "agent-000000");
+        slot.status = .queued;
+        slot.started_ms = 0;
+        slot.completed_ms = null;
+        slot.model_len = copyInto(&slot.model_buffer, "test-model");
+        slot.effort_len = 0;
+        slot.detail_len = copyInto(&slot.detail_buffer, "Inspect auth");
+    }
+    defer {
+        panel_count = 0;
+        panel_total = 0;
+        panel_height = 0;
+        layout_ready = false;
+    }
+    try renderPanelTo(&output.writer);
+    const written = output.written();
+    // Four panel rows directly above the info bar at row 23.
+    try std.testing.expect(std.mem.indexOf(u8, written, "\x1b[19;1H") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\x1b[22;1H") != null);
+    try std.testing.expectEqual(3, std.mem.count(u8, written, "agent-000000"));
+    try std.testing.expect(std.mem.indexOf(u8, written, "+ 3 more · /agents") != null);
 }
 
 test "startup hint is drawn in the input box and can be dismissed" {
