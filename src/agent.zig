@@ -2057,12 +2057,23 @@ fn routineRunLength(calls: []const ToolCall, start: usize) usize {
 }
 
 fn subagentStatus(text: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, text, "{")) {
+        if (jsonStringField(text, "status")) |status| return status;
+    }
     const marker = "Status: ";
     const start = (std.mem.indexOf(u8, text, marker) orelse return null) + marker.len;
     const tail = text[start..];
     const pipe = std.mem.findScalar(u8, tail, '|') orelse tail.len;
     const newline = std.mem.findScalar(u8, tail, '\n') orelse tail.len;
     return std.mem.trim(u8, tail[0..@min(pipe, newline)], " ");
+}
+
+fn jsonStringField(text: []const u8, key: []const u8) ?[]const u8 {
+    var marker_buffer: [64]u8 = undefined;
+    const marker = std.fmt.bufPrint(&marker_buffer, "\"{s}\":\"", .{key}) catch return null;
+    const start = (std.mem.indexOf(u8, text, marker) orelse return null) + marker.len;
+    const end = std.mem.findScalarPos(u8, text, start, '"') orelse return null;
+    return text[start..end];
 }
 
 fn toolAction(name: []const u8, phase: ToolPhase, result: ?[]const u8) []const u8 {
@@ -2100,7 +2111,7 @@ fn toolAction(name: []const u8, phase: ToolPhase, result: ?[]const u8) []const u
         .running => "Starting agent",
         .failed => "Failed to start agent",
         .completed => if (result) |text|
-            if (std.mem.indexOf(u8, text, " queued in background") != null)
+            if (std.mem.eql(u8, subagentStatus(text) orelse "", "queued"))
                 "Queued agent"
             else if (std.mem.eql(u8, subagentStatus(text) orelse "", "completed"))
                 "Finished agent"
@@ -2149,6 +2160,9 @@ fn writeToolDescription(output: *Io.Writer, name: []const u8, arguments: ?std.js
 /// Return a compact model-independent failure reason. Read pagination uses
 /// the same bracket form as process failures but is not an error.
 fn toolFailure(text: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, text, "{\"ok\":false,")) {
+        return jsonStringField(text, "code") orelse "subagent rejected";
+    }
     const prefixes = [_][]const u8{
         "tool error:",
         "invalid tool arguments:",
@@ -2707,6 +2721,13 @@ const RoundResult = struct {
 fn performRound(session: *Session) !RoundResult {
     var request_arena: std.heap.ArenaAllocator = .init(session.gpa);
     defer request_arena.deinit();
+    const subagents_enabled = session.subagent_manager != null and session.settings.value.subagents_enabled;
+    const subagent_launch: ?subagents.Launch = if (subagents_enabled) .{
+        .provider = @tagName(session.provider),
+        .model = session.model,
+        .effort = if (session.effort) |value| @tagName(value) else null,
+        .fast = session.fast,
+    } else null;
     const body = try request.build(
         request_arena.allocator(),
         session.provider,
@@ -2716,7 +2737,9 @@ fn performRound(session: *Session) !RoundResult {
         .{
             .web_enabled = session.settings.value.firecrawl_api_key != null,
             .write_enabled = true,
-            .subagents_enabled = session.subagent_manager != null and session.settings.value.subagents_enabled,
+            .subagents_enabled = subagents_enabled,
+            .subagent_launch = subagent_launch,
+            .subagent_max_concurrent = if (session.subagent_manager) |*manager| manager.config.max_concurrent else subagents.default_max_concurrent,
         },
         session.cwd,
         session.instructions,
@@ -3125,6 +3148,8 @@ test "tool failures recognize only exact process markers" {
     try std.testing.expectEqualStrings("signal 15", toolFailure("output\n[signal 15]").?);
     try std.testing.expectEqualStrings("timeout after 30s", toolFailure("output\n[timeout after 30s]").?);
     try std.testing.expectEqualStrings("interrupted", toolFailure("output\n[interrupted]").?);
+    try std.testing.expectEqualStrings("cross_provider_model", toolFailure("{\"ok\":false,\"code\":\"cross_provider_model\"}").?);
+    try std.testing.expectEqualStrings("queued", subagentStatus("{\"ok\":true,\"status\":\"queued\"}").?);
 }
 
 test "routine summaries are compact and naturally pluralized" {

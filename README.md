@@ -161,7 +161,7 @@ The model receives four local tools:
 | `edit` | replace exact text |
 | `write` | create or overwrite files |
 
-The parent agent can also start, inspect, and steer subagents. Workers are separate `xaq` processes in the same working directory, with up to four running at once by default. In fullscreen mode, live agents appear in a panel above the info bar: id, status, elapsed time, model and effort, and a heartbeat of what each worker is doing right now. The panel takes no rows while no agents exist. `/agents` shows the same detail inline. `/settings` can disable subagents, change the limit, or turn the panel off.
+The parent agent can also start, inspect, and steer subagents. Workers are separate `xaq` processes in the same working directory, with up to four running at once by default. The `Agent` tool tells the parent the active provider, inherited model and effort, valid model overrides, effective access, and concurrency limit. Model overrides stay on the active provider; effort is selected separately. Workers currently have `workspace_write` access, including full-permission shell commands. Read-only workers are not available. In fullscreen mode, live agents appear in a panel above the info bar: id, status, elapsed time, model and effort, and a heartbeat of what each worker is doing right now. The panel takes no rows while no agents exist. `/agents` shows the same detail inline. `/settings` can disable subagents, change the limit, or turn the panel off.
 
 For web access, run `/firecrawl` and enter a [Firecrawl API key](https://www.firecrawl.dev/app/api-keys). This adds `web_fetch` and `web_search`. The key is stored in `~/.config/xaq/settings.json` with mode `0600`.
 

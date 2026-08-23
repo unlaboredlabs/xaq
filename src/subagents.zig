@@ -1,6 +1,8 @@
 const std = @import("std");
 const Io = std.Io;
+const auth = @import("auth.zig");
 const cancel = @import("cancel.zig");
+const models = @import("models.zig");
 
 pub const default_max_concurrent = 4;
 const max_records = 32;
@@ -263,15 +265,44 @@ pub const Manager = struct {
     }
 
     fn agent(self: *Manager, gpa: std.mem.Allocator, args: std.json.Value, launch: Launch) ![]u8 {
-        if (!self.config.enabled) return gpa.dupe(u8, "subagents are disabled in /settings");
-        if (self.records.items.len >= max_records) return gpa.dupe(u8, "subagent limit reached for this session");
+        if (!self.config.enabled) return rejection(gpa, "subagents_disabled", "subagents are disabled in /settings", launch, self.config);
+        if (self.records.items.len >= max_records) return rejection(gpa, "session_limit", "subagent limit reached for this session", launch, self.config);
         const prompt = try fieldString(args, "prompt");
         const description = try fieldString(args, "description");
-        if (prompt.len > 4 * 1024 * 1024 - 1024) return gpa.dupe(u8, "subagent prompt is too large");
-        if (description.len > 120) return gpa.dupe(u8, "subagent description exceeds 120 bytes");
+        if (prompt.len > 4 * 1024 * 1024 - 1024) return rejection(gpa, "prompt_too_large", "subagent prompt is too large", launch, self.config);
+        if (description.len > 120) return rejection(gpa, "description_too_large", "subagent description exceeds 120 bytes", launch, self.config);
         const background = optionalBool(args, "run_in_background") orelse self.config.background_by_default;
         const model_override = optionalString(args, "model");
         const selected_model = model_override orelse launch.model;
+        const provider = auth.Provider.parse(launch.provider) orelse
+            return rejection(gpa, "invalid_runtime", "the active provider is invalid", launch, self.config);
+        const inherits_model = model_override == null or std.mem.eql(u8, selected_model, launch.model);
+        if (!inherits_model and models.find(provider, selected_model) == null) {
+            const profile = models.findAny(selected_model);
+            const code = if (profile == null) "unknown_model" else "cross_provider_model";
+            const message = if (profile) |known|
+                try std.fmt.allocPrint(gpa, "model {s} belongs to provider {s}; subagents in this session must use provider {s}", .{ selected_model, @tagName(known.provider), launch.provider })
+            else
+                try std.fmt.allocPrint(gpa, "model {s} is not a known {s} model; use one of valid_models or omit model to inherit {s}", .{ selected_model, launch.provider, launch.model });
+            defer gpa.free(message);
+            return rejection(gpa, code, message, launch, self.config);
+        }
+        const effort_override = optionalString(args, "effort");
+        const selected_effort = effort_override orelse if (inherits_model) launch.effort else null;
+        if (effort_override) |value| {
+            const effort = models.Effort.parse(value) orelse
+                return rejection(gpa, "invalid_effort", "effort must be low, medium, high, xhigh, or max", launch, self.config);
+            if (!models.supportsEffort(provider, selected_model, effort)) {
+                const message = try std.fmt.allocPrint(gpa, "effort {s} is not supported by model {s}", .{ value, selected_model });
+                defer gpa.free(message);
+                return rejection(gpa, "unsupported_effort", message, launch, self.config);
+            }
+        }
+        if (optionalString(args, "access")) |access| {
+            if (!std.mem.eql(u8, access, "workspace_write")) {
+                return rejection(gpa, "unsupported_access", "read_only is unavailable; subagents have workspace_write access with full host permissions", launch, self.config);
+            }
+        }
 
         try self.ensureTempDir();
         var random: [6]u8 = undefined;
@@ -304,11 +335,8 @@ pub const Manager = struct {
             .description = try self.gpa.dupe(u8, description),
             .provider = try self.gpa.dupe(u8, launch.provider),
             .model = try self.gpa.dupe(u8, selected_model),
-            // An override may have a different effort/fast contract. Let the
-            // provider choose safe defaults instead of failing the worker at
-            // startup with inherited settings it does not support.
-            .effort = if (model_override == null) if (launch.effort) |value| try self.gpa.dupe(u8, value) else null else null,
-            .fast = model_override == null and launch.fast,
+            .effort = if (selected_effort) |value| try self.gpa.dupe(u8, value) else null,
+            .fast = inherits_model and launch.fast,
             .background = background,
             .status = if (background and self.counts().running >= self.config.max_concurrent) .queued else .running,
             .started_ms = nowMs(self.io),
@@ -336,7 +364,43 @@ pub const Manager = struct {
             record.consumed = true;
             return self.resultText(gpa, record, true);
         }
-        return std.fmt.allocPrint(gpa, "Agent {s} {s} in background.\nDescription: {s}\nUse get_subagent_result with wait: true when the result is needed.", .{ record.id, if (record.status == .queued) "queued" else "started", record.description });
+        return self.launchResult(gpa, record);
+    }
+
+    fn launchResult(self: *const Manager, gpa: std.mem.Allocator, record: *const Record) ![]u8 {
+        var out: Io.Writer.Allocating = .init(gpa);
+        defer out.deinit();
+        var js: std.json.Stringify = .{ .writer = &out.writer };
+        const current = self.counts();
+        try js.beginObject();
+        try js.objectField("ok");
+        try js.write(true);
+        try js.objectField("agent_id");
+        try js.write(record.id);
+        try js.objectField("status");
+        try js.write(@tagName(record.status));
+        try js.objectField("provider");
+        try js.write(record.provider);
+        try js.objectField("model");
+        try js.write(record.model);
+        try js.objectField("effort");
+        if (record.effort) |effort| try js.write(effort) else try js.write(null);
+        try js.objectField("fast");
+        try js.write(record.fast);
+        try js.objectField("access");
+        try js.write("workspace_write");
+        try js.objectField("running");
+        try js.write(current.running);
+        try js.objectField("queued");
+        try js.write(current.queued);
+        try js.objectField("max_concurrent");
+        try js.write(self.config.max_concurrent);
+        try js.objectField("description");
+        try js.write(record.description);
+        try js.objectField("next_action");
+        try js.write("Use get_subagent_result with wait=true before relying on this worker's result.");
+        try js.endObject();
+        return out.toOwnedSlice();
     }
 
     fn getResult(self: *Manager, gpa: std.mem.Allocator, args: std.json.Value) ![]u8 {
@@ -531,8 +595,19 @@ pub const Manager = struct {
         if (include_header) {
             try out.writer.print("Agent: {s}\nStatus: {s}", .{ record.id, @tagName(record.status) });
             if (record.completed_ms) |finished| try out.writer.print(" | Duration: {s}", .{formatDuration(finished - record.started_ms)});
-            try out.writer.print("\nDescription: {s}\n", .{record.description});
+            try out.writer.writeByte('\n');
         }
+        const current = self.counts();
+        try out.writer.print("Provider: {s}\nModel: {s}\nEffort: {s}\nFast: {s}\nAccess: workspace_write\nConcurrency: {d} running, {d} queued, {d} max\nDescription: {s}\n", .{
+            record.provider,
+            record.model,
+            record.effort orelse "provider-default",
+            if (record.fast) "on" else "off",
+            current.running,
+            current.queued,
+            self.config.max_concurrent,
+            record.description,
+        });
         switch (record.status) {
             .queued => try out.writer.writeAll("Agent is queued behind the concurrency limit."),
             .running => try out.writer.writeAll("Agent is still running. Use wait: true when its result is needed."),
@@ -593,6 +668,42 @@ pub const Manager = struct {
         return out.toOwnedSlice();
     }
 };
+
+fn rejection(gpa: std.mem.Allocator, code: []const u8, message: []const u8, launch: Launch, config: Config) ![]u8 {
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var js: std.json.Stringify = .{ .writer = &out.writer };
+    try js.beginObject();
+    try js.objectField("ok");
+    try js.write(false);
+    try js.objectField("code");
+    try js.write(code);
+    try js.objectField("message");
+    try js.write(message);
+    try js.objectField("retryable");
+    try js.write(false);
+    try js.objectField("provider");
+    try js.write(launch.provider);
+    try js.objectField("inherited_model");
+    try js.write(launch.model);
+    try js.objectField("inherited_effort");
+    if (launch.effort) |effort| try js.write(effort) else try js.write(null);
+    try js.objectField("access");
+    try js.write("workspace_write");
+    try js.objectField("max_concurrent");
+    try js.write(config.max_concurrent);
+    try js.objectField("valid_models");
+    try js.beginArray();
+    if (auth.Provider.parse(launch.provider)) |provider| {
+        for (models.choices(provider)) |model| try js.write(model);
+        if (models.find(provider, launch.model) == null) try js.write(launch.model);
+    } else {
+        try js.write(launch.model);
+    }
+    try js.endArray();
+    try js.endObject();
+    return out.toOwnedSlice();
+}
 
 fn validateConfig(config: Config) !void {
     if (config.max_concurrent < 1 or config.max_concurrent > 8) return error.InvalidSubagentConcurrency;
@@ -791,9 +902,9 @@ test "panel snapshot tracks unseen agents and drops consumed ones" {
     try std.testing.expectEqualStrings("medium", storage[0].effort.?);
     try std.testing.expectEqualStrings("Inspect auth", storage[0].description);
 
-    const id_start = "Agent ".len;
-    const id_end = std.mem.indexOfScalarPos(u8, started, id_start, ' ').?;
-    const args_text = try std.fmt.allocPrint(std.testing.allocator, "{{\"agent_id\":\"{s}\"}}", .{started[id_start..id_end]});
+    var started_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, started, .{});
+    defer started_json.deinit();
+    const args_text = try std.fmt.allocPrint(std.testing.allocator, "{{\"agent_id\":\"{s}\"}}", .{try fieldString(started_json.value, "agent_id")});
     defer std.testing.allocator.free(args_text);
     var result_args = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, args_text, .{});
     defer result_args.deinit();
@@ -854,6 +965,63 @@ test "capped result reads allocate only the returned prefix" {
     try std.testing.expect(std.mem.endsWith(u8, result, "]"));
 }
 
+test "agent launch validates runtime choices before spawning" {
+    var manager = try Manager.init(std.testing.allocator, std.testing.io, "/tmp", .{});
+    defer manager.deinit();
+    std.testing.allocator.free(manager.executable);
+    manager.executable = try std.testing.allocator.dupeZ(u8, "/bin/echo");
+    const launch: Launch = .{ .provider = "claude", .model = "claude-fable-5", .effort = "high", .fast = false };
+
+    var cross_args = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"prompt":"inspect auth","description":"Inspect auth","model":"gpt-5.6-sol"}
+    , .{});
+    defer cross_args.deinit();
+    const cross_result = try manager.execute(std.testing.allocator, "Agent", cross_args.value, launch);
+    defer std.testing.allocator.free(cross_result);
+    var cross_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, cross_result, .{});
+    defer cross_json.deinit();
+    try std.testing.expectEqualStrings("cross_provider_model", try fieldString(cross_json.value, "code"));
+    try std.testing.expectEqual(false, cross_json.value.object.get("retryable").?.bool);
+    try std.testing.expectEqual(@as(usize, 0), manager.records.items.len);
+
+    var unknown_args = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"prompt":"inspect auth","description":"Inspect auth","model":"sol-high"}
+    , .{});
+    defer unknown_args.deinit();
+    const unknown_result = try manager.execute(std.testing.allocator, "Agent", unknown_args.value, launch);
+    defer std.testing.allocator.free(unknown_result);
+    var unknown_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, unknown_result, .{});
+    defer unknown_json.deinit();
+    try std.testing.expectEqualStrings("unknown_model", try fieldString(unknown_json.value, "code"));
+    try std.testing.expectEqual(@as(usize, 0), manager.records.items.len);
+
+    var access_args = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"prompt":"inspect auth","description":"Inspect auth","access":"read_only"}
+    , .{});
+    defer access_args.deinit();
+    const access_result = try manager.execute(std.testing.allocator, "Agent", access_args.value, launch);
+    defer std.testing.allocator.free(access_result);
+    var access_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, access_result, .{});
+    defer access_json.deinit();
+    try std.testing.expectEqualStrings("unsupported_access", try fieldString(access_json.value, "code"));
+    try std.testing.expectEqual(@as(usize, 0), manager.records.items.len);
+
+    var valid_args = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"prompt":"inspect auth","description":"Inspect auth","model":"claude-opus-5","effort":"max","access":"workspace_write"}
+    , .{});
+    defer valid_args.deinit();
+    const valid_result = try manager.execute(std.testing.allocator, "Agent", valid_args.value, launch);
+    defer std.testing.allocator.free(valid_result);
+    var valid_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, valid_result, .{});
+    defer valid_json.deinit();
+    try std.testing.expectEqual(true, valid_json.value.object.get("ok").?.bool);
+    try std.testing.expectEqualStrings("claude", try fieldString(valid_json.value, "provider"));
+    try std.testing.expectEqualStrings("claude-opus-5", try fieldString(valid_json.value, "model"));
+    try std.testing.expectEqualStrings("max", try fieldString(valid_json.value, "effort"));
+    try std.testing.expectEqualStrings("workspace_write", try fieldString(valid_json.value, "access"));
+    try std.testing.expectEqual(@as(usize, 1), manager.records.items.len);
+}
+
 test "manager config disables launches and changes the background default" {
     var manager = try Manager.init(std.testing.allocator, std.testing.io, "/tmp", .{ .enabled = false });
     defer manager.deinit();
@@ -867,7 +1035,11 @@ test "manager config disables launches and changes the background default" {
     const launch: Launch = .{ .provider = "chatgpt", .model = "test-model", .effort = null, .fast = false };
     const disabled = try manager.execute(std.testing.allocator, "Agent", parsed.value, launch);
     defer std.testing.allocator.free(disabled);
-    try std.testing.expectEqualStrings("subagents are disabled in /settings", disabled);
+    var disabled_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, disabled, .{});
+    defer disabled_json.deinit();
+    try std.testing.expectEqual(false, disabled_json.value.object.get("ok").?.bool);
+    try std.testing.expectEqualStrings("subagents_disabled", try fieldString(disabled_json.value, "code"));
+    try std.testing.expectEqual(@as(usize, 0), manager.records.items.len);
 
     try manager.configure(.{ .max_concurrent = 2, .background_by_default = false });
     const foreground = try manager.execute(std.testing.allocator, "Agent", parsed.value, launch);
@@ -908,9 +1080,12 @@ test "foreground and background agents return worker results" {
         .fast = false,
     });
     defer std.testing.allocator.free(started);
-    const id_start = "Agent ".len;
-    const id_end = std.mem.indexOfScalarPos(u8, started, id_start, ' ').?;
-    const result_args_text = try std.fmt.allocPrint(std.testing.allocator, "{{\"agent_id\":\"{s}\",\"wait\":true}}", .{started[id_start..id_end]});
+    var started_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, started, .{});
+    defer started_json.deinit();
+    try std.testing.expectEqualStrings("chatgpt", try fieldString(started_json.value, "provider"));
+    try std.testing.expectEqualStrings("test-model", try fieldString(started_json.value, "model"));
+    try std.testing.expectEqualStrings("workspace_write", try fieldString(started_json.value, "access"));
+    const result_args_text = try std.fmt.allocPrint(std.testing.allocator, "{{\"agent_id\":\"{s}\",\"wait\":true}}", .{try fieldString(started_json.value, "agent_id")});
     defer std.testing.allocator.free(result_args_text);
     var result_args = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result_args_text, .{});
     defer result_args.deinit();
@@ -934,9 +1109,12 @@ test "foreground and background agents return worker results" {
         });
         defer std.testing.allocator.free(launched);
         if (index == default_max_concurrent) {
-            try std.testing.expect(std.mem.indexOf(u8, launched, "queued in background") != null);
-            const queued_end = std.mem.indexOfScalarPos(u8, launched, id_start, ' ').?;
-            queued_id = try std.testing.allocator.dupe(u8, launched[id_start..queued_end]);
+            var launched_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, launched, .{});
+            defer launched_json.deinit();
+            try std.testing.expectEqualStrings("queued", try fieldString(launched_json.value, "status"));
+            try std.testing.expectEqual(@as(i64, default_max_concurrent), launched_json.value.object.get("running").?.integer);
+            try std.testing.expectEqual(@as(i64, 1), launched_json.value.object.get("queued").?.integer);
+            queued_id = try std.testing.allocator.dupe(u8, try fieldString(launched_json.value, "agent_id"));
         }
     }
     const queued_args_text = try std.fmt.allocPrint(std.testing.allocator, "{{\"agent_id\":\"{s}\",\"wait\":true}}", .{queued_id.?});

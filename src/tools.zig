@@ -1,6 +1,8 @@
 const std = @import("std");
 const Io = std.Io;
+const auth = @import("auth.zig");
 const cancel = @import("cancel.zig");
+const models = @import("models.zig");
 const subagents = @import("subagents.zig");
 const transport = @import("transport.zig");
 
@@ -24,6 +26,8 @@ pub const SchemaOptions = struct {
     web_enabled: bool = false,
     write_enabled: bool = true,
     subagents_enabled: bool = false,
+    subagent_launch: ?subagents.Launch = null,
+    subagent_max_concurrent: u8 = subagents.default_max_concurrent,
     custom: []const Definition = &.{},
 };
 
@@ -68,7 +72,7 @@ pub fn schemasWithOptions(s: *std.json.Stringify, options: SchemaOptions) !void 
             \\{"type":"object","properties":{"query":{"type":"string","minLength":1,"maxLength":500},"limit":{"type":"integer","minimum":1,"maximum":10,"description":"Number of results to return; defaults to 5."}},"required":["query"],"additionalProperties":false}
         );
     }
-    if (options.include_builtin and options.subagents_enabled) try subagentSchemas(s, false);
+    if (options.include_builtin and options.subagents_enabled) try subagentSchemas(s, false, options);
     for (options.custom) |definition| try schema(s, definition.name, definition.description, definition.parameters_json);
     try s.endArray();
 }
@@ -103,16 +107,17 @@ pub fn claudeSchemasWithOptions(s: *std.json.Stringify, options: SchemaOptions) 
             \\{"type":"object","properties":{"query":{"type":"string","minLength":1,"maxLength":500},"limit":{"type":"integer","minimum":1,"maximum":10,"description":"Number of results to return; defaults to 5."}},"required":["query"],"additionalProperties":false}
         );
     }
-    if (options.include_builtin and options.subagents_enabled) try subagentSchemas(s, true);
+    if (options.include_builtin and options.subagents_enabled) try subagentSchemas(s, true, options);
     for (options.custom) |definition| try claudeSchema(s, definition.name, definition.description, definition.parameters_json);
     try s.endArray();
 }
 
-fn subagentSchemas(s: *std.json.Stringify, claude: bool) !void {
-    const description = "Launch an autonomous subagent for a self-contained, multi-step task. Background is the default and lets several Agent calls run concurrently. Use get_subagent_result with wait true before relying on a background result. Prompts must contain all context the subagent needs.";
-    const agent_parameters =
-        \\{"type":"object","properties":{"prompt":{"type":"string","maxLength":4193280},"description":{"type":"string","maxLength":120,"description":"Short task label shown in the UI."},"model":{"type":"string","maxLength":256,"description":"Optional model ID for the active provider."},"run_in_background":{"type":"boolean","description":"Defaults to true. Set false only when the next action depends on this result."}},"required":["prompt","description"],"additionalProperties":false}
-    ;
+fn subagentSchemas(s: *std.json.Stringify, claude: bool, options: SchemaOptions) !void {
+    var description_buffer: [1024]u8 = undefined;
+    const description = if (options.subagent_launch) |launch|
+        std.fmt.bufPrint(&description_buffer, "Launch an autonomous subagent for a self-contained, multi-step task. Workers use provider={s} and cannot switch providers. Omit model to inherit {s}; valid overrides are listed in model.enum. Omit effort to inherit {s} when the model is inherited. Never guess or probe model IDs. Workers have workspace_write access with full host permissions; read_only is unavailable. At most {d} workers run at once and extra workers queue. Background is the default. Use get_subagent_result with wait true before relying on a result. Prompts must contain all context the worker needs.", .{ launch.provider, launch.model, launch.effort orelse "provider-default", options.subagent_max_concurrent }) catch unreachable
+    else
+        "Launch an autonomous subagent for a self-contained, multi-step task. Background is the default. Use get_subagent_result with wait true before relying on a result. Prompts must contain all context the worker needs.";
     const get_parameters =
         \\{"type":"object","properties":{"agent_id":{"type":"string"},"wait":{"type":"boolean","description":"Wait for completion. Defaults to false."}},"required":["agent_id"],"additionalProperties":false}
     ;
@@ -120,14 +125,91 @@ fn subagentSchemas(s: *std.json.Stringify, claude: bool) !void {
         \\{"type":"object","properties":{"agent_id":{"type":"string"},"message":{"type":"string","maxLength":65536}},"required":["agent_id","message"],"additionalProperties":false}
     ;
     if (claude) {
-        try claudeSchema(s, "Agent", description, agent_parameters);
+        try dynamicAgentSchema(s, true, description, options.subagent_launch);
         try claudeSchema(s, "get_subagent_result", "Check a background subagent's status and retrieve its result. Use wait true when the result gates your next action.", get_parameters);
         try claudeSchema(s, "steer_subagent", "Send a message that redirects a running or queued subagent before its next model turn.", steer_parameters);
     } else {
-        try schema(s, "Agent", description, agent_parameters);
+        try dynamicAgentSchema(s, false, description, options.subagent_launch);
         try schema(s, "get_subagent_result", "Check a background subagent's status and retrieve its result. Use wait true when the result gates your next action.", get_parameters);
         try schema(s, "steer_subagent", "Send a message that redirects a running or queued subagent before its next model turn.", steer_parameters);
     }
+}
+
+fn dynamicAgentSchema(s: *std.json.Stringify, claude: bool, description: []const u8, launch: ?subagents.Launch) !void {
+    try s.beginObject();
+    if (!claude) {
+        try s.objectField("type");
+        try s.write("function");
+    }
+    try s.objectField("name");
+    try s.write("Agent");
+    try s.objectField("description");
+    try s.write(description);
+    try s.objectField(if (claude) "input_schema" else "parameters");
+    try s.beginObject();
+    try s.objectField("type");
+    try s.write("object");
+    try s.objectField("properties");
+    try s.beginObject();
+    try s.objectField("prompt");
+    try rawValue(s, "{\"type\":\"string\",\"maxLength\":4193280}");
+    try s.objectField("description");
+    try rawValue(s, "{\"type\":\"string\",\"maxLength\":120,\"description\":\"Short task label shown in the UI.\"}");
+    try s.objectField("model");
+    try s.beginObject();
+    try s.objectField("type");
+    try s.write("string");
+    try s.objectField("maxLength");
+    try s.write(256);
+    if (launch) |runtime| {
+        try s.objectField("description");
+        try s.write("Optional model ID for the active provider. Omit it to inherit the parent model.");
+        try s.objectField("enum");
+        try s.beginArray();
+        const provider = auth.Provider.parse(runtime.provider);
+        if (provider) |value| {
+            for (models.choices(value)) |model| try s.write(model);
+            if (models.find(value, runtime.model) == null) try s.write(runtime.model);
+        } else {
+            try s.write(runtime.model);
+        }
+        try s.endArray();
+    }
+    try s.endObject();
+    try s.objectField("effort");
+    try s.beginObject();
+    try s.objectField("type");
+    try s.write("string");
+    try s.objectField("description");
+    try s.write("Optional reasoning effort. Omit it to inherit the parent effort when the model is inherited, or to use the provider default for a model override.");
+    try s.objectField("enum");
+    try s.beginArray();
+    inline for (@typeInfo(models.Effort).@"enum".fields) |field| try s.write(field.name);
+    try s.endArray();
+    try s.endObject();
+    try s.objectField("access");
+    try s.beginObject();
+    try s.objectField("type");
+    try s.write("string");
+    try s.objectField("description");
+    try s.write("Effective worker access. Only workspace_write is available; workers receive bash, edit, and write tools with full host permissions.");
+    try s.objectField("enum");
+    try s.beginArray();
+    try s.write("workspace_write");
+    try s.endArray();
+    try s.endObject();
+    try s.objectField("run_in_background");
+    try rawValue(s, "{\"type\":\"boolean\",\"description\":\"Defaults to true. Set false only when the next action depends on this result.\"}");
+    try s.endObject();
+    try s.objectField("required");
+    try s.beginArray();
+    try s.write("prompt");
+    try s.write("description");
+    try s.endArray();
+    try s.objectField("additionalProperties");
+    try s.write(false);
+    try s.endObject();
+    try s.endObject();
 }
 
 fn schema(s: *std.json.Stringify, name: []const u8, description: []const u8, parameters: []const u8) !void {
@@ -798,11 +880,32 @@ test "subagent schemas are parent-only and write tools can be omitted" {
     var parent: Io.Writer.Allocating = .init(std.testing.allocator);
     defer parent.deinit();
     var parent_json: std.json.Stringify = .{ .writer = &parent.writer };
-    try schemasWithOptions(&parent_json, .{ .subagents_enabled = true });
+    const subagent_options: SchemaOptions = .{
+        .subagents_enabled = true,
+        .subagent_launch = .{ .provider = "claude", .model = "claude-fable-5", .effort = "high", .fast = false },
+        .subagent_max_concurrent = 2,
+    };
+    try schemasWithOptions(&parent_json, subagent_options);
+    var parsed_parent = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, parent.written(), .{});
+    defer parsed_parent.deinit();
     try std.testing.expect(std.mem.indexOf(u8, parent.written(), "\"name\":\"Agent\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, parent.written(), "get_subagent_result") != null);
     try std.testing.expect(std.mem.indexOf(u8, parent.written(), "steer_subagent") != null);
     try std.testing.expect(std.mem.indexOf(u8, parent.written(), "subagent_type") == null);
+    try std.testing.expect(std.mem.indexOf(u8, parent.written(), "provider=claude and cannot switch providers") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parent.written(), "At most 2 workers run at once") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parent.written(), "\"enum\":[\"claude-opus-5\",\"claude-sonnet-5\",\"claude-fable-5\",\"claude-haiku-4-5\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parent.written(), "gpt-5.6-sol") == null);
+    try std.testing.expect(std.mem.indexOf(u8, parent.written(), "\"enum\":[\"workspace_write\"]") != null);
+
+    var claude_parent: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer claude_parent.deinit();
+    var claude_parent_json: std.json.Stringify = .{ .writer = &claude_parent.writer };
+    try claudeSchemasWithOptions(&claude_parent_json, subagent_options);
+    var parsed_claude = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, claude_parent.written(), .{});
+    defer parsed_claude.deinit();
+    try std.testing.expect(std.mem.indexOf(u8, claude_parent.written(), "\"input_schema\":{\"type\":\"object\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, claude_parent.written(), "claude-fable-5") != null);
 
     var worker: Io.Writer.Allocating = .init(std.testing.allocator);
     defer worker.deinit();
