@@ -7,7 +7,7 @@ const types = @import("types.zig");
 
 pub const Hooks = struct {
     context: ?*anyopaque = null,
-    on_output: ?*const fn (context: ?*anyopaque) anyerror!void = null,
+    on_first_text: ?*const fn (context: ?*anyopaque) anyerror!void = null,
     on_delta: ?*const fn (context: ?*anyopaque, delta: []const u8) anyerror!void = null,
 };
 
@@ -29,6 +29,7 @@ pub const Decoder = struct {
     claude_calls: std.ArrayList(StreamingClaudeCall) = .empty,
     usage: types.Usage = .{},
     received: bool = false,
+    received_text: bool = false,
 
     pub fn init(provider: auth.Provider, parse_gpa: std.mem.Allocator, persist: std.mem.Allocator, hooks: Hooks) Decoder {
         return .{
@@ -40,13 +41,16 @@ pub const Decoder = struct {
         };
     }
 
-    fn beforeOutput(self: *Decoder) !void {
+    fn noteOutput(self: *Decoder) void {
         self.received = true;
-        if (self.hooks.on_output) |callback| try callback(self.hooks.context);
     }
 
     fn writeDelta(self: *Decoder, delta: []const u8) !void {
-        try self.beforeOutput();
+        self.noteOutput();
+        if (delta.len > 0 and !self.received_text) {
+            self.received_text = true;
+            if (self.hooks.on_first_text) |callback| try callback(self.hooks.context);
+        }
         try self.text.writer.writeAll(delta);
         if (self.hooks.on_delta) |callback| try callback(self.hooks.context, delta);
     }
@@ -70,7 +74,7 @@ pub const Decoder = struct {
         if (std.mem.eql(u8, kind, "response.output_text.delta")) {
             try self.writeDelta(eventString(value, "delta") orelse return);
         } else if (std.mem.eql(u8, kind, "response.output_item.done")) {
-            try self.beforeOutput();
+            self.noteOutput();
             const item = switch (value) {
                 .object => |object| object.get("item") orelse return,
                 else => return,
@@ -101,7 +105,7 @@ pub const Decoder = struct {
     fn feedClaude(self: *Decoder, value: std.json.Value, data: []const u8) !void {
         const kind = eventString(value, "type") orelse return;
         if (std.mem.eql(u8, kind, "content_block_start")) {
-            try self.beforeOutput();
+            self.noteOutput();
             const index = switch (value.object.get("index") orelse return) {
                 .integer => |number| number,
                 else => return,
@@ -219,4 +223,57 @@ test "decodes Anthropic fragmented tool input" {
     const result = try decoder.finish();
     try std.testing.expectEqualStrings("ok", result.text);
     try std.testing.expectEqualStrings("{\"command\":\"pwd\"}", result.calls[0].arguments);
+}
+
+const TextProbe = struct {
+    calls: usize = 0,
+
+    fn onFirstText(raw: ?*anyopaque) !void {
+        const self: *TextProbe = @ptrCast(@alignCast(raw.?));
+        self.calls += 1;
+    }
+};
+
+test "Responses hidden output does not announce visible text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var probe: TextProbe = .{};
+    var decoder = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), .{
+        .context = &probe,
+        .on_first_text = TextProbe.onFirstText,
+    });
+
+    try decoder.feed("data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"hidden\"}}");
+    try decoder.feed("data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read\",\"arguments\":\"{}\"}}");
+    try std.testing.expect(decoder.received);
+    try std.testing.expect(!decoder.received_text);
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+
+    try decoder.feed("data: {\"type\":\"response.output_text.delta\",\"delta\":\"\"}");
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    try decoder.feed("data: {\"type\":\"response.output_text.delta\",\"delta\":\"visible\"}");
+    try decoder.feed("data: {\"type\":\"response.output_text.delta\",\"delta\":\" text\"}");
+    try std.testing.expect(decoder.received_text);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+}
+
+test "Anthropic hidden blocks do not announce visible text" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var probe: TextProbe = .{};
+    var decoder = Decoder.init(.claude, std.testing.allocator, arena.allocator(), .{
+        .context = &probe,
+        .on_first_text = TextProbe.onFirstText,
+    });
+
+    try decoder.feed("data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}");
+    try decoder.feed("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hidden\"}}");
+    try decoder.feed("data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"bash\",\"input\":{}}}");
+    try std.testing.expect(decoder.received);
+    try std.testing.expect(!decoder.received_text);
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+
+    try decoder.feed("data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"text_delta\",\"text\":\"visible\"}}");
+    try std.testing.expect(decoder.received_text);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
 }

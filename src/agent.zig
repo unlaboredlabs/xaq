@@ -648,18 +648,20 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
             defer scratch.deinit();
             const scratch_gpa = scratch.allocator();
             var arguments: ?std.json.Value = null;
+            var activity_buffer: [192]u8 = undefined;
+            var tool_spinner_started = false;
+            defer if (tool_spinner_started) spin.stop();
             invoke: {
                 const parsed = std.json.parseFromSliceLeaky(std.json.Value, scratch_gpa, call.arguments, .{}) catch |err| {
                     results[i] = .{ .id = call.id, .text = try std.fmt.allocPrint(session.allocator(), "invalid tool arguments: {s}", .{@errorName(err)}) };
                     break :invoke;
                 };
                 arguments = parsed;
-                var activity_buffer: [192]u8 = undefined;
                 var activity: Io.Writer = .fixed(&activity_buffer);
                 try writeToolDescription(&activity, call.name, parsed, .running, null);
                 tui.noteState(.tooling, activity.buffered());
                 spin.start(io, activity.buffered());
-                defer spin.stop();
+                tool_spinner_started = true;
                 const result = tools.executeWithContext(scratch_gpa, io, call.name, parsed, .{
                     .cwd = session.cwd,
                     .firecrawl_api_key = session.settings.value.firecrawl_api_key,
@@ -686,6 +688,10 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
                 .duration_ms = @intCast(@max(0, elapsed_ms)),
             } });
             log.logf("tool", "event=call turn={d} name={s} args_bytes={d} result_bytes={d} ms={d}", .{ session.turn, call.name, call.arguments.len, results[i].text.len, elapsed_ms });
+            if (tool_spinner_started) {
+                spin.stop();
+                tool_spinner_started = false;
+            }
             const elapsed: u64 = @intCast(@max(0, elapsed_ms));
             const succeeded = toolFailure(results[i].text) == null;
             if (in_routine_group and !grouped_broken) {
@@ -909,15 +915,23 @@ fn imageInputError(err: anyerror) []const u8 {
 }
 
 fn runShellEscape(session: *Session, command: []const u8, add_to_context: bool) !void {
-    tui.noteState(.tooling, "shell");
+    var activity_buffer: [192]u8 = undefined;
+    var activity: Io.Writer = .fixed(&activity_buffer);
+    try activity.writeAll("Running ");
+    try writePreview(&activity, command);
+    tui.noteState(.tooling, activity.buffered());
     syncTui(session);
+    try session.output.flush();
+    spin.start(session.io, activity.buffered());
     const result = tools.runShell(session.gpa, session.io, command, session.cwd) catch |err| {
+        spin.stop();
         if (cancel.requested()) cancel.reset();
         tui.noteState(.idle, "");
         try session.output.print("shell failed: {s}\n", .{@errorName(err)});
         try session.output.flush();
         return;
     };
+    spin.stop();
     defer session.gpa.free(result);
     if (cancel.requested()) cancel.reset();
     tui.noteState(.idle, "");
@@ -2387,20 +2401,23 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
     log.logf("agent", "event=request kind={s} provider={s} model={s} fast={s} turn={d} entries={d} body_bytes={d}", .{ kind, @tagName(session.provider), model, if (fast) "on" else "off", session.turn, session.entries.items.len, body.len });
     var attempt: usize = 0;
     var refreshed = false;
+    const compacting = std.mem.eql(u8, kind, "compact");
     while (attempt < 3) : (attempt += 1) {
+        try output.flush();
+        spin.start(session.io, if (compacting) "compacting" else "thinking");
         var credential_arena: std.heap.ArenaAllocator = .init(session.gpa);
         defer credential_arena.deinit();
-        const credential = try auth.credential(credential_arena.allocator(), session.io, session.home, session.provider);
-        const compacting = std.mem.eql(u8, kind, "compact");
+        const credential = auth.credential(credential_arena.allocator(), session.io, session.home, session.provider) catch |err| {
+            spin.stop();
+            return err;
+        };
         var decoder = Decoder.init(session.provider, session.gpa, session.allocator(), output, if (compacting) null else session.events);
         // A continuously animated placeholder covers the wait; it runs on
         // its own Io task, so it keeps moving even while the provider is
-        // silent. Main rounds stop it just before the first visible
-        // output; compact rounds stream into a sink, so theirs spins
-        // until the round finishes.
+        // silent. Main rounds move it out of the fullscreen transcript when
+        // visible text arrives; compact rounds stream into a sink, so theirs
+        // stays on the live row until the round finishes.
         decoder.stop_spinner = !compacting;
-        try output.flush();
-        spin.start(session.io, if (compacting) "compacting" else "thinking");
         const response = requestStream(session.gpa, session.io, session.provider, credential, body, &decoder, fast) catch |err| {
             spin.stop();
             const partial = interruptedRound(&decoder, compacting, err) catch |terminal| {
@@ -2436,7 +2453,12 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
         if (response.status == 401 and !refreshed) {
             var refresh_arena: std.heap.ArenaAllocator = .init(session.gpa);
             defer refresh_arena.deinit();
-            try auth.forceRefresh(refresh_arena.allocator(), session.io, session.home, session.provider);
+            spin.start(session.io, "refreshing credentials");
+            auth.forceRefresh(refresh_arena.allocator(), session.io, session.home, session.provider) catch |err| {
+                spin.stop();
+                return err;
+            };
+            spin.stop();
             refreshed = true;
             continue;
         }
@@ -2559,15 +2581,15 @@ const Decoder = struct {
     fn bind(self: *Decoder) void {
         self.core.hooks = .{
             .context = self,
-            .on_output = onOutput,
+            .on_first_text = onFirstText,
             .on_delta = onDelta,
         };
     }
 
-    fn onOutput(raw: ?*anyopaque) !void {
+    fn onFirstText(raw: ?*anyopaque) !void {
         const self: *Decoder = @ptrCast(@alignCast(raw.?));
         self.received = true;
-        if (self.stop_spinner) spin.stop();
+        if (self.stop_spinner) spin.textStarted();
     }
 
     fn onDelta(raw: ?*anyopaque, delta: []const u8) !void {
