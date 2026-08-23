@@ -53,6 +53,7 @@ const full_echo_max = 4 * 1024;
 /// submission, as other agent input bars do.
 const paste_stash_min_bytes = 1000;
 const paste_stash_min_lines = 10;
+const mouse_scroll_lines = 3;
 
 const PastedText = struct {
     placeholder: []u8,
@@ -543,21 +544,18 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                 }
                 var final: u8 = 0;
                 var param: usize = 0;
+                var mouse_wheel: ?bool = null;
                 if (second == '[') {
-                    var param_done = false;
-                    var next = (try takeSequenceByte(reader, options.stop)) orelse continue;
-                    while (next < 0x40 or next > 0x7e) {
-                        if (!param_done and next >= '0' and next <= '9') {
-                            // Clamp: an adversarial digit run must not
-                            // overflow (no CSI parameter we act on exceeds
-                            // four digits).
-                            if (param < 100_000) param = param * 10 + (next - '0');
-                        } else {
-                            param_done = true;
-                        }
-                        next = (try takeSequenceByte(reader, options.stop)) orelse break;
+                    const sequence = (try readCsi(reader, options.stop)) orelse continue;
+                    final = sequence.final;
+                    param = sequence.parameters[0];
+                    mouse_wheel = sgrWheelDirection(sequence);
+                    if (isLegacyMousePrefix(sequence)) {
+                        const encoded_button = (try takeSequenceByte(reader, options.stop)) orelse continue;
+                        _ = (try takeSequenceByte(reader, options.stop)) orelse continue; // column
+                        _ = (try takeSequenceByte(reader, options.stop)) orelse continue; // row
+                        mouse_wheel = legacyWheelDirection(encoded_button);
                     }
-                    if (next >= 0x40 and next <= 0x7e) final = next;
                 } else if (second == 'O') {
                     final = (try takeSequenceByte(reader, options.stop)) orelse 0;
                 } else if (second == 'b') { // alt-b: word left
@@ -579,6 +577,10 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                 } else {
                     pending = second;
                     continue;
+                }
+                if (mouse_wheel) |up| {
+                    if (tui.scrollLines(up, mouse_scroll_lines)) dirty = true;
+                    final = 0;
                 }
                 switch (final) {
                     'A' => if (popupHandlesArrows(popup_rows > 0, hist_pos)) {
@@ -1831,6 +1833,66 @@ fn takeByteOrNull(reader: *Io.Reader) !?u8 {
 
 const escape_sequence_timeout_ms = 40;
 
+const CsiSequence = struct {
+    final: u8 = 0,
+    private_marker: u8 = 0,
+    parameters: [4]usize = @splat(0),
+    parameter_count: usize = 1,
+};
+
+fn readCsi(reader: *Io.Reader, stop: ?*const std.atomic.Value(bool)) !?CsiSequence {
+    var sequence: CsiSequence = .{};
+    var accept_digits = true;
+    var next = (try takeSequenceByte(reader, stop)) orelse return null;
+    if (next >= 0x3c and next <= 0x3f) {
+        sequence.private_marker = next;
+        next = (try takeSequenceByte(reader, stop)) orelse return null;
+    }
+    while (next < 0x40 or next > 0x7e) {
+        if (accept_digits and next >= '0' and next <= '9') {
+            const index = sequence.parameter_count - 1;
+            // Clamp each parameter. No input sequence handled here needs a
+            // value above five digits, and malformed input must not overflow.
+            if (sequence.parameters[index] < 100_000) {
+                sequence.parameters[index] = sequence.parameters[index] * 10 + next - '0';
+            }
+        } else if (next == ';' and sequence.parameter_count < sequence.parameters.len) {
+            sequence.parameter_count += 1;
+            accept_digits = true;
+        } else {
+            accept_digits = false;
+        }
+        next = (try takeSequenceByte(reader, stop)) orelse return null;
+    }
+    sequence.final = next;
+    return sequence;
+}
+
+fn sgrWheelDirection(sequence: CsiSequence) ?bool {
+    if (sequence.private_marker != '<' or sequence.final != 'M' or sequence.parameter_count < 3) return null;
+    const modifiers = @as(usize, 4 | 8 | 16);
+    return switch (sequence.parameters[0] & ~modifiers) {
+        64 => true,
+        65 => false,
+        else => null,
+    };
+}
+
+fn isLegacyMousePrefix(sequence: CsiSequence) bool {
+    return sequence.private_marker == 0 and sequence.final == 'M' and
+        sequence.parameter_count == 1 and sequence.parameters[0] == 0;
+}
+
+fn legacyWheelDirection(encoded_button: u8) ?bool {
+    if (encoded_button < 32) return null;
+    const modifiers = @as(usize, 4 | 8 | 16);
+    return switch ((@as(usize, encoded_button) - 32) & ~modifiers) {
+        64 => true,
+        65 => false,
+        else => null,
+    };
+}
+
 fn takeByteWithin(reader: *Io.Reader, timeout_ms: i32) !?u8 {
     if (reader.bufferedLen() > 0) return try takeByteOrNull(reader);
     var descriptors = [_]std.posix.pollfd{.{
@@ -2142,6 +2204,35 @@ test "popup follows a short slash word only" {
     try std.testing.expect(!slashPopupActive("hello"));
     try std.testing.expect(!slashPopupActive("/model x"));
     try std.testing.expect(!slashPopupActive("/" ++ "a" ** popup_line_max));
+}
+
+test "CSI parser recognizes SGR mouse wheel events" {
+    const previous_interactive = interactive;
+    defer interactive = previous_interactive;
+    interactive = false;
+
+    var up_reader = Io.Reader.fixed("<64;12;8M");
+    const up = (try readCsi(&up_reader, null)).?;
+    try std.testing.expectEqual(@as(?bool, true), sgrWheelDirection(up));
+
+    var modified_down_reader = Io.Reader.fixed("<77;12;8M"); // 65 + alt + shift
+    const modified_down = (try readCsi(&modified_down_reader, null)).?;
+    try std.testing.expectEqual(@as(?bool, false), sgrWheelDirection(modified_down));
+
+    var click_reader = Io.Reader.fixed("<0;12;8M");
+    const click = (try readCsi(&click_reader, null)).?;
+    try std.testing.expectEqual(@as(?bool, null), sgrWheelDirection(click));
+
+    var page_reader = Io.Reader.fixed("5;2~");
+    const page = (try readCsi(&page_reader, null)).?;
+    try std.testing.expectEqual(@as(u8, '~'), page.final);
+    try std.testing.expectEqual(@as(usize, 5), page.parameters[0]);
+
+    var legacy_reader = Io.Reader.fixed("M");
+    const legacy = (try readCsi(&legacy_reader, null)).?;
+    try std.testing.expect(isLegacyMousePrefix(legacy));
+    try std.testing.expectEqual(@as(?bool, true), legacyWheelDirection(96));
+    try std.testing.expectEqual(@as(?bool, false), legacyWheelDirection(97));
 }
 
 test "history navigation keeps arrows when recall opens the popup" {

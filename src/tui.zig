@@ -108,7 +108,6 @@ var current: [max_line_bytes]u8 = undefined;
 var current_len: usize = 0;
 var current_truncated = false;
 var pending_cr = false;
-var live_repaint_pending = false;
 var scroll_offset: usize = 0;
 
 // Partial UTF-8 code point being ingested, for width tracking.
@@ -165,7 +164,9 @@ fn enterMeasured(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, measured: ?ter
     layout_dirty = false;
     startup_hint_len = 0;
     errdefer rollbackEnter();
-    try out.writeAll("\x1b[?1049h\x1b[2J");
+    // The alternate screen has no portable scrollback. Ask the terminal for
+    // mouse events so the application-owned transcript can handle the wheel.
+    try out.writeAll("\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[2J");
     try armRegion(out);
     try drawChrome(out);
     region_row = regionTop();
@@ -187,7 +188,7 @@ pub fn exit() void {
     active = false;
     // Also restore paste mode here because process.exit paths skip the
     // editor's defer and call this cleanup directly.
-    sink.writeAll("\x1b[?2004l\x1b[r\x1b[?1049l") catch {};
+    sink.writeAll("\x1b[?1006l\x1b[?1000l\x1b[?2004l\x1b[r\x1b[?1049l") catch {};
     sink.flush() catch {};
     resetTranscriptLocked();
     activity_len = 0;
@@ -213,7 +214,6 @@ fn resetTranscriptLocked() void {
     scroll_offset = 0;
     popup_rows = 0;
     pending_cr = false;
-    live_repaint_pending = false;
     esc_state = .text;
     csi_len = 0;
     display_state = .text;
@@ -239,7 +239,7 @@ pub fn clearTranscript() void {
 fn rollbackEnter() void {
     active = false;
     layout_ready = false;
-    sink.writeAll("\x1b[?2004l\x1b[r\x1b[?1049l") catch {};
+    sink.writeAll("\x1b[?1006l\x1b[?1000l\x1b[?2004l\x1b[r\x1b[?1049l") catch {};
     sink.flush() catch {};
 }
 
@@ -520,20 +520,27 @@ pub fn closePopup() void {
 /// Page the transcript. The input box is untouched; the region is
 /// repainted from the ring (unstyled history is by design).
 pub fn pageUp() bool {
-    return page(true);
+    return scroll(true, null);
 }
 
 pub fn pageDown() bool {
-    return page(false);
+    return scroll(false, null);
 }
 
-fn page(up: bool) bool {
+/// Move the transcript by a fixed number of visual rows. Mouse-wheel input
+/// uses this path while PgUp/PgDn retain viewport-sized steps above.
+pub fn scrollLines(up: bool, count: usize) bool {
+    if (count == 0) return false;
+    return scroll(up, count);
+}
+
+fn scroll(up: bool, requested_step: ?usize) bool {
     if (!active) return false;
     render_mutex.lockUncancelable(io_state);
     defer render_mutex.unlock(io_state);
     if (!layout_ready) return false;
     const visible = viewportHeight();
-    const step = @max(visible -| 1, 1);
+    const step = requested_step orelse @max(visible -| 1, 1);
     const max_offset = visualRowCount() -| visible;
     const previous = scroll_offset;
     scroll_offset = if (up) @min(scroll_offset + step, max_offset) else scroll_offset -| step;
@@ -953,7 +960,7 @@ fn renderInfoTo(out: *Io.Writer) !void {
             writer.writeAll(" \u{b7} working\u{2026}") catch {},
     }
     if (state == .idle) {
-        writer.writeAll(" \u{b7} pgup/pgdn history \u{b7} ctrl-d exits") catch {};
+        writer.writeAll(" \u{b7} wheel/pgup/pgdn history \u{b7} ctrl-d exits") catch {};
     } else {
         writer.writeAll(" \u{b7} enter steers \u{b7} alt-enter next \u{b7} ctrl-c stops") catch {};
     }
@@ -1086,10 +1093,14 @@ fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!
 fn forward(bytes: []const u8) !void {
     const was_scrolled = scroll_offset != 0;
     if (layout_ready and !was_scrolled) try writeRegionBytes(bytes);
-    ingest(bytes);
-    if (layout_ready and (was_scrolled or live_repaint_pending)) {
-        live_repaint_pending = false;
-        try repaint();
+    const bottom_delta = ingest(bytes, was_scrolled);
+    if (was_scrolled) {
+        if (bottom_delta > 0) {
+            scroll_offset += @intCast(bottom_delta);
+        } else if (bottom_delta < 0) {
+            scroll_offset -|= @intCast(-bottom_delta);
+        }
+        if (layout_ready) try repaint();
     }
 }
 
@@ -1272,13 +1283,14 @@ fn writeRegionBytes(bytes: []const u8) !void {
 /// Reassemble the displayed transcript and track the region cursor:
 /// carriage return rewinds, newline commits, SGR is kept, every other
 /// escape sequence is dropped.
-fn ingest(bytes: []const u8) void {
+fn ingest(bytes: []const u8, track_rows: bool) isize {
+    var bottom_delta: isize = 0;
     for (bytes) |byte| switch (esc_state) {
         .text => switch (byte) {
             0x1b => {
                 // CR before styled overwrites (spinner-style redraws)
                 // must land before the SGR is captured.
-                applyPendingCr();
+                bottom_delta += applyPendingCr(track_rows);
                 esc_state = .escape;
                 csi_len = 0;
             },
@@ -1290,21 +1302,21 @@ fn ingest(bytes: []const u8) void {
             },
             '\n' => {
                 pending_cr = false;
-                commit();
+                bottom_delta += commit(track_rows);
             },
             '\t' => {
-                applyPendingCr();
+                bottom_delta += applyPendingCr(track_rows);
                 // Terminals jump to the next 8-column stop; pad the ring
                 // to match so reflowed history lines up with live output.
                 const column = contentLeft() + lineLayout(current[0..current_len]).column;
                 const target = ((column - 1) / 8 + 1) * 8 + 1;
                 var spaces = @max(target -| column, 1);
-                while (spaces > 0) : (spaces -= 1) appendByte(' ');
+                while (spaces > 0) : (spaces -= 1) bottom_delta += appendByte(' ', track_rows);
             },
             0x00...0x08, 0x0b...0x0c, 0x0e...0x1a, 0x1c...0x1f, 0x7f => {},
             else => {
-                applyPendingCr();
-                appendByte(byte);
+                bottom_delta += applyPendingCr(track_rows);
+                bottom_delta += appendByte(byte, track_rows);
             },
         },
         .escape => esc_state = switch (byte) {
@@ -1321,7 +1333,7 @@ fn ingest(bytes: []const u8) void {
                 if (byte == 'm' and csi_len <= csi_buffer.len and current_len + csi_len + 2 <= current.len) {
                     // A carriage return before this SGR rewinds the line
                     // first, or the styling would be wiped with the text.
-                    applyPendingCr();
+                    bottom_delta += applyPendingCr(track_rows);
                     current[current_len] = 0x1b;
                     current[current_len + 1] = '[';
                     @memcpy(current[current_len + 2 .. current_len + 2 + csi_len], csi_buffer[0..csi_len]);
@@ -1337,17 +1349,21 @@ fn ingest(bytes: []const u8) void {
         },
         .osc_escape => esc_state = if (byte == '\\') .text else .osc,
     };
+    return bottom_delta;
 }
 
-fn applyPendingCr() void {
-    if (!pending_cr) return;
+fn applyPendingCr(track_rows: bool) isize {
+    if (!pending_cr) return 0;
+    const previous_rows = if (track_rows) lineLayout(current[0..current_len]).rows else 1;
     pending_cr = false;
     current_len = 0;
     current_truncated = false;
     cp_remaining = 0;
+    return 1 - @as(isize, @intCast(previous_rows));
 }
 
-fn appendByte(byte: u8) void {
+fn appendByte(byte: u8, track_rows: bool) isize {
+    const previous_rows = if (track_rows) lineLayout(current[0..current_len]).rows else 1;
     if (current_len < current.len) {
         current[current_len] = byte;
         current_len += 1;
@@ -1373,22 +1389,20 @@ fn appendByte(byte: u8) void {
         cp_pending = (cp_pending << 6) | (byte & 0x3f);
         cp_remaining -= 1;
     }
+    if (!track_rows) return 0;
+    const next_rows = lineLayout(current[0..current_len]).rows;
+    return @as(isize, @intCast(next_rows)) - @as(isize, @intCast(previous_rows));
 }
 
-fn commit() void {
-    if (scroll_offset != 0) {
-        // New output snaps the view back to live; the screen still shows
-        // the old page, so schedule a repaint once this burst is ingested.
-        scroll_offset = 0;
-        live_repaint_pending = true;
-    }
+fn commit(track_rows: bool) isize {
+    const previous_rows = if (track_rows) lineLayout(current[0..current_len]).rows else 1;
     var stored_len = current_len;
     while (stored_len > 0 and !std.unicode.utf8ValidateSlice(current[0..stored_len])) stored_len -= 1;
     if (stored_len != current_len) current_truncated = true;
     const copy = gpa_state.dupe(u8, current[0..stored_len]) catch {
         current_len = 0;
         current_truncated = false;
-        return;
+        return if (track_rows) 1 - @as(isize, @intCast(previous_rows)) else 0;
     };
     current_len = 0;
     if (line_count == max_lines) {
@@ -1402,6 +1416,9 @@ fn commit() void {
     if (layout_cache_width == contentWidth()) cacheLineLayout(slot);
     current_truncated = false;
     line_count += 1;
+    if (!track_rows) return 0;
+    const stored_rows = lineLayout(copy).rows;
+    return @as(isize, @intCast(stored_rows + 1)) - @as(isize, @intCast(previous_rows));
 }
 
 test "info bar text shows usage, activity, and hints" {
@@ -1466,7 +1483,7 @@ test "ingest reassembles overwritten lines, keeps SGR, drops movement" {
     gpa_state = gpa;
     rows = 24;
     cols = 80;
-    ingest("\x1b[2mhello\r\x1b[1mworld\x1b[0m\nplain\ttext\n");
+    _ = ingest("\x1b[2mhello\r\x1b[1mworld\x1b[0m\nplain\ttext\n", false);
     try std.testing.expectEqual(2, line_count);
     try std.testing.expectEqualStrings("\x1b[1mworld\x1b[0m", lines[0]);
     try std.testing.expectEqualStrings("plain  text", lines[1]);
@@ -1552,8 +1569,20 @@ test "exit restores terminal modes once" {
 
     exit();
     exit();
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output.written(), "\x1b[?2004l\x1b[r\x1b[?1049l"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output.written(), "\x1b[?1006l\x1b[?1000l\x1b[?2004l\x1b[r\x1b[?1049l"));
     try std.testing.expect(!active);
+}
+
+test "fullscreen enables and restores mouse reporting" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+
+    _ = try enterMeasured(std.testing.allocator, threaded.io(), &output.writer, .{ .rows = 24, .cols = 80 }, false);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[?1049h\x1b[?1000h\x1b[?1006h") != null);
+    exit();
+    try std.testing.expect(std.mem.endsWith(u8, output.written(), "\x1b[?1006l\x1b[?1000l\x1b[?2004l\x1b[r\x1b[?1049l"));
 }
 
 test "clearing a fullscreen transcript releases history and parser state" {
@@ -1683,6 +1712,48 @@ test "growing a paged viewport clamps visual scroll offset" {
     try std.testing.expect(resizeMeasured(.{ .rows = 24, .cols = 80 }));
     try std.testing.expectEqual(visualRowCount() -| viewportHeight(), scroll_offset);
     try std.testing.expectEqual(@as(usize, 5), scroll_offset);
+}
+
+test "wheel scrolling stays anchored while output arrives" {
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    io_state = threaded.io();
+    sink = &output.writer;
+    gpa_state = std.testing.allocator;
+    rows = 10;
+    cols = 40;
+    active = true;
+    layout_ready = true;
+    line_start = 0;
+    line_count = 6;
+    current_len = 0;
+    current_truncated = false;
+    pending_cr = false;
+    esc_state = .text;
+    csi_len = 0;
+    for (0..line_count) |i| {
+        lines[i] = try std.fmt.allocPrint(std.testing.allocator, "line {d}", .{i});
+        lines_truncated[i] = false;
+    }
+    scroll_offset = 0;
+    defer {
+        for (lines[0..line_count]) |line| std.testing.allocator.free(line);
+        line_count = 0;
+        line_start = 0;
+        current_len = 0;
+        scroll_offset = 0;
+        active = false;
+        layout_ready = false;
+    }
+
+    try std.testing.expect(scrollLines(true, 2));
+    try std.testing.expectEqual(@as(usize, 2), scroll_offset);
+    try forward("new line\n");
+    try std.testing.expectEqual(@as(usize, 3), scroll_offset);
+    try std.testing.expect(scrollLines(false, 2));
+    try std.testing.expectEqual(@as(usize, 1), scroll_offset);
 }
 
 test "paging is serialized with transcript rollover" {
