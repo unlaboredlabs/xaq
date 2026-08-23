@@ -474,7 +474,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
             }
             try options.output.writeAll("\ninterrupted\n");
             try options.output.flush();
-            tui.noteState(.idle, "");
+            tui.noteState(.idle);
             syncTui(&session);
             const reader = options.input orelse return error.Interrupted;
             if (busy) |queue| try queue.stop();
@@ -489,13 +489,13 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
         session.turn += 1;
         run_rounds += 1;
         try session.emit(.{ .round_start = .{ .number = run_rounds } });
-        tui.noteState(.thinking, "");
+        tui.noteState(.thinking);
         writeWorkerStatus(&session, "thinking", "");
         const round_result = performRound(&session) catch |err| switch (err) {
             error.NotLoggedIn => {
                 session.turn -|= 1;
                 const reader = options.input orelse return err;
-                tui.noteState(.idle, "");
+                tui.noteState(.idle);
                 syncTui(&session);
                 try setTitle(&session, false);
                 try options.output.print("{s} is not connected. Let's connect it now.\n", .{session.provider.label()});
@@ -517,7 +517,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
                     carried_images = popped.user.images;
                     try persistSnapshot(&session);
                 }
-                tui.noteState(.idle, "");
+                tui.noteState(.idle);
                 syncTui(&session);
                 var prompt = (try readPrompt(&session, reader, prefill, carried_images)) orelse return;
                 defer prompt.deinit();
@@ -542,7 +542,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
                     carried_images = popped.user.images;
                     try persistSnapshot(&session);
                 }
-                tui.noteState(.idle, "");
+                tui.noteState(.idle);
                 syncTui(&session);
                 if (busy) |queue| try queue.stop();
                 var prompt = (try readPrompt(&session, reader, prefill, carried_images)) orelse return;
@@ -569,7 +569,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
                 try writeDuration(options.output, interrupted_ms);
                 try options.output.writeByte('\n');
                 try options.output.flush();
-                tui.noteState(.idle, "");
+                tui.noteState(.idle);
                 syncTui(&session);
                 const reader = options.input orelse return error.Interrupted;
                 if (busy) |queue| try queue.stop();
@@ -626,7 +626,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
                 }
             }
 
-            tui.noteState(.idle, "");
+            tui.noteState(.idle);
             if (options.input != null) {
                 const elapsed_ms: u64 = @intCast(@max(0, @divTrunc(Io.Clock.now(.awake, io).nanoseconds - exchange_start.nanoseconds, std.time.ns_per_ms)));
                 try printExchangeStats(options.output, elapsed_ms, .{
@@ -695,7 +695,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
                 var activity_buffer: [192]u8 = undefined;
                 var activity: Io.Writer = .fixed(&activity_buffer);
                 try writeToolDescription(&activity, call.name, parsed, .running, null);
-                tui.noteState(.tooling, activity.buffered());
+                tui.noteState(.tooling);
                 writeWorkerStatus(&session, "tooling", activity.buffered());
                 spin.start(io, activity.buffered());
                 defer spin.stop();
@@ -772,7 +772,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
             try writeDuration(options.output, interrupted_ms);
             try options.output.writeByte('\n');
             try options.output.flush();
-            tui.noteState(.idle, "");
+            tui.noteState(.idle);
             syncTui(&session);
             const reader = options.input orelse return error.Interrupted;
             if (busy) |queue| try queue.stop();
@@ -961,18 +961,22 @@ fn imageInputError(err: anyerror) []const u8 {
 }
 
 fn runShellEscape(session: *Session, command: []const u8, add_to_context: bool) !void {
-    tui.noteState(.tooling, "shell");
+    tui.noteState(.tooling);
     syncTui(session);
+    try session.output.flush();
+    spin.start(session.io, "Running shell command");
     const result = tools.runShell(session.gpa, session.io, command, session.cwd) catch |err| {
+        spin.stop();
         if (cancel.requested()) cancel.reset();
-        tui.noteState(.idle, "");
+        tui.noteState(.idle);
         try session.output.print("shell failed: {s}\n", .{@errorName(err)});
         try session.output.flush();
         return;
     };
+    spin.stop();
     defer session.gpa.free(result);
     if (cancel.requested()) cancel.reset();
-    tui.noteState(.idle, "");
+    tui.noteState(.idle);
     if (result.len == 0) {
         try session.output.print("{s}[no output]{s}\n", .{ term.dim(), term.reset() });
     } else {
