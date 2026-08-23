@@ -3,6 +3,7 @@
 const std = @import("std");
 const Io = std.Io;
 const auth = @import("auth.zig");
+const transport = @import("transport.zig");
 const types = @import("types.zig");
 
 pub const Hooks = struct {
@@ -29,6 +30,7 @@ pub const Decoder = struct {
     claude_calls: std.ArrayList(StreamingClaudeCall) = .empty,
     usage: types.Usage = .{},
     received: bool = false,
+    provider_error: ?[]const u8 = null,
 
     pub fn init(provider: auth.Provider, parse_gpa: std.mem.Allocator, persist: std.mem.Allocator, hooks: Hooks) Decoder {
         return .{
@@ -53,6 +55,18 @@ pub const Decoder = struct {
         try self.beforeOutput();
         try self.text.writer.writeAll(delta);
         if (self.hooks.on_delta) |callback| try callback(self.hooks.context, delta);
+    }
+
+    fn captureProviderError(self: *Decoder, data: []const u8) !void {
+        if (self.provider_error != null) return;
+        self.provider_error = if (transport.errorMessage(self.persist, data)) |message|
+            message
+        else
+            try self.persist.dupe(u8, data[0..@min(data.len, 128 * 1024)]);
+    }
+
+    pub fn providerError(self: *const Decoder) ?[]const u8 {
+        return self.provider_error;
     }
 
     pub fn feed(self: *Decoder, raw_line: []const u8) !void {
@@ -99,8 +113,7 @@ pub const Decoder = struct {
                 if (eventInteger(details, "cached_tokens")) |number| self.usage.cached = number;
             }
         } else if (std.mem.eql(u8, kind, "response.failed") or std.mem.eql(u8, kind, "error")) {
-            _ = data;
-            return error.ProviderRequestFailed;
+            try self.captureProviderError(data);
         }
     }
 
@@ -146,12 +159,12 @@ pub const Decoder = struct {
             if (eventInteger(usage_value, "input_tokens")) |number| self.usage.input = number;
             if (eventInteger(usage_value, "output_tokens")) |number| self.usage.output = number;
         } else if (std.mem.eql(u8, kind, "error")) {
-            _ = data;
-            return error.ProviderRequestFailed;
+            try self.captureProviderError(data);
         }
     }
 
     pub fn finish(self: *Decoder) !types.Assistant {
+        if (self.provider_error != null) return error.ProviderRequestFailed;
         if (self.provider == .claude) {
             for (self.claude_calls.items) |*call| try self.calls.append(self.persist, .{
                 .id = call.id,
@@ -227,4 +240,24 @@ test "decodes Anthropic fragmented tool input" {
     const result = try decoder.finish();
     try std.testing.expectEqualStrings("ok", result.text);
     try std.testing.expectEqualStrings("{\"command\":\"pwd\"}", result.calls[0].arguments);
+}
+
+test "preserves Anthropic streaming errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var decoder = Decoder.init(.claude, std.testing.allocator, arena.allocator(), .{});
+    defer decoder.deinit();
+    try decoder.feed("data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Claude is overloaded\"}}");
+    try std.testing.expectEqualStrings("Claude is overloaded", decoder.providerError().?);
+    try std.testing.expectError(error.ProviderRequestFailed, decoder.finish());
+}
+
+test "preserves Responses streaming errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var decoder = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), .{});
+    defer decoder.deinit();
+    try decoder.feed("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"Model unavailable\"}}}");
+    try std.testing.expectEqualStrings("Model unavailable", decoder.providerError().?);
+    try std.testing.expectError(error.ProviderRequestFailed, decoder.finish());
 }

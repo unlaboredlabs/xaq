@@ -51,7 +51,7 @@ xaq login claude
 xaq login grok
 ```
 
-ChatGPT and Claude use browser login. If the localhost callback page fails to load, copy its full address-bar URL or the authorization code back into `xaq`. Grok uses device-code login.
+ChatGPT and Claude use browser login. ChatGPT may ask you to copy a localhost callback URL. Claude shows an authorization code on its callback page. Paste either value back into `xaq`. Grok uses device-code login.
 
 Already inside an interactive session? Run `/login` to connect or replace any provider login without leaving `xaq`.
 
@@ -88,7 +88,7 @@ Type `/` to browse local commands:
 | `/fast [on\|off\|status]` | control the provider's premium speed tier |
 | `/verbose [on\|off]` | show tool-result previews |
 | `/firecrawl [status\|clear]` | configure web tools |
-| `/agents` | list subagents |
+| `/agents` | list subagents with model, effort, and live activity |
 | `/settings` | configure compaction and subagents |
 | `/status` | show session and token details |
 | `/compact` | compact context now |
@@ -161,7 +161,7 @@ The model receives four local tools:
 | `edit` | replace exact text |
 | `write` | create or overwrite files |
 
-The parent agent can also start, inspect, and steer subagents. Workers are separate `xaq` processes in the same working directory, with up to four running at once by default. `/settings` can disable them or change the limit.
+The parent agent can also start, inspect, and steer subagents. Workers are separate `xaq` processes in the same working directory, with up to four running at once by default. In fullscreen mode, live agents appear in a panel above the info bar: id, status, elapsed time, model and effort, and a heartbeat of what each worker is doing right now. The panel takes no rows while no agents exist. `/agents` shows the same detail inline. `/settings` can disable subagents, change the limit, or turn the panel off.
 
 For web access, run `/firecrawl` and enter a [Firecrawl API key](https://www.firecrawl.dev/app/api-keys). This adds `web_fetch` and `web_search`. The key is stored in `~/.config/xaq/settings.json` with mode `0600`.
 
