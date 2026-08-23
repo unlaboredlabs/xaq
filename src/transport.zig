@@ -14,24 +14,24 @@ const max_response_line_bytes = 8 * 1024 * 1024;
 pub fn errorMessage(gpa: std.mem.Allocator, body: []const u8) ?[]u8 {
     var parsed = std.json.parseFromSlice(std.json.Value, gpa, body, .{}) catch return null;
     defer parsed.deinit();
-    const object = switch (parsed.value) {
-        .object => |value| value,
+    const text = errorMessageValue(parsed.value) orelse return null;
+    return gpa.dupe(u8, text) catch null;
+}
+
+fn errorMessageValue(root: std.json.Value) ?[]const u8 {
+    const object = switch (root) {
+        .object => |object_value| object_value,
         else => return null,
     };
     for ([_][]const u8{ "error_description", "detail", "message", "error" }) |key| {
         const value = object.get(key) orelse continue;
         switch (value) {
-            .string => |text| return gpa.dupe(u8, text) catch null,
-            .object => |nested| {
-                const message = nested.get("message") orelse continue;
-                switch (message) {
-                    .string => |text| return gpa.dupe(u8, text) catch null,
-                    else => {},
-                }
-            },
+            .string => |text| return text,
+            .object => if (errorMessageValue(value)) |text| return text,
             else => {},
         }
     }
+    if (object.get("response")) |response| return errorMessageValue(response);
     return null;
 }
 
@@ -294,6 +294,10 @@ test "provider error messages handle OAuth and nested API errors" {
     const nested = errorMessage(std.testing.allocator, "{\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Try again later\"}}").?;
     defer std.testing.allocator.free(nested);
     try std.testing.expectEqualStrings("Try again later", nested);
+
+    const streamed = errorMessage(std.testing.allocator, "{\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"Model unavailable\"}}}").?;
+    defer std.testing.allocator.free(streamed);
+    try std.testing.expectEqualStrings("Model unavailable", streamed);
 }
 
 test "curl config rejects header injection" {

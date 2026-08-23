@@ -494,7 +494,13 @@ pub const Agent = struct {
             defer request_arena.allocator().free(response.body);
             if (self.cancellation.isRequested()) return error.Cancelled;
             self.last_http_status = response.status;
-            if (response.status >= 200 and response.status < 300) return decoder.finish();
+            if (response.status >= 200 and response.status < 300) {
+                if (decoder.providerError()) |message| {
+                    self.last_error_body = try self.gpa.dupe(u8, message);
+                    return error.ProviderRequestFailed;
+                }
+                return decoder.finish();
+            }
             if (response.status == 401 and !force_refresh and self.credential_source != null) {
                 force_refresh = true;
                 continue;
@@ -969,6 +975,31 @@ test "provider failures preserve diagnostics and roll back the turn" {
     try std.testing.expectEqual(@as(usize, 0), embedded.history().len);
     try std.testing.expectEqualStrings("denied by host", embedded.lastProviderError().?);
     try std.testing.expectEqual(@as(?u16, 403), embedded.last_http_status);
+}
+
+test "streaming provider failures preserve diagnostics and roll back the turn" {
+    const Fake = struct {
+        fn post(_: ?*anyopaque, gpa: std.mem.Allocator, _: Io, _: Request, line_context: ?*anyopaque, on_line: StreamLineFn) !Response {
+            try on_line(line_context, "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Claude is overloaded\"}}");
+            return .{ .status = 200, .body = try gpa.dupe(u8, "") };
+        }
+    };
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var embedded = try Agent.init(std.testing.allocator, .{
+        .io = threaded.io(),
+        .provider = .claude,
+        .model = "claude-haiku-4-5",
+        .cwd = "/workspace",
+        .credential = .{ .access = "token", .refresh = "", .expires = 0 },
+        .transport = .{ .post_stream = Fake.post },
+    });
+    defer embedded.deinit();
+    try std.testing.expectError(error.ProviderRequestFailed, embedded.prompt("do not retain me", .{}));
+    try std.testing.expectEqual(@as(usize, 0), embedded.history().len);
+    try std.testing.expectEqualStrings("Claude is overloaded", embedded.lastProviderError().?);
+    try std.testing.expectEqual(@as(?u16, 200), embedded.last_http_status);
 }
 
 test "failed prompts release copied image and streamed response payloads" {

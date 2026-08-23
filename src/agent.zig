@@ -354,6 +354,7 @@ const Session = struct {
 };
 
 pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
+    provider_error_len = 0;
     if (options.effort) |effort| {
         if (!models.supportsEffort(options.provider, options.model, effort)) return error.InvalidEffortForModel;
     }
@@ -1332,8 +1333,8 @@ const login_providers = [_]auth.Provider{ .chatgpt, .claude, .grok };
 
 fn printLogins(session: *Session) !void {
     for (login_providers) |provider| {
-        const connected = try auth.isLoggedIn(session.gpa, session.io, session.home, provider);
-        try session.output.print("  {s:<8} {s}", .{ provider.label(), if (connected) "connected" else "not connected" });
+        const status = try auth.loginStatus(session.gpa, session.io, session.home, provider);
+        try session.output.print("  {s:<8} {s}", .{ provider.label(), status.label() });
         if (provider == session.provider) try session.output.writeAll(" \u{b7} current session");
         try session.output.writeByte('\n');
     }
@@ -1345,11 +1346,12 @@ fn pickLogin(session: *Session, reader: *Io.Reader) !void {
     var connected: [login_providers.len]bool = undefined;
     var initial: usize = 0;
     for (login_providers, 0..) |provider, index| {
-        connected[index] = try auth.isLoggedIn(session.gpa, session.io, session.home, provider);
+        const status = try auth.loginStatus(session.gpa, session.io, session.home, provider);
+        connected[index] = status.hasCredential();
         if (provider == session.provider) initial = index;
         labels[index] = try std.fmt.bufPrint(&storage[index], "{s:<8} {s}{s}", .{
             provider.label(),
-            if (connected[index]) "connected" else "not connected",
+            status.label(),
             if (provider == session.provider) " \u{b7} current session" else "",
         });
     }
@@ -1929,6 +1931,33 @@ fn rememberProviderError(status: u16, body: []const u8) void {
         writer.writeByte(byte) catch break;
     }
     provider_error_len = writer.buffered().len;
+}
+
+fn rememberProviderDiagnostic(message: []const u8) void {
+    var writer: Io.Writer = .fixed(&provider_error_buffer);
+    for (message) |byte| {
+        if (byte == '\n' or byte == '\r') break;
+        if (byte < 0x20 or byte == 0x7f) continue;
+        writer.writeByte(byte) catch break;
+    }
+    provider_error_len = writer.buffered().len;
+}
+
+fn reportProviderDiagnostic(session: *Session, message: []const u8) !void {
+    rememberProviderDiagnostic(message);
+    if (!session.interactive) return;
+    var safe: term.SafeWriter = .{ .output = session.output };
+    try safe.write(message);
+    try session.output.writeByte('\n');
+    try session.output.flush();
+}
+
+fn reportProviderStreamError(session: *Session, message: []const u8) !void {
+    var buffer: [512]u8 = undefined;
+    var writer: Io.Writer = .fixed(&buffer);
+    writer.writeAll("provider stream error: ") catch {};
+    writer.writeAll(message) catch {};
+    try reportProviderDiagnostic(session, writer.buffered());
 }
 
 pub fn lastProviderError() ?[]const u8 {
@@ -2587,7 +2616,13 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
     while (attempt < 3) : (attempt += 1) {
         var credential_arena: std.heap.ArenaAllocator = .init(session.gpa);
         defer credential_arena.deinit();
-        const credential = try auth.credential(credential_arena.allocator(), session.io, session.home, session.provider);
+        var credential_diagnostic: auth.Diagnostic = .{};
+        const credential = auth.credentialWithDiagnostic(credential_arena.allocator(), session.io, session.home, session.provider, &credential_diagnostic) catch |err| {
+            if (err == error.ProviderRequestFailed) {
+                if (credential_diagnostic.message()) |message| try reportProviderDiagnostic(session, message);
+            }
+            return err;
+        };
         const compacting = std.mem.eql(u8, kind, "compact");
         var decoder = Decoder.init(session.provider, session.gpa, session.allocator(), output, if (compacting) null else session.events);
         defer decoder.deinit();
@@ -2630,11 +2665,23 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
         spin.stop();
         defer session.gpa.free(response.body);
         log.logf("agent", "event=response kind={s} turn={d} status={d} attempt={d}", .{ kind, session.turn, response.status, attempt + 1 });
-        if (response.status >= 200 and response.status < 300) return finishRound(&decoder, .completed);
+        if (response.status >= 200 and response.status < 300) {
+            if (decoder.core.providerError()) |message| {
+                try reportProviderStreamError(session, message);
+                return error.ProviderRequestFailed;
+            }
+            return finishRound(&decoder, .completed);
+        }
         if (response.status == 401 and !refreshed) {
             var refresh_arena: std.heap.ArenaAllocator = .init(session.gpa);
             defer refresh_arena.deinit();
-            try auth.forceRefresh(refresh_arena.allocator(), session.io, session.home, session.provider);
+            var refresh_diagnostic: auth.Diagnostic = .{};
+            auth.forceRefreshWithDiagnostic(refresh_arena.allocator(), session.io, session.home, session.provider, &refresh_diagnostic) catch |err| {
+                if (err == error.ProviderRequestFailed) {
+                    if (refresh_diagnostic.message()) |message| try reportProviderDiagnostic(session, message);
+                }
+                return err;
+            };
             refreshed = true;
             continue;
         }
