@@ -183,6 +183,27 @@ const Session = struct {
         if (self.thread) |*thread| try thread.appendFast(enabled);
     }
 
+    /// Move the session to another provider, keeping the visible
+    /// transcript. Provider-native response items (ChatGPT's encrypted
+    /// reasoning, raw Responses output) only replay against the API that
+    /// produced them, so they are dropped and history falls back to its
+    /// plain text and tool-call form. That loss is one-way; the returned
+    /// summary lets the caller say so at switch time.
+    fn switchProvider(self: *Session, provider: auth.Provider, model: []const u8) !ProviderSwitch {
+        const effort_before = self.effort;
+        const fast_before = self.fast;
+        self.provider = provider;
+        if (self.thread) |*thread| try thread.appendProvider(@tagName(provider));
+        try self.setModel(model);
+        const dropped = stripRawItems(self.entries.items);
+        if (dropped) try persistSnapshot(self);
+        return .{
+            .reasoning_dropped = dropped,
+            .effort_dropped = effort_before != null and self.effort == null,
+            .fast_dropped = fast_before and !self.fast,
+        };
+    }
+
     fn appendEntry(self: *Session, entry: Entry) !void {
         try self.entries.append(self.allocator(), entry);
         if (self.thread) |*thread| try thread.appendEntry(entry);
@@ -977,7 +998,7 @@ const CommandSpec = struct {
 const command_specs = [_]CommandSpec{
     .{ .command = .help, .name = "help", .help = "list commands" },
     .{ .command = .login, .name = "login", .args = " [PROVIDER]", .help = "connect a subscription" },
-    .{ .command = .model, .name = "model", .args = " [ID]", .help = "pick model, effort, and speed" },
+    .{ .command = .model, .name = "model", .args = " [ID]", .help = "pick any provider's model, effort, and speed" },
     .{ .command = .effort, .name = "effort", .args = " [LEVEL]", .help = "pick or set reasoning effort" },
     .{ .command = .fast, .name = "fast", .args = " [MODE]", .help = "toggle normal or fast mode" },
     .{ .command = .verbose, .name = "verbose", .args = " [on|off]", .help = "show tool output inline" },
@@ -1073,7 +1094,9 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
         } else if (std.mem.eql(u8, args, "status")) {
             try printLogins(session);
         } else if (auth.Provider.parse(args)) |provider| {
-            _ = try connectLogin(session, reader, provider);
+            if (try connectLogin(session, reader, provider) and provider != session.provider) {
+                try printProviderHint(session, provider);
+            }
         } else {
             try output.writeAll("usage: /login [chatgpt|claude|grok|status]\n");
         },
@@ -1083,11 +1106,23 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
             } else {
                 try output.print("model {s} (provider default {s})\n", .{ session.model, defaultModel(session.provider) });
             }
+        } else if (crossProviderTarget(session, args)) |target| {
+            if (try ensureProviderLogin(session, reader, target)) {
+                const from = session.provider;
+                const changes = try session.switchProvider(target, args);
+                persistSelection(session);
+                try output.print("model set to {s} \u{b7} provider {s}\n", .{ session.model, @tagName(session.provider) });
+                try printProviderSwitchNotes(session, from, changes);
+            } else {
+                try output.print("model {s} (unchanged)\n", .{session.model});
+            }
         } else {
             const was_fast = session.fast;
+            const had_effort = session.effort != null;
             try session.setModel(args);
             persistSelection(session);
             try output.print("model set to {s}\n", .{session.model});
+            if (had_effort and session.effort == null) try output.writeAll("effort reset to provider-default; this model does not support the previous setting\n");
             if (was_fast and !session.fast) try output.writeAll("fast mode turned off; this model does not support it\n");
         },
         .effort => if (args.len == 0) {
@@ -1335,7 +1370,17 @@ fn pickLogin(session: *Session, reader: *Io.Reader) !void {
             return;
         }
     }
-    _ = try connectLogin(session, reader, provider);
+    if (try connectLogin(session, reader, provider) and provider != session.provider) {
+        try printProviderHint(session, provider);
+    }
+}
+
+/// After connecting another provider from /login, say how to use it: this
+/// session can move over with /model, or a second terminal can run both
+/// subscriptions at once.
+fn printProviderHint(session: *Session, provider: auth.Provider) !void {
+    try session.output.print("{s}switch this session with /model {s}, or run a parallel one with: xaq --provider {s}{s}\n", .{ term.dim(), models.defaultModel(provider), @tagName(provider), term.reset() });
+    try session.output.flush();
 }
 
 fn connectLogin(session: *Session, reader: *Io.Reader, provider: auth.Provider) !bool {
@@ -1359,36 +1404,111 @@ fn connectLogin(session: *Session, reader: *Io.Reader, provider: auth.Provider) 
         }
         return false;
     };
-    if (provider != session.provider) {
-        try session.output.print("Use it with: xaq --provider {s}\n", .{@tagName(provider)});
-    }
     return true;
+}
+
+/// True when the provider can serve requests. Interactive sessions get the
+/// guided login; one-shots are pointed at `xaq login`.
+fn ensureProviderLogin(session: *Session, reader: *Io.Reader, provider: auth.Provider) !bool {
+    if (try auth.isLoggedIn(session.gpa, session.io, session.home, provider)) return true;
+    if (!input_mod.interactive) {
+        try session.output.print("{s} is not connected; run: xaq login {s}\n", .{ provider.label(), @tagName(provider) });
+        return false;
+    }
+    try session.output.print("{s} is not connected. Let's connect it now.\n", .{provider.label()});
+    try session.output.flush();
+    return connectLogin(session, reader, provider);
+}
+
+/// What a provider switch changed beyond the model itself.
+const ProviderSwitch = struct {
+    reasoning_dropped: bool,
+    effort_dropped: bool,
+    fast_dropped: bool,
+};
+
+/// A catalog ID from another provider makes /model a provider switch.
+/// Unknown IDs (snapshot names) stay with the current provider.
+fn crossProviderTarget(session: *const Session, id: []const u8) ?auth.Provider {
+    const profile = models.findAny(id) orelse return null;
+    return if (profile.provider == session.provider) null else profile.provider;
+}
+
+/// Drop provider-native response items so the history replays anywhere.
+/// ChatGPT's encrypted reasoning and raw Responses items are opaque to
+/// every other API; the plain text and tool-call form always exists
+/// alongside them and is what both request serializers fall back to.
+fn stripRawItems(entries: []Entry) bool {
+    var dropped = false;
+    for (entries) |*entry| switch (entry.*) {
+        .assistant => |*answer| if (answer.raw_items.len > 0) {
+            answer.raw_items = &.{};
+            dropped = true;
+        },
+        else => {},
+    };
+    return dropped;
+}
+
+fn historyImagesUnsupported(provider: auth.Provider, entries: []const Entry) bool {
+    for (entries) |entry| switch (entry) {
+        .user => |user| image_input.validateProvider(provider, user.images) catch return true,
+        else => {},
+    };
+    return false;
+}
+
+/// One dim note per real consequence of a provider switch, printed once at
+/// switch time instead of surprising the user with a slower or forgetful
+/// first reply.
+fn printProviderSwitchNotes(session: *Session, from: auth.Provider, changes: ProviderSwitch) !void {
+    const output = session.output;
+    if (changes.reasoning_dropped) {
+        try output.print("{s}note: the transcript carries over, but {s}'s private reasoning state cannot; the first {s} reply may briefly re-explore, and cached-token discounts restart{s}\n", .{ term.dim(), from.label(), session.provider.label(), term.reset() });
+    }
+    if (changes.effort_dropped) {
+        try output.print("{s}note: effort reset to provider-default; {s} does not support the previous setting{s}\n", .{ term.dim(), session.model, term.reset() });
+    }
+    if (changes.fast_dropped) {
+        try output.print("{s}note: fast mode turned off; {s} does not support it{s}\n", .{ term.dim(), session.model, term.reset() });
+    }
+    if (historyImagesUnsupported(session.provider, session.entries.items)) {
+        try output.print("{s}note: some earlier image attachments are unsupported here (Grok accepts PNG and JPEG only); /rewind past them or /new if requests fail{s}\n", .{ term.dim(), term.reset() });
+    }
+    try output.flush();
 }
 
 fn consumeLoginCancellation() void {
     if (cancel.requested()) cancel.reset();
 }
 
-/// Interactive model switcher: current model first, then per-provider
-/// suggestions. Selection is optional sugar over `/model <id>`.
+/// Interactive model switcher across every provider: the current model
+/// first, then the session provider's catalog, then other providers'
+/// models labeled with their provider. Picking another provider's model
+/// switches the whole session to it (see switchProvider for what that
+/// keeps and what it cannot).
 fn pickModel(session: *Session, reader: *Io.Reader) !void {
     const output = session.output;
-    var values: [9][]const u8 = undefined;
-    var labels: [9][]const u8 = undefined;
-    var owned: [9]?[]u8 = @splat(null);
+    // Worst case: an off-catalog current model plus the full catalog.
+    const max_items = models.profiles.len + 1;
+    var values: [max_items][]const u8 = undefined;
+    var providers: [max_items]auth.Provider = undefined;
+    var labels: [max_items][]const u8 = undefined;
+    var owned: [max_items]?[]u8 = @splat(null);
     var count: usize = 0;
     defer for (owned[0..count]) |label| {
         if (label) |text| session.gpa.free(text);
     };
     values[count] = session.model;
+    providers[count] = session.provider;
     owned[count] = try std.fmt.allocPrint(session.gpa, "{s} (current)", .{session.model});
     labels[count] = owned[count].?;
     count += 1;
     const default_id = defaultModel(session.provider);
     for (modelChoices(session.provider)) |choice| {
-        if (count == values.len) break;
         if (std.mem.eql(u8, choice, session.model)) continue;
         values[count] = choice;
+        providers[count] = session.provider;
         if (std.mem.eql(u8, choice, default_id)) {
             owned[count] = try std.fmt.allocPrint(session.gpa, "{s} (default)", .{choice});
             labels[count] = owned[count].?;
@@ -1397,32 +1517,62 @@ fn pickModel(session: *Session, reader: *Io.Reader) !void {
         }
         count += 1;
     }
-    try output.print("{s}pick a model \u{b7} enter confirms \u{b7} esc/q cancels \u{b7} any ID via /model <id>{s}\r\n", .{ term.dim(), term.reset() });
+    for (login_providers) |provider| {
+        if (provider == session.provider) continue;
+        const connected = try auth.isLoggedIn(session.gpa, session.io, session.home, provider);
+        for (models.choices(provider)) |choice| {
+            values[count] = choice;
+            providers[count] = provider;
+            owned[count] = try std.fmt.allocPrint(session.gpa, "{s} \u{b7} {s}{s}", .{ choice, @tagName(provider), if (connected) "" else " (not connected)" });
+            labels[count] = owned[count].?;
+            count += 1;
+        }
+    }
+    try output.print("{s}pick a model \u{b7} another provider's model switches the session \u{b7} enter confirms \u{b7} esc/q cancels{s}\r\n", .{ term.dim(), term.reset() });
     try output.flush();
     if (try input_mod.pick(reader, output, labels[0..count], 0)) |index| {
         const selected_model = values[index];
-        const preferences = (try pickModelPreferences(session, reader, selected_model)) orelse {
+        const selected_provider = providers[index];
+        if (selected_provider != session.provider and !try ensureProviderLogin(session, reader, selected_provider)) {
+            try output.print("model {s} (unchanged)\n", .{session.model});
+            return;
+        }
+        const preferences = (try pickModelPreferences(session, reader, selected_provider, selected_model)) orelse {
             try output.print("model {s} (unchanged)\n", .{session.model});
             return;
         };
-        if (!std.mem.eql(u8, selected_model, session.model)) try session.setModel(selected_model);
+        const from = session.provider;
+        var changes: ProviderSwitch = .{ .reasoning_dropped = false, .effort_dropped = false, .fast_dropped = false };
+        if (selected_provider != session.provider) {
+            changes = try session.switchProvider(selected_provider, selected_model);
+        } else if (!std.mem.eql(u8, selected_model, session.model)) {
+            try session.setModel(selected_model);
+        }
         if (session.effort != preferences.effort) try session.setEffort(preferences.effort);
         if (session.fast != preferences.fast) try session.setFast(preferences.fast);
         persistSelection(session);
-        log.logf("agent", "event=model model={s}", .{session.model});
+        log.logf("agent", "event=model provider={s} model={s}", .{ @tagName(session.provider), session.model });
+        if (from != session.provider) {
+            try output.print("model {s} \u{b7} provider {s}", .{ session.model, @tagName(session.provider) });
+        } else {
+            try output.print("model {s}", .{session.model});
+        }
         if (models.supportsFast(session.provider, session.model)) {
-            try output.print("model {s} \u{b7} effort {s} \u{b7} {s}\n", .{
-                session.model,
+            try output.print(" \u{b7} effort {s} \u{b7} {s}\n", .{
                 if (session.effort) |effort| @tagName(effort) else "provider-default",
                 if (session.fast) "fast" else "normal",
             });
         } else if (models.efforts(session.provider, session.model).len > 0) {
-            try output.print("model {s} \u{b7} effort {s}\n", .{
-                session.model,
-                if (session.effort) |effort| @tagName(effort) else "provider-default",
-            });
+            try output.print(" \u{b7} effort {s}\n", .{if (session.effort) |effort| @tagName(effort) else "provider-default"});
         } else {
-            try output.print("model {s}\n", .{session.model});
+            try output.writeByte('\n');
+        }
+        if (from != session.provider) {
+            // Effort and fast were just confirmed for the new model, so
+            // only the notes about lost state still apply.
+            changes.effort_dropped = false;
+            changes.fast_dropped = false;
+            try printProviderSwitchNotes(session, from, changes);
         }
     } else {
         try output.print("model {s} (unchanged)\n", .{session.model});
@@ -1435,15 +1585,16 @@ const ModelPreferences = struct {
 };
 
 /// Follow model selection with the controls that model supports. Nothing is
-/// applied until every visible stage has been confirmed.
-fn pickModelPreferences(session: *Session, reader: *Io.Reader, model: []const u8) !?ModelPreferences {
+/// applied until every visible stage has been confirmed. `provider` may
+/// differ from the session's when the selection switches providers.
+fn pickModelPreferences(session: *Session, reader: *Io.Reader, provider: auth.Provider, model: []const u8) !?ModelPreferences {
     var selected: ModelPreferences = .{
         .effort = null,
         // Match fx's staged picker: supported models start on Fast, while
         // Normal remains one arrow key away.
-        .fast = models.supportsFast(session.provider, model),
+        .fast = models.supportsFast(provider, model),
     };
-    const available_efforts = models.efforts(session.provider, model);
+    const available_efforts = models.efforts(provider, model);
     if (available_efforts.len > 0) {
         var labels: [6][]const u8 = undefined;
         labels[0] = "provider-default";
@@ -1453,7 +1604,7 @@ fn pickModelPreferences(session: *Session, reader: *Io.Reader, model: []const u8
         const index = (try input_mod.pick(reader, session.output, labels[0 .. available_efforts.len + 1], 0)) orelse return null;
         selected.effort = if (index == 0) null else available_efforts[index - 1];
     }
-    if (models.supportsFast(session.provider, model)) {
+    if (models.supportsFast(provider, model)) {
         const labels = [_][]const u8{ "normal", "fast" };
         try session.output.print("{s}speed for {s} \u{b7} fast uses more credits \u{b7} enter confirms \u{b7} esc/q cancels{s}\r\n", .{ term.dim(), model, term.reset() });
         try session.output.flush();
@@ -2712,6 +2863,27 @@ test "rewind refuses to cross compacted history" {
     };
     try std.testing.expectEqual(@as(?usize, 1), try rewindIndex(&entries, 1));
     try std.testing.expectError(error.CompactedHistoryBoundary, rewindIndex(&entries, 2));
+}
+
+test "provider switch strips provider-native response items" {
+    var raw = [_][]const u8{"{\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}"};
+    var entries = [_]Entry{
+        .{ .user = .{ .text = "hi" } },
+        .{ .assistant = .{ .text = "answer", .calls = &.{}, .raw_items = &raw } },
+    };
+    try std.testing.expect(stripRawItems(&entries));
+    try std.testing.expectEqual(@as(usize, 0), entries[1].assistant.raw_items.len);
+    // Idempotent: a second switch has nothing left to drop.
+    try std.testing.expect(!stripRawItems(&entries));
+}
+
+test "history image audit flags formats the target provider rejects" {
+    const entries = [_]Entry{
+        .{ .user = .{ .text = "look", .images = &.{.{ .name = "shot.webp", .media_type = "image/webp", .data = "" }} } },
+    };
+    try std.testing.expect(historyImagesUnsupported(.grok, &entries));
+    try std.testing.expect(!historyImagesUnsupported(.chatgpt, &entries));
+    try std.testing.expect(!historyImagesUnsupported(.claude, &entries));
 }
 
 test "guided login cancellation is consumed before the next prompt" {

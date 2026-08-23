@@ -110,6 +110,12 @@ pub const Thread = struct {
         try self.appendSetting("model", "model", model);
     }
 
+    /// A mid-thread provider switch. Written before the accompanying model
+    /// line so a resumed thread replays the pair in selection order.
+    pub fn appendProvider(self: *Thread, provider: []const u8) !void {
+        try self.appendSetting("provider", "provider", provider);
+    }
+
     pub fn appendEffort(self: *Thread, effort: []const u8) !void {
         try self.appendSetting("effort", "effort", effort);
     }
@@ -401,6 +407,10 @@ pub fn load(gpa: std.mem.Allocator, entry_gpa: std.mem.Allocator, io: Io, home: 
             fast = objectBool(parsed.value, "fast") orelse false;
         } else if (std.mem.eql(u8, kind, "model")) {
             model = try entry_gpa.dupe(u8, objectString(parsed.value, "model") orelse continue);
+        } else if (std.mem.eql(u8, kind, "provider")) {
+            // An unparseable provider line keeps the previous value; the
+            // thread stays loadable on builds that predate a new provider.
+            provider = auth.Provider.parse(objectString(parsed.value, "provider") orelse continue) orelse provider;
         } else if (std.mem.eql(u8, kind, "effort")) {
             effort = try entry_gpa.dupe(u8, objectString(parsed.value, "effort") orelse continue);
         } else if (std.mem.eql(u8, kind, "fast")) {
@@ -660,6 +670,8 @@ test "thread JSONL resumes state after the last reset" {
     try thread.appendEntry(.{ .user = .{ .text = "new" } });
     try std.testing.expectEqual(scratch_capacity, thread.scratch.writer.buffer.len);
     try thread.appendFast(false);
+    try thread.appendProvider("claude");
+    try thread.appendProvider("not-a-provider");
     const summaries = try list(std.testing.allocator, std.testing.io, home, "/work/project", null, 8);
     defer freeSummaries(std.testing.allocator, summaries);
     try std.testing.expectEqual(@as(usize, 1), summaries.len);
@@ -674,7 +686,7 @@ test "thread JSONL resumes state after the last reset" {
     defer arena.deinit();
     var loaded = try load(std.testing.allocator, arena.allocator(), std.testing.io, home, "/work/project", id, null);
     defer loaded.thread.deinit();
-    try std.testing.expectEqual(auth.Provider.chatgpt, loaded.provider);
+    try std.testing.expectEqual(auth.Provider.claude, loaded.provider);
     try std.testing.expectEqualStrings("model-a", loaded.model);
     try std.testing.expectEqualStrings("high", loaded.effort.?);
     try std.testing.expect(!loaded.fast);

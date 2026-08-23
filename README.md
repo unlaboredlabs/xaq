@@ -83,7 +83,7 @@ Type `/` to browse local commands:
 | Command | What it does |
 | --- | --- |
 | `/login [PROVIDER]` | connect a ChatGPT, Claude, or Grok subscription |
-| `/model [ID]` | choose a model |
+| `/model [ID]` | choose a model from any connected provider |
 | `/effort [LEVEL]` | set reasoning effort |
 | `/fast [on\|off\|status]` | control the provider's premium speed tier |
 | `/verbose [on\|off]` | show tool-result previews |
@@ -134,7 +134,9 @@ xaq --model gpt-5.5 --effort high
 xaq --fast 'solve the failing test'
 ```
 
-The defaults are `gpt-5.6-sol`, `claude-opus-5`, and `grok-4.6`. Run `/model` for the curated choices. Exact model IDs also work, though `xaq` uses conservative context limits when it does not recognize one. Fast mode is available only on models whose subscription API supports it and consumes plan usage at a higher rate.
+The defaults are `gpt-5.6-sol`, `claude-opus-5`, and `grok-4.6`. Run `/model` for the curated choices across all three providers; picking another provider's model switches the session to that subscription, offering login first if needed. A recognized `--model` ID implies its provider, so `xaq --model claude-opus-5` needs no `--provider` flag. Exact model IDs also work, though `xaq` uses conservative context limits when it does not recognize one, and unrecognized IDs stay with the current provider. Fast mode is available only on models whose subscription API supports it and consumes plan usage at a higher rate.
+
+Switching providers mid-conversation keeps the transcript but not the previous provider's private state. Providers return reasoning in a form only their own API can replay (ChatGPT encrypts it), so after a switch `xaq` resends history as plain text and tool calls. The first reply on the new provider may briefly re-explore, cached-token discounts restart, and the drop is one-way: switching back does not restore it. `xaq` prints a note at switch time when this applies. Image attachments must also satisfy the new provider's format rules; Grok accepts PNG and JPEG only.
 
 Run `xaq --help` for the complete CLI syntax.
 
