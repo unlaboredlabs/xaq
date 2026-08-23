@@ -22,34 +22,40 @@ var out_fd: std.posix.fd_t = std.posix.STDOUT_FILENO;
 var future: ?Io.Future(void) = null;
 var io_handle: Io = undefined;
 var label: []const u8 = "";
+var fallback_visible = false;
 
 /// Begin animating a dim `⠙ label`, redrawn in place. The label must
 /// outlive the spinner (pass a literal). No-op when styling is disabled
 /// or a spinner is already running.
 pub fn start(io: Io, text: []const u8) void {
-    if (tui.active) {
-        // Fullscreen also shows the label statically in the info bar;
-        // frames animate on the transcript's live row.
-        tui.setActivity(text);
-    } else if (!term.enabled) return;
     if (future != null) return;
+    if (!tui.active and !term.enabled) return;
     label = text;
     io_handle = io;
-    future = io.concurrent(loop, .{io}) catch return;
+    future = io.concurrent(loop, .{io}) catch {
+        // Keep the activity visible even when this Io implementation cannot
+        // animate it. `stop` clears the fallback frame with the normal path.
+        if (tui.active) {
+            tui.spinnerFrame(frames[0], label);
+            fallback_visible = true;
+        }
+        return;
+    };
 }
 
 /// Stop and erase the spinner line. Cancels and awaits the task, so no
 /// frame can land after this returns. Safe to call when nothing runs.
 pub fn stop() void {
     var running = future orelse {
-        if (tui.active) tui.setActivity(null);
+        if (fallback_visible and tui.active) tui.spinnerClear();
+        fallback_visible = false;
         return;
     };
     future = null;
     running.cancel(io_handle);
+    fallback_visible = false;
     if (tui.active) {
         tui.spinnerClear();
-        tui.setActivity(null);
     } else {
         write("\r\x1b[K");
     }

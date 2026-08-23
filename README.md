@@ -74,7 +74,7 @@ On a capable terminal, `xaq` opens a compact fullscreen view with a scrolling tr
 
 Type `@` to search project files, then use Up and Down to select one and Tab or Enter to insert its path. Tab also completes relative path tokens such as `src/ag`. The index is built on demand and stays in memory for the current prompt.
 
-Tool activity stays in the info bar while it runs. Completed calls enter the transcript as dim one-line summaries such as `Read src/main.zig`, `Edited src/tui.zig · 2 edits`, or `Ran zig build test · 3.1s`. Three or more consecutive reads and web lookups collapse into one `Explored…` line; failures and file-changing actions always remain visible. `/verbose on` adds a bounded result preview.
+Tool activity animates on the live transcript row while it runs. Completed calls enter the transcript as dim one-line summaries such as `Read src/main.zig`, `Edited src/tui.zig · 2 edits`, or `Ran zig build test · 3.1s`. Three or more consecutive reads and web lookups collapse into one `Explored…` line; failures and file-changing actions always remain visible. `/verbose on` adds a bounded result preview.
 
 Prefix a prompt with `!` to run a shell command directly. `!command` includes the command and output in model context; `!!command` runs it without adding either to context.
 

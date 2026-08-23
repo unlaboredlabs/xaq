@@ -7,7 +7,7 @@
 //!   row H-4      input box content:  │ > prompt text │
 //!   row H-3      input box bottom border
 //!   row H-2      gap above the info bar
-//!   row H-1      info bar: context %, tokens, activity, key hints
+//!   row H-1      info bar: context %, tokens, queues, key hints
 //!   row H        outer margin
 //!
 //! The transcript is the only place the agent writes: its output flows
@@ -20,9 +20,8 @@
 //!
 //! Activity comes from the spinner facade: in fullscreen its frames are
 //! routed through the live transcript row (`spinnerFrame`/`spinnerClear`)
-//! under the render mutex, and the label also shows statically in the
-//! info bar. `--plain`, pipes, one-shots, and small terminals keep the
-//! inline flow on the raw fd.
+//! under the render mutex. `--plain`, pipes, one-shots, and small terminals
+//! keep the inline flow on the raw fd.
 
 const std = @import("std");
 const Io = std.Io;
@@ -77,10 +76,6 @@ var branch_buffer: [128]u8 = undefined;
 var branch_len: usize = 0;
 var git_dirty = false;
 var state: State = .idle;
-var detail_buffer: [48]u8 = undefined;
-var detail_len: usize = 0;
-var activity_buffer: [48]u8 = undefined;
-var activity_len: usize = 0;
 var tokens_in: u64 = 0;
 var tokens_out: u64 = 0;
 var context_percent: u8 = 0;
@@ -192,7 +187,6 @@ pub fn exit() void {
     sink.writeAll("\x1b[?1006l\x1b[?1000l\x1b[?2004l\x1b[r\x1b[?1049l") catch {};
     sink.flush() catch {};
     resetTranscriptLocked();
-    activity_len = 0;
     agents_running = 0;
     agents_queued = 0;
     steering_queued = 0;
@@ -443,12 +437,11 @@ pub fn noteIdentity(provider: []const u8, model: []const u8, effort: ?[]const u8
     renderTopLocked();
 }
 
-pub fn noteState(next: State, detail: []const u8) void {
+pub fn noteState(next: State) void {
     if (!active) return;
     render_mutex.lockUncancelable(io_state);
     defer render_mutex.unlock(io_state);
     state = next;
-    detail_len = copyInto(&detail_buffer, detail);
     renderInfoLocked();
 }
 
@@ -477,16 +470,6 @@ pub fn noteQueue(steering: usize, follow_ups: usize) void {
     defer render_mutex.unlock(io_state);
     steering_queued = @intCast(@min(steering, std.math.maxInt(u8)));
     follow_ups_queued = @intCast(@min(follow_ups, std.math.maxInt(u8)));
-    renderInfoLocked();
-}
-
-/// Static activity label from the spinner facade (`thinking`,
-/// `compacting`, `retrying`, ...); null clears it.
-pub fn setActivity(label: ?[]const u8) void {
-    if (!active) return;
-    render_mutex.lockUncancelable(io_state);
-    defer render_mutex.unlock(io_state);
-    activity_len = if (label) |text| copyInto(&activity_buffer, text) else 0;
     renderInfoLocked();
 }
 
@@ -984,18 +967,8 @@ fn renderInfoTo(out: *Io.Writer) !void {
     }
     if (steering_queued > 0) writer.print(" \u{b7} steer {d}", .{steering_queued}) catch {};
     if (follow_ups_queued > 0) writer.print(" \u{b7} next {d}", .{follow_ups_queued}) catch {};
-    if (activity_len > 0) {
-        writer.print(" \u{b7} {s}\u{2026}", .{activity_buffer[0..activity_len]}) catch {};
-    } else switch (state) {
-        .idle => writer.writeAll(" \u{b7} ready") catch {},
-        .thinking => writer.writeAll(" \u{b7} thinking\u{2026}") catch {},
-        .tooling => if (detail_len > 0)
-            writer.print(" \u{b7} {s}\u{2026}", .{detail_buffer[0..detail_len]}) catch {}
-        else
-            writer.writeAll(" \u{b7} working\u{2026}") catch {},
-    }
     if (state == .idle) {
-        writer.writeAll(" \u{b7} wheel/pgup/pgdn history \u{b7} ctrl-d exits") catch {};
+        writer.writeAll(" \u{b7} ready \u{b7} wheel/pgup/pgdn history \u{b7} ctrl-d exits") catch {};
     } else {
         writer.writeAll(" \u{b7} enter steers \u{b7} alt-enter next \u{b7} ctrl-c stops") catch {};
     }
@@ -1472,25 +1445,23 @@ fn commit(track_rows: bool) isize {
     return @as(isize, @intCast(stored_rows + 1)) - @as(isize, @intCast(previous_rows));
 }
 
-test "info bar text shows usage, activity, and hints" {
+test "info bar text shows usage and hints without live activity" {
     var output: Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
     tokens_in = 12_345;
     tokens_out = 678;
     context_percent = 42;
     state = .tooling;
-    detail_len = copyInto(&detail_buffer, "Running zig build test");
-    activity_len = 0;
     rows = 24;
     cols = 120;
     try renderInfoTo(&output.writer);
     const text = output.written();
     try std.testing.expect(std.mem.find(u8, text, "ctx 42%") != null);
     try std.testing.expect(std.mem.find(u8, text, "12.3k") != null);
-    try std.testing.expect(std.mem.find(u8, text, "Running zig build test…") != null);
-    try std.testing.expect(std.mem.find(u8, text, "[Running zig build test]") == null);
+    try std.testing.expect(std.mem.find(u8, text, "enter steers") != null);
+    try std.testing.expect(std.mem.find(u8, text, "thinking") == null);
+    try std.testing.expect(std.mem.find(u8, text, "working") == null);
     state = .idle;
-    detail_len = 0;
 }
 
 test "top bar aligns git identity and collapses on narrow terminals" {
