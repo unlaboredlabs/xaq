@@ -894,7 +894,7 @@ test "subagent schemas are parent-only and write tools can be omitted" {
     try std.testing.expect(std.mem.indexOf(u8, parent.written(), "subagent_type") == null);
     try std.testing.expect(std.mem.indexOf(u8, parent.written(), "provider=claude and cannot switch providers") != null);
     try std.testing.expect(std.mem.indexOf(u8, parent.written(), "At most 2 workers run at once") != null);
-    try std.testing.expect(std.mem.indexOf(u8, parent.written(), "\"enum\":[\"claude-opus-5\",\"claude-sonnet-5\",\"claude-fable-5\",\"claude-haiku-4-5\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, parent.written(), "\"enum\":[\"claude-opus-5\",\"claude-sonnet-5\",\"claude-fable-5-1\",\"claude-fable-5\",\"claude-haiku-4-5\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, parent.written(), "gpt-5.6-sol") == null);
     try std.testing.expect(std.mem.indexOf(u8, parent.written(), "\"enum\":[\"workspace_write\"]") != null);
 
