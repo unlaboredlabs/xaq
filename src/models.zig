@@ -41,6 +41,7 @@ pub const profiles = [_]Profile{
     .{ .provider = .chatgpt, .id = "gpt-5.3-codex-spark", .context_tokens = 128_000, .efforts = &standard_efforts },
     .{ .provider = .claude, .id = "claude-opus-5", .context_tokens = 1_000_000, .efforts = &full_efforts, .fast = true },
     .{ .provider = .claude, .id = "claude-sonnet-5", .context_tokens = 1_000_000, .efforts = &full_efforts },
+    .{ .provider = .claude, .id = "claude-fable-5-1", .context_tokens = 1_000_000, .efforts = &full_efforts },
     .{ .provider = .claude, .id = "claude-fable-5", .context_tokens = 1_000_000, .efforts = &full_efforts },
     .{ .provider = .claude, .id = "claude-haiku-4-5", .context_tokens = 200_000, .efforts = &no_efforts },
     .{ .provider = .grok, .id = "grok-4.6", .context_tokens = 500_000, .efforts = &standard_efforts },
@@ -58,6 +59,7 @@ const chatgpt_choices = [_][]const u8{
 const claude_choices = [_][]const u8{
     "claude-opus-5",
     "claude-sonnet-5",
+    "claude-fable-5-1",
     "claude-fable-5",
     "claude-haiku-4-5",
 };
@@ -136,11 +138,13 @@ test "catalog model IDs resolve their provider" {
 test "subscription profiles preserve product-specific context windows" {
     try std.testing.expectEqual(@as(u32, 272_000), contextWindow(.chatgpt, "gpt-5.6-sol"));
     try std.testing.expectEqual(@as(u32, 1_000_000), contextWindow(.claude, "claude-opus-5"));
+    try std.testing.expectEqual(@as(u32, 1_000_000), contextWindow(.claude, "claude-fable-5-1"));
     try std.testing.expectEqual(@as(u32, 200_000), contextWindow(.claude, "claude-haiku-4-5"));
     try std.testing.expectEqual(@as(u32, 500_000), contextWindow(.grok, "grok-4.6"));
     try std.testing.expect(!supportsEffort(.claude, "claude-haiku-4-5", .low));
     try std.testing.expect(!supportsEffort(.grok, "grok-4.6", .max));
     try std.testing.expect(supportsEffort(.chatgpt, "gpt-5.6-sol", .max));
+    try std.testing.expect(supportsEffort(.claude, "claude-fable-5-1", .max));
     try std.testing.expect(supportsFast(.chatgpt, "gpt-5.6-sol"));
     try std.testing.expect(supportsFast(.chatgpt, "gpt-5.4"));
     try std.testing.expect(!supportsFast(.chatgpt, "gpt-5.4-mini"));
@@ -148,5 +152,6 @@ test "subscription profiles preserve product-specific context windows" {
     try std.testing.expect(supportsFast(.claude, "claude-opus-5-20260801"));
     try std.testing.expect(supportsFast(.claude, "claude-opus-4-8"));
     try std.testing.expect(!supportsFast(.claude, "claude-sonnet-5"));
+    try std.testing.expect(!supportsFast(.claude, "claude-fable-5-1"));
     try std.testing.expect(!supportsFast(.grok, "grok-4.6"));
 }
