@@ -140,9 +140,47 @@ const Session = struct {
     subagent_control: ?[]const u8 = null,
     subagent_control_offset: u64 = 0,
     subagent_status: ?[]const u8 = null,
+    /// Set after the first fast request a provider served at standard
+    /// speed, so the notice prints once instead of after every round.
+    fast_downgrade_noted: bool = false,
+    /// Slash completions for the current provider and model. Commands
+    /// whose feature the model lacks (/fast) stay out of the popup and
+    /// /help; typing them still resolves so the user gets a reason.
+    suggestion_buf: [command_specs.len]input_mod.Suggestion = undefined,
+    suggestion_len: usize = 0,
+    /// The busy-time editor reads the same list; it is only ever updated
+    /// between rounds, while that editor is stopped.
+    busy: ?*input_mod.BusyInput = null,
 
     fn allocator(self: *Session) std.mem.Allocator {
         return self.arena.allocator();
+    }
+
+    fn commandAvailable(self: *const Session, command: Command) bool {
+        return switch (command) {
+            .fast => models.supportsFast(self.provider, self.model),
+            else => true,
+        };
+    }
+
+    fn suggestions(self: *const Session) []const input_mod.Suggestion {
+        return self.suggestion_buf[0..self.suggestion_len];
+    }
+
+    fn refreshSuggestions(self: *Session) void {
+        var len: usize = 0;
+        for (command_specs) |spec| {
+            if (!self.commandAvailable(spec.command)) continue;
+            self.suggestion_buf[len] = .{
+                .name = spec.name,
+                .alias = spec.alias,
+                .args = spec.args,
+                .help = spec.help,
+            };
+            len += 1;
+        }
+        self.suggestion_len = len;
+        if (self.busy) |queue| queue.setSuggestions(self.suggestions());
     }
 
     fn emit(self: *Session, event: Event) !void {
@@ -173,6 +211,7 @@ const Session = struct {
             self.fast = false;
             if (self.thread) |*thread| try thread.appendFast(false);
         }
+        self.refreshSuggestions();
     }
 
     fn setEffort(self: *Session, value: ?Effort) !void {
@@ -340,6 +379,7 @@ const Session = struct {
         if (self.effort) |effort| {
             if (!models.supportsEffort(self.provider, self.model, effort)) self.effort = null;
         }
+        self.refreshSuggestions();
         self.recount();
         if (self.entries.items.len > 0) switch (self.entries.items[self.entries.items.len - 1]) {
             .assistant => |answer| if (answer.calls.len > 0) {
@@ -391,6 +431,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
     };
     settings_owned = false;
     defer session.deinit();
+    session.refreshSuggestions();
     var signal_scope = cancel.Scope.install();
     defer signal_scope.deinit();
 
@@ -434,13 +475,15 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
 
     var busy_storage: input_mod.BusyInput = undefined;
     const busy: ?*input_mod.BusyInput = if (options.input != null and tui.active) blk: {
-        busy_storage = input_mod.BusyInput.init(gpa, io, options.input.?, options.output, &slash_suggestions, .{
+        busy_storage = input_mod.BusyInput.init(gpa, io, options.input.?, options.output, session.suggestions(), .{
             .io = io,
             .cwd = session.cwd,
         });
         break :blk &busy_storage;
     } else null;
     defer if (busy) |queue| queue.deinit();
+    session.busy = busy;
+    defer session.busy = null;
     if (busy) |queue| try queue.start();
 
     var exchange_start = Io.Clock.now(.awake, io);
@@ -902,7 +945,7 @@ fn readPrompt(session: *Session, reader: *Io.Reader, prefill: ?[]const u8, carri
     try setTitle(session, false);
     var initial = prefill;
     while (true) {
-        const line = (try input_mod.readLine(session.gpa, reader, session.output, &slash_suggestions, .{ .io = session.io, .cwd = session.cwd }, initial)) orelse return null;
+        const line = (try input_mod.readLine(session.gpa, reader, session.output, session.suggestions(), .{ .io = session.io, .cwd = session.cwd }, initial)) orelse return null;
         initial = null;
         if (line.len == 0) {
             session.gpa.free(line);
@@ -1036,19 +1079,27 @@ const command_specs = [_]CommandSpec{
     .{ .command = .exit, .name = "exit", .alias = "quit", .help = "leave xaq" },
 };
 
-const slash_suggestions = blk: {
-    var out: [command_specs.len]input_mod.Suggestion = undefined;
-    for (command_specs, 0..) |spec, i| out[i] = .{
-        .name = spec.name,
-        .alias = spec.alias,
-        .args = spec.args,
-        .help = spec.help,
-    };
-    break :blk out;
-};
-
 fn modelChoices(provider: auth.Provider) []const []const u8 {
     return models.choices(provider);
+}
+
+/// Names the current provider's fast-capable models so the user can
+/// switch instead of guessing; providers without a fast tier say so.
+fn printFastUnavailable(session: *Session) !void {
+    const output = session.output;
+    try output.print("fast mode is not available for {s}", .{session.model});
+    var listed: usize = 0;
+    for (models.choices(session.provider)) |id| {
+        if (!models.supportsFast(session.provider, id)) continue;
+        try output.writeAll(if (listed == 0) " (try " else ", ");
+        try output.writeAll(id);
+        listed += 1;
+    }
+    if (listed > 0) {
+        try output.writeAll(")\n");
+    } else {
+        try output.print(" (no {s} model offers it)\n", .{@tagName(session.provider)});
+    }
 }
 
 /// Exact name or alias first, then unique prefix (`/mod` resolves to /model).
@@ -1096,6 +1147,7 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
     switch (command) {
         .help => {
             for (command_specs) |spec| {
+                if (!session.commandAvailable(spec.command)) continue;
                 try output.print("  {s}/{s}{s}{s}", .{ term.bold(), spec.name, spec.args, term.reset() });
                 var column = 1 + spec.name.len + spec.args.len;
                 while (column < input_mod.help_column) : (column += 1) try output.writeByte(' ');
@@ -1175,7 +1227,11 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
             else if (std.mem.eql(u8, args, "off"))
                 false
             else if (std.mem.eql(u8, args, "status")) {
-                try output.print("fast mode {s}\n", .{if (session.fast) "on" else "off"});
+                if (models.supportsFast(session.provider, session.model)) {
+                    try output.print("fast mode {s}\n", .{if (session.fast) "on" else "off"});
+                } else {
+                    try printFastUnavailable(session);
+                }
                 try output.flush();
                 return true;
             } else {
@@ -1184,7 +1240,7 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
                 return true;
             };
             if (enabled and !models.supportsFast(session.provider, session.model)) {
-                try output.print("fast mode is not available for {s}\n", .{session.model});
+                try printFastUnavailable(session);
                 try output.flush();
                 return true;
             }
@@ -1253,9 +1309,10 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
         },
         .status => {
             const context_tokens = models.contextWindow(session.provider, session.model);
+            const fast_state = if (!models.supportsFast(session.provider, session.model)) "unavailable" else if (session.fast) "on" else "off";
             try output.print(
                 "  thread    {s}\n  provider  {s}\n  model     {s}\n  effort    {s}\n  fast      {s}\n  web       {s}\n  cwd       {s}\n  turns     {d}\n  context   ~{d} / {d} tokens\n",
-                .{ if (session.thread) |thread| thread.id else "ephemeral", @tagName(session.provider), session.model, if (session.effort) |value| @tagName(value) else "provider-default", if (session.fast) "on" else "off", if (session.settings.value.firecrawl_api_key != null) "Firecrawl" else "off", session.cwd, session.turn, estimatedContextTokens(session), context_tokens },
+                .{ if (session.thread) |thread| thread.id else "ephemeral", @tagName(session.provider), session.model, if (session.effort) |value| @tagName(value) else "provider-default", fast_state, if (session.settings.value.firecrawl_api_key != null) "Firecrawl" else "off", session.cwd, session.turn, estimatedContextTokens(session), context_tokens },
             );
             try output.writeAll("  tokens    ");
             try writeTokens(output, session.usage.input);
@@ -2773,7 +2830,7 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
         decoder.stop_spinner = !compacting;
         try output.flush();
         spin.start(session.io, if (compacting) "compacting" else "thinking");
-        const response = requestStream(session.gpa, session.io, session.provider, credential, body, &decoder, fast) catch |err| {
+        const response = requestStream(session.gpa, session.io, session.provider, credential, model, body, &decoder, fast) catch |err| {
             spin.stop();
             const partial = interruptedRound(&decoder, compacting, err) catch |terminal| {
                 // Close any active markdown style before control returns to
@@ -2803,13 +2860,15 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
         };
         spin.stop();
         defer session.gpa.free(response.body);
-        log.logf("agent", "event=response kind={s} turn={d} status={d} attempt={d}", .{ kind, session.turn, response.status, attempt + 1 });
+        log.logf("agent", "event=response kind={s} turn={d} status={d} attempt={d} speed={s}", .{ kind, session.turn, response.status, attempt + 1, @tagName(decoder.core.speed) });
         if (response.status >= 200 and response.status < 300) {
             if (decoder.core.providerError()) |message| {
                 try reportProviderStreamError(session, message);
                 return error.ProviderRequestFailed;
             }
-            return finishRound(&decoder, .completed);
+            const result = try finishRound(&decoder, .completed);
+            try noteServedSpeed(session, fast, decoder.core.speed);
+            return result;
         }
         if (response.status == 401 and !refreshed) {
             var refresh_arena: std.heap.ArenaAllocator = .init(session.gpa);
@@ -2859,6 +2918,21 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
     return error.ProviderRequestFailed;
 }
 
+/// Both providers can serve a fast request at standard speed instead of
+/// rejecting it (ChatGPT downgrades the tier; Anthropic reports
+/// `usage.speed`). Fast mode is billed at a premium, so say so once per
+/// session rather than letting the user assume they are getting it. The
+/// note goes to the transcript even for compaction, whose round output
+/// is a sink.
+fn noteServedSpeed(session: *Session, fast: bool, served: stream_decoder.ServedSpeed) !void {
+    if (!fast or served != .standard) return;
+    log.logf("agent", "event=fast_downgraded provider={s} model={s}", .{ @tagName(session.provider), session.model });
+    if (session.fast_downgrade_noted or !session.interactive) return;
+    session.fast_downgrade_noted = true;
+    try session.output.print("\n{s}fast mode requested but {s} served this response at standard speed{s}\n", .{ term.dim(), session.provider.label(), term.reset() });
+    try session.output.flush();
+}
+
 fn finishRound(decoder: *Decoder, stop_reason: StopReason) !RoundResult {
     return .{
         .answer = try decoder.finish(),
@@ -2884,9 +2958,11 @@ fn retryableStatus(status: u16) bool {
     return status == 408 or status == 409 or status == 425 or status == 429 or status == 500 or status == 502 or status == 503 or status == 504;
 }
 
-fn requestStream(gpa: std.mem.Allocator, io: Io, provider: auth.Provider, credential: auth.Credential, body: []const u8, decoder: *Decoder, fast: bool) !transport.Response {
+fn requestStream(gpa: std.mem.Allocator, io: Io, provider: auth.Provider, credential: auth.Credential, model: []const u8, body: []const u8, decoder: *Decoder, fast: bool) !transport.Response {
     const authorization = try std.fmt.allocPrint(gpa, "Bearer {s}", .{credential.access});
     defer gpa.free(authorization);
+    const routing_hint = try request.chatgptRoutingHint(gpa, model, fast);
+    defer gpa.free(routing_hint);
     return switch (provider) {
         .chatgpt => transport.postStream(gpa, io, "https://chatgpt.com/backend-api/codex/responses", "application/json", &.{
             .{ .name = "Authorization", .value = authorization },
@@ -2894,12 +2970,13 @@ fn requestStream(gpa: std.mem.Allocator, io: Io, provider: auth.Provider, creden
             .{ .name = "originator", .value = "xaq" },
             .{ .name = "Accept", .value = "text/event-stream" },
             .{ .name = "OpenAI-Beta", .value = "responses=experimental" },
+            .{ .name = "x-codex-routing-hint", .value = routing_hint },
             .{ .name = "User-Agent", .value = "xaq/0.1" },
         }, body, decoder, decodeLine),
         .claude => transport.postStream(gpa, io, "https://api.anthropic.com/v1/messages", "application/json", &.{
             .{ .name = "Authorization", .value = authorization },
             .{ .name = "anthropic-version", .value = "2023-06-01" },
-            .{ .name = "anthropic-beta", .value = claudeBetaHeader(fast) },
+            .{ .name = "anthropic-beta", .value = request.claudeBetaHeader(fast) },
             .{ .name = "anthropic-dangerous-direct-browser-access", .value = "true" },
             .{ .name = "User-Agent", .value = "claude-cli/2.1.75" },
             .{ .name = "x-app", .value = "cli" },
@@ -2910,13 +2987,6 @@ fn requestStream(gpa: std.mem.Allocator, io: Io, provider: auth.Provider, creden
             .{ .name = "User-Agent", .value = "xaq/0.1" },
         }, body, decoder, decodeLine),
     };
-}
-
-fn claudeBetaHeader(fast: bool) []const u8 {
-    return if (fast)
-        "claude-code-20250219,oauth-2025-04-20,fast-mode-2026-02-01"
-    else
-        "claude-code-20250219,oauth-2025-04-20";
 }
 
 fn decodeLine(context_ptr: ?*anyopaque, line: []const u8) !void {
@@ -3008,6 +3078,47 @@ test "slash command lookup matches names, aliases, and unique prefixes" {
     try std.testing.expectEqual(Command.exit, (try findCommand("q")).?);
     try std.testing.expectEqual(null, try findCommand("bogus"));
     try std.testing.expectEqual(null, try findCommand(""));
+}
+
+test "slash suggestions hide /fast unless the model supports it" {
+    // Only the fields refreshSuggestions reads are meaningful here.
+    var session: Session = .{
+        .gpa = std.testing.allocator,
+        .io = undefined,
+        .home = "",
+        .cwd = "",
+        .provider = .claude,
+        .model = @constCast("claude-sonnet-5"),
+        .effort = null,
+        .fast = false,
+        .output = undefined,
+        .trace = undefined,
+        .arena = undefined,
+        .instructions = @constCast(""),
+        .settings = undefined,
+    };
+    session.refreshSuggestions();
+    try std.testing.expectEqual(command_specs.len - 1, session.suggestions().len);
+    for (session.suggestions()) |suggestion| try std.testing.expect(!std.mem.eql(u8, suggestion.name, "fast"));
+    // Typing the hidden command still resolves, so it can explain itself.
+    try std.testing.expectEqual(Command.fast, (try findCommand("fast")).?);
+
+    session.provider = .chatgpt;
+    session.model = @constCast("gpt-5.6-sol");
+    session.refreshSuggestions();
+    try std.testing.expectEqual(command_specs.len, session.suggestions().len);
+    var seen_fast = false;
+    for (session.suggestions()) |suggestion| seen_fast = seen_fast or std.mem.eql(u8, suggestion.name, "fast");
+    try std.testing.expect(seen_fast);
+
+    session.model = @constCast("gpt-5.4-mini");
+    session.refreshSuggestions();
+    try std.testing.expectEqual(command_specs.len - 1, session.suggestions().len);
+
+    session.provider = .grok;
+    session.model = @constCast("grok-4.6");
+    session.refreshSuggestions();
+    try std.testing.expectEqual(command_specs.len - 1, session.suggestions().len);
 }
 
 test "rewind index removes whole recent user exchanges" {
@@ -3237,8 +3348,8 @@ test "fast mode uses each provider's request contract" {
     defer std.testing.allocator.free(anthropic);
     try std.testing.expect(std.mem.indexOf(u8, anthropic, "\"speed\":\"fast\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, anthropic, "\"service_tier\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, claudeBetaHeader(true), "fast-mode-2026-02-01") != null);
-    try std.testing.expect(std.mem.indexOf(u8, claudeBetaHeader(false), "fast-mode-2026-02-01") == null);
+    try std.testing.expect(std.mem.indexOf(u8, request.claudeBetaHeader(true), "fast-mode-2026-02-01") != null);
+    try std.testing.expect(std.mem.indexOf(u8, request.claudeBetaHeader(false), "fast-mode-2026-02-01") == null);
 
     const standard = try buildRequest(std.testing.allocator, .chatgpt, "gpt-5.6-sol", null, false, .{}, "/work", "", &.{});
     defer std.testing.allocator.free(standard);

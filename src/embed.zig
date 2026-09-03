@@ -518,6 +518,7 @@ pub const Agent = struct {
 
     fn send(self: *Agent, arena: std.mem.Allocator, credential: Credential, body: []const u8, decoder: *stream.Decoder) !Response {
         const authorization = try std.fmt.allocPrint(arena, "Bearer {s}", .{credential.access});
+        const routing_hint = try request_builder.chatgptRoutingHint(arena, self.model, self.fast);
         const common = self.transport;
         return switch (self.provider) {
             .chatgpt => common.post_stream(common.context, arena, self.io, .{
@@ -530,6 +531,7 @@ pub const Agent = struct {
                     .{ .name = "originator", .value = "xaq" },
                     .{ .name = "Accept", .value = "text/event-stream" },
                     .{ .name = "OpenAI-Beta", .value = "responses=experimental" },
+                    .{ .name = "x-codex-routing-hint", .value = routing_hint },
                     .{ .name = "User-Agent", .value = "xaq/0.1" },
                 },
                 .body = body,
@@ -542,7 +544,7 @@ pub const Agent = struct {
                 .headers = &.{
                     .{ .name = "Authorization", .value = authorization },
                     .{ .name = "anthropic-version", .value = "2023-06-01" },
-                    .{ .name = "anthropic-beta", .value = if (self.fast) "claude-code-20250219,oauth-2025-04-20,fast-mode-2026-02-01" else "claude-code-20250219,oauth-2025-04-20" },
+                    .{ .name = "anthropic-beta", .value = request_builder.claudeBetaHeader(self.fast) },
                     .{ .name = "anthropic-dangerous-direct-browser-access", .value = "true" },
                     .{ .name = "User-Agent", .value = "claude-cli/2.1.75" },
                     .{ .name = "x-app", .value = "cli" },

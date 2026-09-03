@@ -2047,6 +2047,13 @@ pub const BusyInput = struct {
         tui.noteQueue(0, 0);
     }
 
+    /// The editor task reads the list without locking, so the list may
+    /// only change while it is stopped.
+    pub fn setSuggestions(self: *BusyInput, suggestions: []const Suggestion) void {
+        std.debug.assert(self.future == null);
+        self.suggestions = suggestions;
+    }
+
     pub fn start(self: *BusyInput) !void {
         if (self.future != null or self.eof_flag.load(.acquire)) return;
         self.stop_flag.store(false, .release);
