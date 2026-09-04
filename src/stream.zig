@@ -12,6 +12,11 @@ pub const Hooks = struct {
     on_delta: ?*const fn (context: ?*anyopaque, delta: []const u8) anyerror!void = null,
 };
 
+/// The speed a provider reports having served, independent of what the
+/// request asked for. Anthropic echoes `usage.speed`; the Responses API
+/// echoes the applied `service_tier`. Either may be absent.
+pub const ServedSpeed = enum { unknown, standard, fast };
+
 const StreamingClaudeCall = struct {
     index: i64,
     id: []const u8,
@@ -29,6 +34,7 @@ pub const Decoder = struct {
     raw: std.ArrayList([]const u8) = .empty,
     claude_calls: std.ArrayList(StreamingClaudeCall) = .empty,
     usage: types.Usage = .{},
+    speed: ServedSpeed = .unknown,
     received: bool = false,
     provider_error: ?[]const u8 = null,
 
@@ -106,7 +112,13 @@ pub const Decoder = struct {
                 });
             };
         } else if (std.mem.eql(u8, kind, "response.completed")) {
-            const usage_value = eventObject(eventObject(value, "response") orelse return, "usage") orelse return;
+            const response = eventObject(value, "response") orelse return;
+            // Every tier other than priority is standard processing; the
+            // backend may downgrade silently rather than reject the request.
+            if (eventString(response, "service_tier")) |tier| {
+                self.speed = if (std.mem.eql(u8, tier, "priority")) .fast else .standard;
+            }
+            const usage_value = eventObject(response, "usage") orelse return;
             if (eventInteger(usage_value, "input_tokens")) |number| self.usage.input = number;
             if (eventInteger(usage_value, "output_tokens")) |number| self.usage.output = number;
             if (eventObject(usage_value, "input_tokens_details")) |details| {
@@ -154,12 +166,25 @@ pub const Decoder = struct {
             const usage_value = eventObject(eventObject(value, "message") orelse return, "usage") orelse return;
             if (eventInteger(usage_value, "input_tokens")) |number| self.usage.input = number;
             if (eventInteger(usage_value, "cache_read_input_tokens")) |number| self.usage.cached = number;
+            self.noteClaudeSpeed(usage_value);
         } else if (std.mem.eql(u8, kind, "message_delta")) {
             const usage_value = eventObject(value, "usage") orelse return;
             if (eventInteger(usage_value, "input_tokens")) |number| self.usage.input = number;
             if (eventInteger(usage_value, "output_tokens")) |number| self.usage.output = number;
+            self.noteClaudeSpeed(usage_value);
         } else if (std.mem.eql(u8, kind, "error")) {
             try self.captureProviderError(data);
+        }
+    }
+
+    /// Anthropic reports `usage.speed` as "fast" or "standard" on models
+    /// that know the field; older models omit it and stay unknown.
+    fn noteClaudeSpeed(self: *Decoder, usage_value: std.json.Value) void {
+        const speed = eventString(usage_value, "speed") orelse return;
+        if (std.mem.eql(u8, speed, "fast")) {
+            self.speed = .fast;
+        } else if (std.mem.eql(u8, speed, "standard")) {
+            self.speed = .standard;
         }
     }
 
@@ -227,6 +252,38 @@ test "decodes Responses text, calls, and usage" {
     try std.testing.expectEqual(@as(u64, 10), result.usage.input);
     try std.testing.expectEqual(@as(u64, 3), result.usage.cached);
     try std.testing.expectEqual(@as(u64, 5), result.usage.output);
+}
+
+test "reports the speed each provider actually served" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var responses_fast = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), .{});
+    defer responses_fast.deinit();
+    try responses_fast.feed("data: {\"type\":\"response.completed\",\"response\":{\"service_tier\":\"priority\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}");
+    try std.testing.expectEqual(ServedSpeed.fast, responses_fast.speed);
+
+    var responses_downgraded = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), .{});
+    defer responses_downgraded.deinit();
+    try responses_downgraded.feed("data: {\"type\":\"response.completed\",\"response\":{\"service_tier\":\"default\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}");
+    try std.testing.expectEqual(ServedSpeed.standard, responses_downgraded.speed);
+
+    var responses_silent = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), .{});
+    defer responses_silent.deinit();
+    try responses_silent.feed("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}");
+    try std.testing.expectEqual(ServedSpeed.unknown, responses_silent.speed);
+
+    var claude_fast = Decoder.init(.claude, std.testing.allocator, arena.allocator(), .{});
+    defer claude_fast.deinit();
+    try claude_fast.feed("data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"speed\":\"fast\"}}}");
+    try std.testing.expectEqual(ServedSpeed.fast, claude_fast.speed);
+
+    var claude_standard = Decoder.init(.claude, std.testing.allocator, arena.allocator(), .{});
+    defer claude_standard.deinit();
+    try claude_standard.feed("data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}");
+    try std.testing.expectEqual(ServedSpeed.unknown, claude_standard.speed);
+    try claude_standard.feed("data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":2,\"speed\":\"standard\"}}");
+    try std.testing.expectEqual(ServedSpeed.standard, claude_standard.speed);
 }
 
 test "decodes Anthropic fragmented tool input" {

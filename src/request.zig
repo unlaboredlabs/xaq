@@ -5,7 +5,30 @@ const models = @import("models.zig");
 const tools = @import("tools.zig");
 const types = @import("types.zig");
 
+/// The providers spell fast mode differently. ChatGPT takes the Responses
+/// `service_tier` field, and Codex's "fast" tier is the wire value
+/// "priority" (sending "fast" is rejected). Anthropic takes a top-level
+/// `speed: "fast"` field that only works with the beta header below.
 const chatgpt_fast_service_tier = "priority";
+
+/// Anthropic ignores `speed` unless the fast-mode beta is requested.
+pub fn claudeBetaHeader(fast: bool) []const u8 {
+    return if (fast)
+        "claude-code-20250219,oauth-2025-04-20,fast-mode-2026-02-01"
+    else
+        "claude-code-20250219,oauth-2025-04-20";
+}
+
+/// Codex sends `x-codex-routing-hint` on every ChatGPT-backend request
+/// (rounds and compaction alike) so the backend can route to the tier
+/// before parsing the body. The tier is the same wire value as the body's
+/// `service_tier`; standard requests carry only the model.
+pub fn chatgptRoutingHint(gpa: std.mem.Allocator, model: []const u8, fast: bool) ![]u8 {
+    return if (fast)
+        std.fmt.allocPrint(gpa, "model={s};tier={s}", .{ model, chatgpt_fast_service_tier })
+    else
+        std.fmt.allocPrint(gpa, "model={s}", .{model});
+}
 
 pub fn build(gpa: std.mem.Allocator, provider: auth.Provider, model: []const u8, effort: ?models.Effort, fast: bool, tool_options: tools.SchemaOptions, cwd: []const u8, instructions: []const u8, entries: []const types.Entry) ![]u8 {
     const write_instructions = if (!tool_options.include_builtin)
@@ -438,4 +461,17 @@ test "images use each provider's multimodal content blocks" {
     const claude = try build(std.testing.allocator, .claude, "claude-opus-5", null, false, .{ .include_builtin = false }, "/work", "", entries);
     defer std.testing.allocator.free(claude);
     try std.testing.expect(std.mem.indexOf(u8, claude, "\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"aGVsbG8=\"}") != null);
+}
+
+test "fast mode headers follow each provider's contract" {
+    try std.testing.expectEqualStrings("claude-code-20250219,oauth-2025-04-20,fast-mode-2026-02-01", claudeBetaHeader(true));
+    try std.testing.expectEqualStrings("claude-code-20250219,oauth-2025-04-20", claudeBetaHeader(false));
+
+    const fast_hint = try chatgptRoutingHint(std.testing.allocator, "gpt-5.6-sol", true);
+    defer std.testing.allocator.free(fast_hint);
+    try std.testing.expectEqualStrings("model=gpt-5.6-sol;tier=priority", fast_hint);
+
+    const standard_hint = try chatgptRoutingHint(std.testing.allocator, "gpt-5.4-mini", false);
+    defer std.testing.allocator.free(standard_hint);
+    try std.testing.expectEqualStrings("model=gpt-5.4-mini", standard_hint);
 }
