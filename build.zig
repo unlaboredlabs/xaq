@@ -27,6 +27,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addOptions("build_options", build_options);
+    disableRelro(exe);
     b.installArtifact(exe);
 
     const run = b.addRunArtifact(exe);
@@ -64,6 +65,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     perf_target.root_module.addOptions("build_options", build_options);
+    disableRelro(perf_target);
     const perf_runner = b.addExecutable(.{
         .name = "xaq-perf",
         .root_module = b.createModule(.{
@@ -89,4 +91,13 @@ pub fn build(b: *std.Build) void {
 
     const fmt = b.addFmt(.{ .paths = &.{ "build.zig", "src", "tools" } });
     b.step("fmt", "Format source in place").dependOn(&fmt.step);
+}
+
+// The static Linux executable has an empty .got, so LLD's default RELRO
+// segment is nothing but .relro_padding: a PT_LOAD with p_filesz == 0 at an
+// unaligned address. Rosetta's Linux ELF loader rejects that layout with
+// "rosetta error: bss_size overflow", which kills xaq inside amd64 containers
+// on Apple Silicon. RELRO protects nothing here, so drop the segment.
+fn disableRelro(compile: *std.Build.Step.Compile) void {
+    if (compile.rootModuleTarget().os.tag == .linux) compile.link_z_relro = false;
 }
