@@ -3287,7 +3287,7 @@ test "failed new thread and compaction preserve the current conversation" {
     session.thread.?.gpa = std.testing.failing_allocator;
     const compacted = compactIfNeeded(&session, true);
     session.thread.?.gpa = std.testing.allocator;
-    try std.testing.expectError(error.WriteFailed, compacted);
+    try std.testing.expectError(error.OutOfMemory, compacted);
     try std.testing.expectEqual(@as(usize, 2), session.entries.items.len);
     try std.testing.expectEqualStrings("goal", session.entries.items[0].user.text);
     try std.testing.expectEqualStrings("x" ** 128, session.entries.items[1].assistant.text);
