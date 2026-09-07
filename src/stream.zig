@@ -216,7 +216,7 @@ pub const Decoder = struct {
                 .arguments = if (call.args.written().len == 0)
                     try self.persist.dupe(u8, "{}")
                 else
-                    try self.persist.dupe(u8, call.args.written()),
+                    try call.args.toOwnedSlice(),
             });
         }
         return .{
@@ -317,6 +317,57 @@ test "decodes Anthropic fragmented tool input" {
     const result = try decoder.finish();
     try std.testing.expectEqualStrings("ok", result.text);
     try std.testing.expectEqualStrings("{\"command\":\"pwd\"}", result.calls[0].arguments);
+}
+
+test "finishing Anthropic calls does not duplicate large argument buffers" {
+    const Feed = struct {
+        fn delta(decoder: *Decoder, index: u8, partial: []const u8) !void {
+            var event: Io.Writer.Allocating = .init(std.testing.allocator);
+            defer event.deinit();
+            try event.writer.writeAll("data: ");
+            try std.json.Stringify.value(.{
+                .type = "content_block_delta",
+                .index = index,
+                .delta = .{ .type = "input_json_delta", .partial_json = partial },
+            }, .{}, &event.writer);
+            try decoder.feed(event.written());
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var counted: std.testing.FailingAllocator = .init(arena.allocator(), .{});
+    var decoder = Decoder.init(.claude, std.testing.allocator, counted.allocator(), .{});
+    defer decoder.deinit();
+    try decoder.feed("data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"write\",\"input\":{}}}");
+    try decoder.feed("data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_2\",\"name\":\"edit\",\"input\":{}}}");
+    try decoder.feed("data: {\"type\":\"content_block_start\",\"index\":3,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_3\",\"name\":\"bash\",\"input\":{}}}");
+    const chunk = try std.testing.allocator.alloc(u8, 64 * 1024);
+    defer std.testing.allocator.free(chunk);
+    @memset(chunk, 'x');
+    const prefix = "{\"text\":\"";
+    const suffix = "\"}";
+    for ([_]u8{ 1, 2 }) |index| try Feed.delta(&decoder, index, prefix);
+    for (0..4) |_| {
+        for ([_]u8{ 1, 2 }) |index| try Feed.delta(&decoder, index, chunk);
+    }
+    for ([_]u8{ 1, 2 }) |index| try Feed.delta(&decoder, index, suffix);
+    try decoder.feed("data: {\"type\":\"message_stop\"}");
+
+    const allocated_before_finish = counted.allocated_bytes;
+    const result = try decoder.finish();
+    // Finalization needs only call metadata and the empty-input default,
+    // regardless of how much source text the tool arguments contain.
+    try std.testing.expect(counted.allocated_bytes - allocated_before_finish < chunk.len);
+    try std.testing.expectEqual(@as(usize, 3), result.calls.len);
+    try std.testing.expectEqualStrings("write", result.calls[0].name);
+    try std.testing.expectEqualStrings("edit", result.calls[1].name);
+    for (result.calls[0..2]) |call| {
+        try std.testing.expectEqual(prefix.len + 4 * chunk.len + suffix.len, call.arguments.len);
+        try std.testing.expectEqualStrings(prefix, call.arguments[0..prefix.len]);
+        for (0..4) |i| try std.testing.expectEqualSlices(u8, chunk, call.arguments[prefix.len + i * chunk.len ..][0..chunk.len]);
+        try std.testing.expectEqualStrings(suffix, call.arguments[call.arguments.len - suffix.len ..]);
+    }
+    try std.testing.expectEqualStrings("{}", result.calls[2].arguments);
 }
 
 test "preserves Anthropic streaming errors" {
