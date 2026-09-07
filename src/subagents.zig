@@ -937,8 +937,13 @@ pub fn atomicWrite(gpa: std.mem.Allocator, io: Io, path: []const u8, bytes: []co
     const hex = std.fmt.bytesToHex(random, .lower);
     const temporary = try std.fmt.allocPrint(gpa, "{s}.tmp-{s}", .{ path, &hex });
     defer gpa.free(temporary);
+    const file = try Io.Dir.cwd().createFile(io, temporary, .{
+        .exclusive = true,
+        .permissions = @enumFromInt(0o600),
+    });
     errdefer Io.Dir.cwd().deleteFile(io, temporary) catch {};
-    try writePrivate(io, temporary, bytes);
+    defer file.close(io);
+    try file.writeStreamingAll(io, bytes);
     try Io.Dir.cwd().rename(temporary, Io.Dir.cwd(), path, io);
 }
 
@@ -1555,4 +1560,57 @@ fn waitTestFile(dir: Io.Dir, path: []const u8) ![]u8 {
         try std.testing.io.sleep(.fromMilliseconds(10), .awake);
     }
     return error.WorkerNotReady;
+}
+
+test "atomic worker writes preserve colliding files and clean up failed replacements" {
+    const Fault = struct {
+        fn random(_: ?*anyopaque, buffer: []u8) Io.RandomSecureError!void {
+            @memset(buffer, 0);
+        }
+        fn partial(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
+            if (operation == .file_write_streaming) {
+                var write = operation.file_write_streaming;
+                const body = write.data[0];
+                if (!std.mem.startsWith(u8, body, "replacement")) return .{ .file_write_streaming = error.NoSpaceLeft };
+                write.data = &.{body[0..3]};
+                return std.testing.io.vtable.operate(userdata, .{ .file_write_streaming = write });
+            }
+            return std.testing.io.vtable.operate(userdata, operation);
+        }
+        fn rename(_: ?*anyopaque, _: Io.Dir, _: []const u8, _: Io.Dir, _: []const u8) Io.Dir.RenameError!void {
+            return error.AccessDenied;
+        }
+    };
+    const gpa = std.testing.allocator;
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/status", .{directory.sub_path});
+    defer gpa.free(path);
+    const temporary = try std.fmt.allocPrint(gpa, "{s}.tmp-0000000000000000", .{path});
+    defer gpa.free(temporary);
+    try writePrivate(std.testing.io, path, "original status");
+    try writePrivate(std.testing.io, temporary, "other writer");
+    var vtable = std.testing.io.vtable.*;
+    vtable.randomSecure = Fault.random;
+    const io: Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    try std.testing.expectError(error.PathAlreadyExists, atomicWrite(gpa, io, path, "replacement status"));
+    const other = try Io.Dir.cwd().readFileAlloc(std.testing.io, temporary, gpa, .limited(1024));
+    defer gpa.free(other);
+    try std.testing.expectEqualStrings("other writer", other);
+    try Io.Dir.cwd().deleteFile(std.testing.io, temporary);
+    vtable.operate = Fault.partial;
+    try std.testing.expectError(error.NoSpaceLeft, atomicWrite(gpa, io, path, "replacement status"));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().openFile(std.testing.io, temporary, .{}));
+    vtable.operate = std.testing.io.vtable.operate;
+    vtable.dirRename = Fault.rename;
+    try std.testing.expectError(error.AccessDenied, atomicWrite(gpa, io, path, "replacement status"));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().openFile(std.testing.io, temporary, .{}));
+    const original = try Io.Dir.cwd().readFileAlloc(std.testing.io, path, gpa, .limited(1024));
+    defer gpa.free(original);
+    try std.testing.expectEqualStrings("original status", original);
+    vtable.dirRename = std.testing.io.vtable.dirRename;
+    try atomicWrite(gpa, io, path, "replacement status");
+    const saved = try Io.Dir.cwd().readFileAlloc(std.testing.io, path, gpa, .limited(1024));
+    defer gpa.free(saved);
+    try std.testing.expectEqualStrings("replacement status", saved);
 }

@@ -237,12 +237,15 @@ fn requestFile(gpa: std.mem.Allocator, io: Io, body: []const u8) ![]u8 {
     const suffix = std.base64.url_safe_no_pad.Encoder.encode(&encoded, &random);
     const path = try std.fmt.allocPrint(gpa, "/tmp/xaq-request-{s}", .{suffix});
     errdefer gpa.free(path);
-    errdefer Io.Dir.cwd().deleteFile(io, path) catch {};
-    try Io.Dir.cwd().writeFile(io, .{
-        .sub_path = path,
-        .data = body,
-        .flags = .{ .exclusive = true, .permissions = @enumFromInt(0o600) },
+    var file = try Io.Dir.cwd().createFile(io, path, .{
+        .exclusive = true,
+        .permissions = @enumFromInt(0o600),
     });
+    // Only remove files this request created. A name collision belongs to
+    // another request, which may still need its body file for curl.
+    errdefer Io.Dir.cwd().deleteFile(io, path) catch {};
+    defer file.close(io);
+    try file.writeStreamingAll(io, body);
     return path;
 }
 
@@ -381,4 +384,48 @@ test "response lines grow beyond the fixed read buffer" {
     const result = (try nextResponseLine(&reader, &line)).?;
     try std.testing.expectEqual(input.len - 1, result.len);
     try std.testing.expectEqualSlices(u8, input[0 .. input.len - 1], result);
+}
+
+test "request body files survive name collisions and failed writes clean up" {
+    const Fault = struct {
+        threadlocal var bytes: [12]u8 = undefined;
+        fn random(_: ?*anyopaque, buffer: []u8) Io.RandomSecureError!void {
+            @memcpy(buffer, &bytes);
+        }
+        fn partial(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
+            if (operation == .file_write_streaming) {
+                var write = operation.file_write_streaming;
+                const body = write.data[0];
+                if (!std.mem.startsWith(u8, body, "request")) return .{ .file_write_streaming = error.NoSpaceLeft };
+                write.data = &.{body[0..3]};
+                return std.testing.io.vtable.operate(userdata, .{ .file_write_streaming = write });
+            }
+            return std.testing.io.vtable.operate(userdata, operation);
+        }
+    };
+    const gpa = std.testing.allocator;
+    // Repeat a fresh random name within this test without colliding with
+    // another test process that is running the same regression concurrently.
+    try std.testing.io.randomSecure(&Fault.bytes);
+    var vtable = std.testing.io.vtable.*;
+    vtable.randomSecure = Fault.random;
+    const io: Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    const path = try requestFile(gpa, io, "original request body");
+    defer gpa.free(path);
+    defer Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    try std.testing.expectError(error.PathAlreadyExists, requestFile(gpa, io, "replacement body"));
+    const retained = try Io.Dir.cwd().readFileAlloc(std.testing.io, path, gpa, .limited(1024));
+    defer gpa.free(retained);
+    try std.testing.expectEqualStrings("original request body", retained);
+
+    try Io.Dir.cwd().deleteFile(std.testing.io, path);
+    vtable.operate = Fault.partial;
+    try std.testing.expectError(error.NoSpaceLeft, requestFile(gpa, io, "request body interrupted"));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().openFile(std.testing.io, path, .{}));
+    vtable.operate = std.testing.io.vtable.operate;
+    const retried = try requestFile(gpa, io, "retry request body");
+    defer gpa.free(retried);
+    const saved = try Io.Dir.cwd().readFileAlloc(std.testing.io, retried, gpa, .limited(1024));
+    defer gpa.free(saved);
+    try std.testing.expectEqualStrings("retry request body", saved);
 }
