@@ -76,6 +76,7 @@ jobs:
           tests/publish_edge_test.sh
           tests/version_test.sh
           python3 tests/cli_test.py zig-out/bin/xaq
+          python3 tests/selection_test.py zig-out/bin/xaq
       - name: Size and startup budget
         if: runner.os == 'Linux'
         run: zig build perf

@@ -12,6 +12,7 @@ pub const Config = struct {
     subagent_max_concurrent: u8 = 4,
     subagent_default_background: bool = true,
     subagent_panel: bool = true,
+    copy_on_select: bool = true,
     firecrawl_api_key: ?[]const u8 = null,
 
     pub const ProviderModels = struct {
@@ -172,4 +173,39 @@ test "Firecrawl API keys reject whitespace and empty values" {
     try std.testing.expect(!validFirecrawlApiKey(""));
     try std.testing.expect(!validFirecrawlApiKey("fc-test key"));
     try std.testing.expect(!validFirecrawlApiKey("fc-test\nkey"));
+}
+
+test "copy on select defaults on for missing and existing settings" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_length = try std.process.currentPath(std.testing.io, &cwd_buffer);
+    const home = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd_buffer[0..cwd_length], temporary.sub_path });
+    defer std.testing.allocator.free(home);
+    var missing = try load(std.testing.allocator, std.testing.io, home);
+    defer missing.deinit();
+    try std.testing.expect(missing.value.copy_on_select);
+
+    const path = try pathFor(std.testing.allocator, home);
+    defer std.testing.allocator.free(path);
+    try saveJsonFile(std.testing.allocator, std.testing.io, path, .{ .auto_compact = false });
+    var existing = try load(std.testing.allocator, std.testing.io, home);
+    defer existing.deinit();
+    try std.testing.expect(existing.value.copy_on_select);
+    try std.testing.expect(!existing.value.auto_compact);
+}
+
+test "copy on select persists both off and on" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_length = try std.process.currentPath(std.testing.io, &cwd_buffer);
+    const home = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd_buffer[0..cwd_length], temporary.sub_path });
+    defer std.testing.allocator.free(home);
+    for ([_]bool{ false, true }) |enabled| {
+        try save(std.testing.allocator, std.testing.io, home, .{ .copy_on_select = enabled });
+        var loaded = try load(std.testing.allocator, std.testing.io, home);
+        defer loaded.deinit();
+        try std.testing.expectEqual(enabled, loaded.value.copy_on_select);
+    }
 }
