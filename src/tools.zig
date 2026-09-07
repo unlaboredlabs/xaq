@@ -276,11 +276,14 @@ pub fn resultText(gpa: std.mem.Allocator, result: []const u8) ![]u8 {
     const prefix = result[0..@min(result.len, max_output)];
     const text = try types.dupeText(gpa, prefix);
     if (result.len <= max_output and text.len <= max_output) return text;
-    defer gpa.free(text);
+    errdefer gpa.free(text);
     const suffix = "\n[tool result truncated]";
     var keep = max_output - suffix.len;
     while (keep > 0 and text[keep] & 0xc0 == 0x80) keep -= 1;
-    return std.fmt.allocPrint(gpa, "{s}{s}", .{ text[0..keep], suffix });
+    @memcpy(text[keep..][0..suffix.len], suffix);
+    // Shrink the latest allocation so session arenas can reuse the repaired
+    // bytes beyond the limit instead of retaining a second, temporary copy.
+    return gpa.realloc(text, keep + suffix.len);
 }
 
 fn fieldString(args: std.json.Value, key: []const u8) ![]const u8 {
