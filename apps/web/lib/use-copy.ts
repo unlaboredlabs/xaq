@@ -35,6 +35,7 @@ export function useCopy(text: string) {
     const currentAttempt = ++attempt.current;
     if (timer.current) clearTimeout(timer.current);
     timer.current = null;
+    setStatus("idle");
 
     const clipboard =
       typeof navigator === "undefined" ? undefined : navigator.clipboard;
@@ -42,6 +43,8 @@ export function useCopy(text: string) {
     if (attempt.current !== currentAttempt) return;
 
     setStatus(copied ? "copied" : "failed");
+    if (!copied) return;
+
     timer.current = setTimeout(() => {
       timer.current = null;
       setStatus("idle");
