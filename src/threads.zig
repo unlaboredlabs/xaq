@@ -340,6 +340,30 @@ fn nextThreadLine(reader: *Io.Reader, out: *Io.Writer.Allocating) !?[]const u8 {
     return out.written();
 }
 
+/// Locate canonical reset lines without copying image payloads or other
+/// discarded history into the allocating buffer used by the replay pass.
+fn lastResetOffset(reader: *Io.Reader) !u64 {
+    const marker = "{\"type\":\"reset\"}";
+    var offset: u64 = 0;
+    var last_reset: u64 = 0;
+    while (true) {
+        const prefix = reader.peek(marker.len) catch |err| switch (err) {
+            error.EndOfStream => reader.buffered(),
+            else => return err,
+        };
+        const matches = std.mem.eql(u8, prefix, marker);
+        const count = try reader.discardDelimiterLimit('\n', .limited(max_thread_line_bytes + 1));
+        const separator: ?u8 = reader.takeByte() catch |err| switch (err) {
+            error.EndOfStream => null,
+            else => return err,
+        };
+        offset += count + @intFromBool(separator != null);
+        if (matches and count == marker.len) last_reset = offset;
+        if (separator == null) return last_reset;
+        std.debug.assert(separator.? == '\n');
+    }
+}
+
 fn newestFirst(_: void, a: Summary, b: Summary) bool {
     if (a.modified != b.modified) return a.modified > b.modified;
     return std.mem.order(u8, a.id, b.id) == .lt;
@@ -446,10 +470,7 @@ pub fn load(gpa: std.mem.Allocator, entry_gpa: std.mem.Allocator, io: Io, home: 
     var fast = false;
     var entries: std.ArrayList(types.Entry) = .empty;
     errdefer entries.deinit(entry_gpa);
-    var last_reset_offset: u64 = 0;
-    while (try nextThreadLine(&file_reader.interface, &line_buffer)) |line| {
-        if (std.mem.eql(u8, line, "{\"type\":\"reset\"}")) last_reset_offset = file_reader.logicalPos();
-    }
+    const last_reset_offset = try lastResetOffset(&file_reader.interface);
     try file_reader.seekTo(0);
     while (true) {
         const this_offset = file_reader.logicalPos();
@@ -908,6 +929,54 @@ test "thread JSONL resumes state after the last reset" {
     try std.testing.expect(!loaded.fast);
     try std.testing.expectEqual(@as(usize, 1), loaded.entries.items.len);
     try std.testing.expectEqualStrings("new", loaded.entries.items[0].user.text);
+}
+
+test "thread reset scan matches exact lines and preserves EOF offsets" {
+    const cases = .{
+        .{ "", 0 },
+        .{ "\n\r\nshort", 0 },
+        .{ "{\"type\":\"reset\"}", 16 },
+        .{ "{\"type\":\"reset\"}\n", 17 },
+        .{ "prefix\n{\"type\":\"reset\"}\ntrailing", 24 },
+        .{ "{\"type\":\"reset\"}\n{\"type\":\"reset\"}", 33 },
+        .{ "{\"type\":\"reset\"}\r\n", 0 },
+        .{ " {\"type\":\"reset\"}\n", 0 },
+        .{ "{\"type\":\"reset\"}extra\n", 0 },
+        .{ "{\"type\":\"reset\"}\n{\"type\":\"reset\"}\r\n", 17 },
+    };
+    inline for (cases) |case| {
+        var reader: Io.Reader = .fixed(case[0]);
+        try std.testing.expectEqual(@as(u64, case[1]), try lastResetOffset(&reader));
+    }
+}
+
+test "thread reset scan handles marker and newline across reader boundaries" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const content = "padding\n{\"type\":\"reset\"}\nmore\n{\"type\":\"reset\"}";
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "thread.jsonl", .data = content });
+    const file = try temporary.dir.openFile(std.testing.io, "thread.jsonl", .{});
+    defer file.close(std.testing.io);
+    var buffer: [16]u8 = undefined;
+    var reader: Io.File.Reader = .init(file, std.testing.io, &buffer);
+    try std.testing.expectEqual(@as(u64, content.len), try lastResetOffset(&reader.interface));
+}
+
+test "thread reset scan preserves the maximum line length" {
+    const bytes = try std.testing.allocator.alloc(u8, max_thread_line_bytes + 2);
+    defer std.testing.allocator.free(bytes);
+    @memset(bytes, 'x');
+    var reader: Io.Reader = .fixed(bytes[0..max_thread_line_bytes]);
+    try std.testing.expectEqual(@as(u64, 0), try lastResetOffset(&reader));
+    reader = .fixed(bytes[0 .. max_thread_line_bytes + 1]);
+    try std.testing.expectError(error.StreamTooLong, lastResetOffset(&reader));
+    bytes[max_thread_line_bytes] = '\n';
+    reader = .fixed(bytes[0 .. max_thread_line_bytes + 1]);
+    try std.testing.expectEqual(@as(u64, 0), try lastResetOffset(&reader));
+    bytes[max_thread_line_bytes] = 'x';
+    bytes[max_thread_line_bytes + 1] = '\n';
+    reader = .fixed(bytes);
+    try std.testing.expectError(error.StreamTooLong, lastResetOffset(&reader));
 }
 
 test "thread JSONL persists image content" {
