@@ -1710,13 +1710,16 @@ fn writeRegionBytes(bytes: []const u8) !void {
 /// carriage return rewinds, newline commits, SGR is kept, every other
 /// escape sequence is dropped.
 fn ingest(bytes: []const u8, track_rows: bool) isize {
+    // Only the net change moves a scrolled viewport. Measuring at chunk
+    // boundaries avoids laying out the whole partial line for every byte.
+    const previous_rows = if (track_rows) lineLayout(current[0..current_len]).rows else 1;
     var bottom_delta: isize = 0;
     for (bytes) |byte| switch (esc_state) {
         .text => switch (byte) {
             0x1b => {
                 // CR before styled overwrites (spinner-style redraws)
                 // must land before the SGR is captured.
-                bottom_delta += applyPendingCr(track_rows);
+                applyPendingCr();
                 esc_state = .escape;
                 csi_len = 0;
             },
@@ -1731,18 +1734,18 @@ fn ingest(bytes: []const u8, track_rows: bool) isize {
                 bottom_delta += commit(track_rows);
             },
             '\t' => {
-                bottom_delta += applyPendingCr(track_rows);
+                applyPendingCr();
                 // Terminals jump to the next 8-column stop; pad the ring
                 // to match so reflowed history lines up with live output.
                 const column = contentLeft() + lineLayout(current[0..current_len]).column;
                 const target = ((column - 1) / 8 + 1) * 8 + 1;
                 var spaces = @max(target -| column, 1);
-                while (spaces > 0) : (spaces -= 1) bottom_delta += appendByte(' ', track_rows);
+                while (spaces > 0) : (spaces -= 1) appendByte(' ');
             },
             0x00...0x08, 0x0b...0x0c, 0x0e...0x1a, 0x1c...0x1f, 0x7f => {},
             else => {
-                bottom_delta += applyPendingCr(track_rows);
-                bottom_delta += appendByte(byte, track_rows);
+                applyPendingCr();
+                appendByte(byte);
             },
         },
         .escape => esc_state = switch (byte) {
@@ -1759,7 +1762,7 @@ fn ingest(bytes: []const u8, track_rows: bool) isize {
                 if (byte == 'm' and csi_len <= csi_buffer.len and current_len + csi_len + 2 <= current.len) {
                     // A carriage return before this SGR rewinds the line
                     // first, or the styling would be wiped with the text.
-                    bottom_delta += applyPendingCr(track_rows);
+                    applyPendingCr();
                     current[current_len] = 0x1b;
                     current[current_len + 1] = '[';
                     @memcpy(current[current_len + 2 .. current_len + 2 + csi_len], csi_buffer[0..csi_len]);
@@ -1775,21 +1778,19 @@ fn ingest(bytes: []const u8, track_rows: bool) isize {
         },
         .osc_escape => esc_state = if (byte == '\\') .text else .osc,
     };
-    return bottom_delta;
+    if (!track_rows) return 0;
+    return bottom_delta + @as(isize, @intCast(lineLayout(current[0..current_len]).rows)) - @as(isize, @intCast(previous_rows));
 }
 
-fn applyPendingCr(track_rows: bool) isize {
-    if (!pending_cr) return 0;
-    const previous_rows = if (track_rows) lineLayout(current[0..current_len]).rows else 1;
+fn applyPendingCr() void {
+    if (!pending_cr) return;
     pending_cr = false;
     current_len = 0;
     current_truncated = false;
     cp_remaining = 0;
-    return 1 - @as(isize, @intCast(previous_rows));
 }
 
-fn appendByte(byte: u8, track_rows: bool) isize {
-    const previous_rows = if (track_rows) lineLayout(current[0..current_len]).rows else 1;
+fn appendByte(byte: u8) void {
     if (current_len < current.len) {
         current[current_len] = byte;
         current_len += 1;
@@ -1815,20 +1816,16 @@ fn appendByte(byte: u8, track_rows: bool) isize {
         cp_pending = (cp_pending << 6) | (byte & 0x3f);
         cp_remaining -= 1;
     }
-    if (!track_rows) return 0;
-    const next_rows = lineLayout(current[0..current_len]).rows;
-    return @as(isize, @intCast(next_rows)) - @as(isize, @intCast(previous_rows));
 }
 
 fn commit(track_rows: bool) isize {
-    const previous_rows = if (track_rows) lineLayout(current[0..current_len]).rows else 1;
     var stored_len = current_len;
     while (stored_len > 0 and !std.unicode.utf8ValidateSlice(current[0..stored_len])) stored_len -= 1;
     if (stored_len != current_len) current_truncated = true;
     const copy = gpa_state.dupe(u8, current[0..stored_len]) catch {
         current_len = 0;
         current_truncated = false;
-        return if (track_rows) 1 - @as(isize, @intCast(previous_rows)) else 0;
+        return 0;
     };
     current_len = 0;
     if (line_count == max_lines) {
@@ -1844,8 +1841,7 @@ fn commit(track_rows: bool) isize {
     current_truncated = false;
     line_count += 1;
     if (!track_rows) return 0;
-    const stored_rows = lineLayout(copy).rows;
-    return @as(isize, @intCast(stored_rows + 1)) - @as(isize, @intCast(previous_rows));
+    return @intCast(lineLayout(copy).rows);
 }
 
 test "info bar text shows usage and hints without live activity" {
@@ -2531,6 +2527,50 @@ test "wheel scrolling stays anchored while output arrives" {
     try std.testing.expectEqual(@as(usize, 3), scroll_offset);
     try std.testing.expect(scrollLines(false, 2));
     try std.testing.expectEqual(@as(usize, 1), scroll_offset);
+}
+
+test "scrolled ingest tracks wrapped rows across chunk and overwrite boundaries" {
+    gpa_state = std.testing.allocator;
+    rows = 24;
+    cols = 40;
+    resetTranscriptLocked();
+    defer resetTranscriptLocked();
+    const text = "a" ** 38 ++ "e\u{0301}👩‍💻🇺🇸\r\x1b[1mshort\x1b[0m\r\n" ++
+        "中" ** 30 ++ "\tend\n" ++ "a" ** (max_line_bytes - 1) ++ "中\nlast";
+    for ([_]usize{ 1, 2, 7, 64, text.len }) |chunk_size| {
+        resetTranscriptLocked();
+        var start: usize = 0;
+        while (start < text.len) {
+            const end = @min(start + chunk_size, text.len);
+            const previous_rows = visualRowCount();
+            const delta = ingest(text[start..end], true);
+            try std.testing.expectEqual(
+                @as(isize, @intCast(visualRowCount())) - @as(isize, @intCast(previous_rows)),
+                delta,
+            );
+            start = end;
+        }
+        try std.testing.expectEqual(@as(usize, 3), line_count);
+        try std.testing.expectEqualStrings("\x1b[1mshort\x1b[0m", lines[0]);
+        try std.testing.expectEqualStrings("a" ** (max_line_bytes - 1), lines[2]);
+        try std.testing.expect(lines_truncated[2]);
+        try std.testing.expectEqualStrings("last", current[0..current_len]);
+    }
+}
+
+test "scrolled ingest subtracts discarded live rows when a commit allocation fails" {
+    resetTranscriptLocked();
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    gpa_state = failing.allocator();
+    defer {
+        resetTranscriptLocked();
+        gpa_state = std.testing.allocator;
+    }
+    cols = 40;
+    _ = ingest("a" ** 80, false);
+    try std.testing.expectEqual(@as(isize, -2), ingest("\n", true));
+    try std.testing.expectEqual(@as(usize, 0), line_count);
+    try std.testing.expectEqual(@as(usize, 0), current_len);
 }
 
 test "paging is serialized with transcript rollover" {
