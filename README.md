@@ -72,6 +72,8 @@ A positional prompt opens the interactive session and submits the first turn imm
 
 On a capable terminal, `xaq` opens a compact fullscreen view with a scrolling transcript, fixed prompt, status bars, command completion, and thread picker. Use the mouse wheel or PgUp/PgDn to move through the transcript. While the agent is running, Enter steers it at the next safe model boundary and Alt+Enter queues a follow-up for after the current exchange. Both queues are FIFO; the status bar shows their pending counts. Mid-run input is a fullscreen feature; `--plain` and `XAQ_PLAIN=1` retain terminal type-ahead. Up and Down search prompt history using the text already typed, and Down restores the draft after the newest match. `ctrl-c` clears the prompt or interrupts active work; `ctrl-d` exits.
 
+Left-drag in the fullscreen transcript to select text. Releasing the mouse copies the selection by default. Turn off **copy on select** in `/settings` to copy manually with Ctrl-Y. Escape clears the selection. Hold Shift while dragging to use your terminal's native selection instead. Copying supports selections up to 64 KiB. The `copy_on_select` setting is saved in `~/.config/xaq/settings.json` and defaults to `true` for existing settings files.
+
 Type `@` to search project files, then use Up and Down to select one and Tab or Enter to insert its path. Tab also completes relative path tokens such as `src/ag`. The index is built on demand and stays in memory for the current prompt.
 
 Interactive prompts are limited to 4 MiB, including expanded pastes and continued lines. Longer input is clipped at a complete UTF-8 character with a notice. Continuation lines beyond the limit are consumed with that prompt.
@@ -91,7 +93,7 @@ Type `/` to browse local commands:
 | `/verbose [on\|off]` | show tool-result previews |
 | `/firecrawl [status\|clear]` | configure web tools |
 | `/agents` | list subagents with model, effort, and live activity |
-| `/settings` | configure compaction and subagents |
+| `/settings` | configure compaction, subagents, and selection copying |
 | `/status` | show session and token details |
 | `/compact` | compact context now |
 | `/clear` | clear the current thread |

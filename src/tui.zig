@@ -26,6 +26,7 @@
 const std = @import("std");
 const Io = std.Io;
 const term = @import("term.zig");
+const clipboard = @import("clipboard.zig");
 
 pub var active = false;
 
@@ -144,6 +145,33 @@ var current_truncated = false;
 var pending_cr = false;
 var scroll_offset: usize = 0;
 
+pub const MouseAction = enum { press, drag, release };
+
+const SelectionPoint = struct {
+    line: usize,
+    start: usize,
+    end: usize,
+};
+
+const SelectionRange = struct { first: SelectionPoint, last: SelectionPoint };
+
+// Committed ring lines stay immutable until eviction. Only the live partial
+// line needs copying to keep selected text and its screen positions stable
+// while the agent continues writing.
+const Selection = struct {
+    anchor: SelectionPoint = .{ .line = 0, .start = 0, .end = 0 },
+    focus: SelectionPoint = .{ .line = 0, .start = 0, .end = 0 },
+    dragging: bool = true,
+    line_count: usize,
+    current: [max_line_bytes]u8,
+    current_len: usize,
+    current_truncated: bool,
+    first_row: usize,
+    end_row: usize,
+};
+
+var selection: ?Selection = null;
+
 // Partial UTF-8 code point being ingested, for width tracking.
 var cp_pending: u21 = 0;
 var cp_remaining: u3 = 0;
@@ -202,8 +230,9 @@ fn enterMeasured(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, measured: ?ter
     panel_height = 0;
     errdefer rollbackEnter();
     // The alternate screen has no portable scrollback. Ask the terminal for
-    // mouse events so the application-owned transcript can handle the wheel.
-    try out.writeAll("\x1b[?1049h\x1b[?1000h\x1b[?1006h\x1b[2J");
+    // mouse events for scrolling and motion while a selection button is held.
+    selection = null;
+    try out.writeAll("\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[2J");
     try armRegion(out);
     try drawChrome(out);
     region_row = regionTop();
@@ -225,7 +254,7 @@ pub fn exit() void {
     active = false;
     // Also restore paste mode here because process.exit paths skip the
     // editor's defer and call this cleanup directly.
-    sink.writeAll("\x1b[?1006l\x1b[?1000l\x1b[?2004l\x1b[r\x1b[?1049l") catch {};
+    sink.writeAll("\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[r\x1b[?1049l") catch {};
     sink.flush() catch {};
     resetTranscriptLocked();
     agents_running = 0;
@@ -242,6 +271,7 @@ pub fn exit() void {
 }
 
 fn resetTranscriptLocked() void {
+    selection = null;
     var i: usize = 0;
     while (i < line_count) : (i += 1) gpa_state.free(lines[(line_start + i) % max_lines]);
     line_start = 0;
@@ -278,7 +308,8 @@ pub fn clearTranscript() void {
 fn rollbackEnter() void {
     active = false;
     layout_ready = false;
-    sink.writeAll("\x1b[?1006l\x1b[?1000l\x1b[?2004l\x1b[r\x1b[?1049l") catch {};
+    selection = null;
+    sink.writeAll("\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[r\x1b[?1049l") catch {};
     sink.flush() catch {};
 }
 
@@ -566,7 +597,7 @@ pub fn spinnerFrame(glyph: []const u8, label: []const u8) void {
     render_mutex.lockUncancelable(io_state);
     defer render_mutex.unlock(io_state);
     _ = resizeIfNeededLocked();
-    if (!layout_ready or scroll_offset != 0) return;
+    if (!layout_ready or scroll_offset != 0 or selection != null) return;
     var buffer: [512]u8 = undefined;
     var writer: Io.Writer = .fixed(&buffer);
     writer.writeByte('\r') catch return;
@@ -617,6 +648,7 @@ pub fn beginPopup(count: usize) usize {
     const capacity = regionHeight() -| 1;
     const clamped = @min(count, @min(capacity, 9));
     if (clamped != popup_rows) {
+        selection = null;
         popup_rows = clamped;
         repaint() catch {};
     }
@@ -633,6 +665,7 @@ pub fn popupLine(index: usize, text: []const u8) void {
 
 pub fn closePopup() void {
     if (!active or popup_rows == 0) return;
+    selection = null;
     popup_rows = 0;
     if (layout_ready) repaint() catch {};
 }
@@ -659,14 +692,169 @@ fn scroll(up: bool, requested_step: ?usize) bool {
     render_mutex.lockUncancelable(io_state);
     defer render_mutex.unlock(io_state);
     if (!layout_ready) return false;
+    const had_selection = selection != null;
+    const total = visualRowCount();
+    if (selection) |*selected| scroll_offset = total -| selected.end_row;
+    selection = null;
     const visible = viewportHeight();
     const step = requested_step orelse @max(visible -| 1, 1);
-    const max_offset = visualRowCount() -| visible;
+    const max_offset = total -| visible;
     const previous = scroll_offset;
     scroll_offset = if (up) @min(scroll_offset + step, max_offset) else scroll_offset -| step;
-    if (scroll_offset == previous) return false;
+    if (scroll_offset == previous and !had_selection) return false;
     repaint() catch {};
     return true;
+}
+
+/// Screen coordinates are one-based, matching SGR and legacy mouse reports.
+/// A click only clears the previous selection. A drag includes both endpoint
+/// cells; endpoints outside the transcript clamp to its visible edges.
+pub fn mouseSelection(gpa: std.mem.Allocator, action: MouseAction, column: usize, row: usize) !?[]u8 {
+    if (!active) return null;
+    render_mutex.lockUncancelable(io_state);
+    defer render_mutex.unlock(io_state);
+    _ = resizeIfNeededLocked();
+    if (!layout_ready) return null;
+    if (action == .press) {
+        const was_selected = selection != null;
+        if (row < regionTop() or row >= regionTop() + viewportHeight() or column < contentLeft() or column >= contentLeft() + contentWidth()) {
+            selection = null;
+            if (was_selected) {
+                try repaint();
+                try restoreEditorCursor();
+            }
+            return null;
+        }
+        const total = visualRowCount();
+        const end = total - scroll_offset;
+        var snapshot: Selection = selection orelse .{
+            .line_count = line_count,
+            .current = current,
+            .current_len = current_len,
+            .current_truncated = current_truncated,
+            .first_row = end -| viewportHeight(),
+            .end_row = end,
+        };
+        while (snapshot.current_len > 0 and !std.unicode.utf8ValidateSlice(snapshot.current[0..snapshot.current_len])) snapshot.current_len -= 1;
+        snapshot.dragging = true;
+        snapshot.anchor = pointAt(&snapshot, column, row);
+        snapshot.focus = snapshot.anchor;
+        selection = snapshot;
+    } else if (selection) |*selected| {
+        if (!selected.dragging) return null;
+        selected.focus = pointAt(selected, column, row);
+        if (action == .release) selected.dragging = false;
+    } else return null;
+    if (action == .release and selectedRange() == null) selection = null;
+    try repaint();
+    try restoreEditorCursor();
+    return if (action == .release) selectionTextLocked(gpa) else null;
+}
+
+pub fn selectionText(gpa: std.mem.Allocator) !?[]u8 {
+    if (!active) return null;
+    render_mutex.lockUncancelable(io_state);
+    defer render_mutex.unlock(io_state);
+    return selectionTextLocked(gpa);
+}
+
+pub fn clearSelection() void {
+    if (!active) return;
+    render_mutex.lockUncancelable(io_state);
+    defer render_mutex.unlock(io_state);
+    if (selection == null) return;
+    selection = null;
+    repaint() catch return;
+    restoreEditorCursor() catch {};
+}
+
+/// Native clipboard helpers may block briefly; keep transcript rendering
+/// unlocked until an OSC 52 fallback actually needs the terminal writer.
+pub fn copyText(text: []const u8) !void {
+    if (!active) return error.ClipboardUnavailable;
+    if (try clipboard.copy(gpa_state, io_state, text)) return;
+    render_mutex.lockUncancelable(io_state);
+    defer render_mutex.unlock(io_state);
+    if (!active) return error.ClipboardUnavailable;
+    try clipboard.writeOsc52(sink, text);
+    try sink.flush();
+}
+
+fn pointBefore(first: SelectionPoint, second: SelectionPoint) bool {
+    return first.line < second.line or (first.line == second.line and first.start < second.start);
+}
+
+fn selectedRange() ?SelectionRange {
+    const selected = if (selection) |*value| value else return null;
+    if (selected.anchor.line == selected.focus.line and selected.anchor.start == selected.focus.start and selected.anchor.end == selected.focus.end) return null;
+    return if (pointBefore(selected.anchor, selected.focus))
+        .{ .first = selected.anchor, .last = selected.focus }
+    else
+        .{ .first = selected.focus, .last = selected.anchor };
+}
+
+fn selectedLine(selected: *const Selection, index: usize) []const u8 {
+    return if (index < selected.line_count) lines[(line_start + index) % max_lines] else selected.current[0..selected.current_len];
+}
+
+fn pointAt(selected: *const Selection, column: usize, row: usize) SelectionPoint {
+    const screen_row = std.math.clamp(row, regionTop(), regionTop() + viewportHeight() - 1);
+    const target_row = selected.first_row + screen_row - regionTop();
+    const target_column = std.math.clamp(column, contentLeft(), contentLeft() + contentWidth()) - contentLeft();
+    var base_row: usize = 0;
+    for (0..selected.line_count + 1) |index| {
+        const text = selectedLine(selected, index);
+        const layout = if (index < selected.line_count) line_layouts[(line_start + index) % max_lines] else lineLayout(text);
+        if (target_row < base_row + layout.rows) return pointInLine(text, index, target_row - base_row, target_column);
+        base_row += layout.rows;
+    }
+    return .{ .line = selected.line_count, .start = selected.current_len, .end = selected.current_len };
+}
+
+fn pointInLine(text: []const u8, index: usize, target_row: usize, target_column: usize) SelectionPoint {
+    var row: usize = 0;
+    var column: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == 0x1b) {
+            i = sgrEnd(text, i) orelse break;
+            continue;
+        }
+        const cell = term.nextCell(text, i);
+        if (cell.width > 0 and column + cell.width > contentWidth()) {
+            if (row == target_row) return .{ .line = index, .start = i, .end = i };
+            row += 1;
+            column = 0;
+        }
+        if (row == target_row and target_column < column + cell.width) return .{ .line = index, .start = i, .end = cell.end };
+        column += @min(cell.width, contentWidth());
+        i = cell.end;
+    }
+    return .{ .line = index, .start = text.len, .end = text.len };
+}
+
+fn selectionTextLocked(gpa: std.mem.Allocator) !?[]u8 {
+    const range = selectedRange() orelse return null;
+    const selected = if (selection) |*value| value else return null;
+    var result: Io.Writer.Allocating = .init(gpa);
+    defer result.deinit();
+    for (range.first.line..range.last.line + 1) |index| {
+        if (index != range.first.line) try result.writer.writeByte('\n');
+        const text = selectedLine(selected, index);
+        var i = if (index == range.first.line) range.first.start else 0;
+        const end = if (index == range.last.line) range.last.end else text.len;
+        while (i < end) {
+            if (text[i] == 0x1b) {
+                i = sgrEnd(text, i) orelse break;
+                continue;
+            }
+            const cell = term.nextCell(text, i);
+            try result.writer.writeAll(text[i..cell.end]);
+            i = cell.end;
+        }
+    }
+    if (result.written().len == 0) return null;
+    return try result.toOwnedSlice();
 }
 
 fn contentLeft() usize {
@@ -839,8 +1027,18 @@ fn visualRowCount() usize {
     }
     // The live insertion line remains part of the viewport when empty. This
     // prevents the next streamed byte from overwriting the last committed row.
-    count += lineLayout(current[0..current_len]).rows;
+    count += lineLayout(displayCurrent()).rows;
     return count;
+}
+
+/// The incremental renderer holds an unfinished code point until its next
+/// chunk arrives. Repaints must leave the same bytes pending.
+fn displayCurrent() []const u8 {
+    const text = current[0..current_len];
+    return if (display_utf8_len > 0 and std.mem.endsWith(u8, text, display_utf8[0..display_utf8_len]))
+        text[0 .. text.len - display_utf8_len]
+    else
+        text;
 }
 
 fn clampViewState(total_rows: usize) void {
@@ -855,16 +1053,22 @@ fn clampViewState(total_rows: usize) void {
 }
 
 /// Render one logical line into the requested visual-row window.
-fn renderLogicalLine(out: *Io.Writer, text: []const u8, truncated: bool, layout: LineLayout, base_row: usize, first_row: usize, end_row: usize) !usize {
+fn renderLogicalLine(out: *Io.Writer, text: []const u8, truncated: bool, layout: LineLayout, logical_index: usize, base_row: usize, first_row: usize, end_row: usize) !usize {
     const width = contentWidth();
     if (base_row + layout.rows <= first_row or base_row >= end_row) return base_row + layout.rows;
     var row_offset: usize = 0;
     var column: usize = 0;
     var positioned = false;
+    var inverse = false;
+    const range = selectedRange();
     var i: usize = 0;
     while (i < text.len) {
         if (text[i] == 0x1b) {
             const end = sgrEnd(text, i) orelse break;
+            if (inverse) {
+                try out.writeAll("\x1b[27m");
+                inverse = false;
+            }
             try out.writeAll(text[i..end]);
             i = end;
             continue;
@@ -884,11 +1088,22 @@ fn renderLogicalLine(out: *Io.Writer, text: []const u8, truncated: bool, layout:
                 try out.print("\x1b[{d};{d}H", .{ screen_row, contentLeft() + column });
                 positioned = true;
             }
+            const highlighted = if (range) |value|
+                logical_index >= value.first.line and logical_index <= value.last.line and
+                    (logical_index != value.first.line or i >= value.first.start) and
+                    (logical_index != value.last.line or i < value.last.end)
+            else
+                false;
+            if (highlighted != inverse) {
+                try out.writeAll(if (highlighted) "\x1b[7m" else "\x1b[27m");
+                inverse = highlighted;
+            }
             try out.writeAll(text[i..token_end]);
         }
         column += @min(glyph_width, width);
         i = token_end;
     }
+    if (inverse) try out.writeAll("\x1b[27m");
     if (truncated) {
         const virtual_row = base_row + layout.rows - 1;
         if (virtual_row >= first_row and virtual_row < end_row) {
@@ -908,8 +1123,8 @@ fn repaint() !void {
     const total = visualRowCount();
     clampViewState(total);
     const capacity = viewportHeight();
-    const end = total - scroll_offset;
-    const begin = end -| capacity;
+    const end = if (selection) |*selected| selected.end_row else total - scroll_offset;
+    const begin = if (selection) |*selected| selected.first_row else end -| capacity;
     // Absolute positioning ignores the scroll region, so rows are
     // cleared one by one: [J would erase the input box and info bar.
     var row = regionTop();
@@ -919,15 +1134,19 @@ fn repaint() !void {
     try sink.writeAll("\x1b[0m");
     var virtual_row: usize = 0;
     var index: usize = 0;
-    while (index < line_count) : (index += 1) {
+    const shown_count = if (selection) |*selected| selected.line_count else line_count;
+    while (index < shown_count) : (index += 1) {
         const slot = (line_start + index) % max_lines;
-        virtual_row = try renderLogicalLine(sink, lines[slot], lines_truncated[slot], line_layouts[slot], virtual_row, begin, end);
+        virtual_row = try renderLogicalLine(sink, lines[slot], lines_truncated[slot], line_layouts[slot], index, virtual_row, begin, end);
     }
-    const current_layout = lineLayout(current[0..current_len]);
-    _ = try renderLogicalLine(sink, current[0..current_len], current_truncated, current_layout, virtual_row, begin, end);
+    const live_current = displayCurrent();
+    const shown_current = if (selection) |*selected| selected.current[0..selected.current_len] else live_current;
+    const shown_truncated = if (selection) |*selected| selected.current_truncated else current_truncated;
+    const current_layout = lineLayout(shown_current);
+    _ = try renderLogicalLine(sink, shown_current, shown_truncated, current_layout, shown_count, virtual_row, begin, end);
     if (scroll_offset == 0) {
-        region_row = regionTop() + @min(total - 1 - begin, capacity - 1);
-        region_col = contentLeft() + current_layout.column;
+        region_row = regionTop() + @min(total - 1, capacity - 1);
+        region_col = contentLeft() + lineLayout(live_current).column;
     } else {
         region_row = regionTop();
         region_col = contentLeft();
@@ -962,6 +1181,7 @@ fn resizeMeasured(size: ?term.WindowSize) bool {
     }
     if (!layout_dirty) return false;
 
+    selection = null;
     layout_ready = rows >= min_rows and cols >= min_cols;
     if (!layout_ready) {
         clampViewState(0);
@@ -1275,7 +1495,12 @@ fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!
 
 fn forward(bytes: []const u8) !void {
     const was_scrolled = scroll_offset != 0;
-    if (layout_ready and !was_scrolled) try writeRegionBytes(bytes);
+    const was_selected = selection != null;
+    if (layout_ready) {
+        // Keep split control sequences and Unicode clusters current while
+        // the user views a frozen transcript, without changing that view.
+        for (bytes) |byte| try processDisplayByte(byte, !was_scrolled and !was_selected);
+    }
     const bottom_delta = ingest(bytes, was_scrolled);
     if (was_scrolled) {
         if (bottom_delta > 0) {
@@ -1283,22 +1508,24 @@ fn forward(bytes: []const u8) !void {
         } else if (bottom_delta < 0) {
             scroll_offset -|= @intCast(-bottom_delta);
         }
-        if (layout_ready) try repaint();
     }
+    if (layout_ready and selection == null and (was_scrolled or was_selected)) try repaint();
 }
 
-fn advanceDisplayRow() !void {
-    try sink.writeByte('\n');
-    try sink.print("\x1b[{d}G", .{contentLeft()});
+fn advanceDisplayRow(emit: bool) !void {
+    if (emit) {
+        try sink.writeByte('\n');
+        try sink.print("\x1b[{d}G", .{contentLeft()});
+    }
     region_row = @min(region_row + 1, regionBottom());
     region_col = contentLeft();
 }
 
-fn writeDisplayGlyph(glyph: []const u8, width: usize) !void {
+fn writeDisplayGlyph(glyph: []const u8, width: usize, emit: bool) !void {
     if (width > 0 and region_col - contentLeft() + width > contentWidth()) {
-        try advanceDisplayRow();
+        try advanceDisplayRow(emit);
     }
-    try sink.writeAll(glyph);
+    if (emit) try sink.writeAll(glyph);
     region_col += @min(width, contentWidth());
 }
 
@@ -1309,15 +1536,15 @@ fn appendDisplayControl(byte: u8) void {
     }
 }
 
-fn finishDisplayControl() !void {
-    try sink.writeAll(display_control[0..display_control_len]);
+fn finishDisplayControl(emit: bool) !void {
+    if (emit) try sink.writeAll(display_control[0..display_control_len]);
     display_control_len = 0;
     display_state = .text;
 }
 
-fn flushInvalidDisplayUtf8() !void {
+fn flushInvalidDisplayUtf8(emit: bool) !void {
     for (display_utf8[0..display_utf8_len]) |byte| {
-        try writeDisplayGlyph(&.{byte}, 1);
+        try writeDisplayGlyph(&.{byte}, 1, emit);
         display_cluster_width = 1;
         display_joined = false;
         display_regional_pending = false;
@@ -1362,67 +1589,69 @@ fn displayCellWidth(cp: u21) usize {
     return raw_width;
 }
 
-fn writeDisplayTextByte(byte: u8) !void {
+fn writeDisplayTextByte(byte: u8, emit: bool) !void {
     if (display_utf8_expected > 0) {
         if (byte & 0xc0 != 0x80) {
-            try flushInvalidDisplayUtf8();
-            return writeDisplayTextByte(byte);
+            try flushInvalidDisplayUtf8(emit);
+            return writeDisplayTextByte(byte, emit);
         }
         display_utf8[display_utf8_len] = byte;
         display_utf8_len += 1;
         if (display_utf8_len == display_utf8_expected) {
             const glyph = display_utf8[0..display_utf8_len];
             const width: usize = if (std.unicode.utf8Decode(glyph)) |cp| displayCellWidth(cp) else |_| 1;
-            try writeDisplayGlyph(glyph, width);
+            try writeDisplayGlyph(glyph, width, emit);
             display_utf8_len = 0;
             display_utf8_expected = 0;
         }
         return;
     }
-    if (byte & 0x80 == 0) return writeDisplayGlyph(&.{byte}, displayCellWidth(byte));
+    if (byte & 0x80 == 0) return writeDisplayGlyph(&.{byte}, displayCellWidth(byte), emit);
     display_utf8_expected = std.unicode.utf8ByteSequenceLength(byte) catch {
-        return writeDisplayGlyph(&.{byte}, 1);
+        return writeDisplayGlyph(&.{byte}, 1, emit);
     };
     display_utf8[0] = byte;
     display_utf8_len = 1;
 }
 
-fn processDisplayByte(byte: u8) !void {
+fn processDisplayByte(byte: u8, emit: bool) !void {
     switch (display_state) {
         .text => switch (byte) {
             0x1b => {
-                try flushInvalidDisplayUtf8();
+                try flushInvalidDisplayUtf8(emit);
                 display_control_len = 0;
                 appendDisplayControl(byte);
                 display_state = .escape;
             },
             '\n' => {
-                try flushInvalidDisplayUtf8();
-                try advanceDisplayRow();
+                try flushInvalidDisplayUtf8(emit);
+                try advanceDisplayRow(emit);
                 display_joined = false;
                 display_cluster_width = 0;
                 display_regional_pending = false;
             },
             '\r' => {
-                try flushInvalidDisplayUtf8();
-                try sink.writeByte('\r');
-                try sink.print("\x1b[{d}G", .{contentLeft()});
+                try flushInvalidDisplayUtf8(emit);
+                if (emit) {
+                    try sink.writeByte('\r');
+                    try sink.print("\x1b[{d}G", .{contentLeft()});
+                }
                 region_col = contentLeft();
                 display_joined = false;
                 display_cluster_width = 0;
                 display_regional_pending = false;
             },
             '\t' => {
-                try flushInvalidDisplayUtf8();
+                try flushInvalidDisplayUtf8(emit);
                 const next_stop = ((region_col - 1) / 8 + 1) * 8 + 1;
                 var spaces = @max(next_stop -| region_col, 1);
-                while (spaces > 0) : (spaces -= 1) try writeDisplayGlyph(" ", 1);
+                while (spaces > 0) : (spaces -= 1) try writeDisplayGlyph(" ", 1, emit);
                 display_joined = false;
                 display_cluster_width = 1;
                 display_regional_pending = false;
             },
             0x00...0x08, 0x0b...0x0c, 0x0e...0x1a, 0x1c...0x1f, 0x7f => {},
-            else => try writeDisplayTextByte(byte),
+            else => try writeDisplayTextByte(byte, emit),
         },
         .escape => {
             appendDisplayControl(byte);
@@ -1431,17 +1660,17 @@ fn processDisplayByte(byte: u8) !void {
             } else if (byte == ']') {
                 display_state = .osc;
             } else {
-                try finishDisplayControl();
+                try finishDisplayControl(emit);
             }
         },
         .csi => {
             appendDisplayControl(byte);
-            if (byte >= 0x40 and byte <= 0x7e) try finishDisplayControl();
+            if (byte >= 0x40 and byte <= 0x7e) try finishDisplayControl(emit);
         },
         .osc => {
             appendDisplayControl(byte);
             if (byte == 0x07) {
-                try finishDisplayControl();
+                try finishDisplayControl(emit);
             } else if (byte == 0x1b) {
                 display_state = .osc_escape;
             }
@@ -1449,7 +1678,7 @@ fn processDisplayByte(byte: u8) !void {
         .osc_escape => {
             appendDisplayControl(byte);
             if (byte == '\\') {
-                try finishDisplayControl();
+                try finishDisplayControl(emit);
             } else if (byte != 0x1b) {
                 display_state = .osc;
             }
@@ -1460,7 +1689,7 @@ fn processDisplayByte(byte: u8) !void {
 /// Stream through the same explicit content-width wrapping used by repaint.
 /// This preserves both outer margins and pre-wraps wide glyphs.
 fn writeRegionBytes(bytes: []const u8) !void {
-    for (bytes) |byte| try processDisplayByte(byte);
+    for (bytes) |byte| try processDisplayByte(byte, true);
 }
 
 /// Reassemble the displayed transcript and track the region cursor:
@@ -1589,6 +1818,7 @@ fn commit(track_rows: bool) isize {
     };
     current_len = 0;
     if (line_count == max_lines) {
+        selection = null;
         gpa_state.free(lines[line_start]);
         line_start = (line_start + 1) % max_lines;
         line_count -= 1;
@@ -1886,7 +2116,7 @@ test "exit restores terminal modes once" {
 
     exit();
     exit();
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output.written(), "\x1b[?1006l\x1b[?1000l\x1b[?2004l\x1b[r\x1b[?1049l"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output.written(), "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[r\x1b[?1049l"));
     try std.testing.expect(!active);
 }
 
@@ -1897,9 +2127,199 @@ test "fullscreen enables and restores mouse reporting" {
     defer output.deinit();
 
     _ = try enterMeasured(std.testing.allocator, threaded.io(), &output.writer, .{ .rows = 24, .cols = 80 }, false);
-    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[?1049h\x1b[?1000h\x1b[?1006h") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[?1049h\x1b[?1000h\x1b[?1002h\x1b[?1006h") != null);
     exit();
-    try std.testing.expect(std.mem.endsWith(u8, output.written(), "\x1b[?1006l\x1b[?1000l\x1b[?2004l\x1b[r\x1b[?1049l"));
+    try std.testing.expect(std.mem.endsWith(u8, output.written(), "\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[r\x1b[?1049l"));
+}
+
+test "mouse selection copies plain text in either direction and ignores clicks" {
+    const gpa = std.testing.allocator;
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    const transcript = try enterMeasured(gpa, std.testing.io, &output.writer, .{ .rows = 24, .cols = 80 }, false);
+    defer exit();
+    try transcript.writeAll("\x1b[31mhello\x1b[0m world\nsecond line\n");
+    try transcript.flush();
+
+    try std.testing.expect(try mouseSelection(gpa, .press, 2, 3) == null);
+    try std.testing.expect(try mouseSelection(gpa, .drag, 6, 3) == null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[7mhello\x1b[27m") != null);
+    const forward_text = (try mouseSelection(gpa, .release, 6, 3)).?;
+    defer gpa.free(forward_text);
+    try std.testing.expectEqualStrings("hello", forward_text);
+    const manual = (try selectionText(gpa)).?;
+    defer gpa.free(manual);
+    try std.testing.expectEqualStrings("hello", manual);
+
+    _ = try mouseSelection(gpa, .press, 6, 3);
+    const reversed = (try mouseSelection(gpa, .release, 2, 3)).?;
+    defer gpa.free(reversed);
+    try std.testing.expectEqualStrings("hello", reversed);
+
+    _ = try mouseSelection(gpa, .press, 8, 3);
+    const multiline = (try mouseSelection(gpa, .release, 7, 4)).?;
+    defer gpa.free(multiline);
+    try std.testing.expectEqualStrings("world\nsecond", multiline);
+    _ = try mouseSelection(gpa, .press, 2, 3);
+    try std.testing.expect(try mouseSelection(gpa, .release, 2, 3) == null);
+    try std.testing.expect(try selectionText(gpa) == null);
+}
+
+test "selection follows soft wraps and preserves wide and joined Unicode cells" {
+    const gpa = std.testing.allocator;
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    const transcript = try enterMeasured(gpa, std.testing.io, &output.writer, .{ .rows = 24, .cols = 40 }, false);
+    defer exit();
+    try transcript.writeAll(("a" ** 36) ++ "\x1b[1m中\x1b[0m👩‍💻e\u{301}Z\n");
+    try transcript.flush();
+
+    _ = try mouseSelection(gpa, .press, 39, 3);
+    const text = (try mouseSelection(gpa, .release, 4, 4)).?;
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings("中👩‍💻e\u{301}", text);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(text));
+    output.clearRetainingCapacity();
+    try repaint();
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[7m中\x1b[27m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[7m👩‍💻e\u{301}\x1b[27m") != null);
+
+    _ = try mouseSelection(gpa, .press, 4, 4);
+    const reversed = (try mouseSelection(gpa, .release, 39, 3)).?;
+    defer gpa.free(reversed);
+    try std.testing.expectEqualStrings(text, reversed);
+}
+
+test "selection freezes the visible partial line while output keeps arriving" {
+    const gpa = std.testing.allocator;
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    const transcript = try enterMeasured(gpa, std.testing.io, &output.writer, .{ .rows = 24, .cols = 80 }, false);
+    defer exit();
+    try transcript.writeAll("stable\npartial");
+    try transcript.flush();
+    _ = try mouseSelection(gpa, .press, 2, 3);
+    output.clearRetainingCapacity();
+    try transcript.writeAll("\rchanged\nnew output\n");
+    try transcript.flush();
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "changed") == null);
+    const copied = (try mouseSelection(gpa, .release, 8, 4)).?;
+    defer gpa.free(copied);
+    try std.testing.expectEqualStrings("stable\npartial", copied);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "changed") == null);
+    clearSelection();
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "changed") != null);
+    try std.testing.expect(try selectionText(gpa) == null);
+}
+
+test "clearing a frozen selection resumes live cursor and split stream state" {
+    const gpa = std.testing.allocator;
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    const transcript = try enterMeasured(gpa, std.testing.io, &output.writer, .{ .rows = 12, .cols = 40 }, false);
+    defer exit();
+    try transcript.writeAll("keep\npartial");
+    try transcript.flush();
+    _ = try mouseSelection(gpa, .press, 2, 3);
+    const first = (try mouseSelection(gpa, .release, 5, 3)).?;
+    defer gpa.free(first);
+    try transcript.writeAll("\rchanged\n" ++ ("line\n" ** 6) ++ "👩‍");
+    try transcript.flush();
+
+    // A new drag still refers to the text currently visible on screen.
+    _ = try mouseSelection(gpa, .press, 2, 3);
+    const repeated = (try mouseSelection(gpa, .release, 5, 3)).?;
+    defer gpa.free(repeated);
+    try std.testing.expectEqualStrings("keep", repeated);
+    try transcript.writeAll("\xf0\x9f");
+    try transcript.flush();
+    output.clearRetainingCapacity();
+    clearSelection();
+    try std.testing.expectEqual(regionBottom(), region_row);
+    try std.testing.expectEqual(contentLeft() + 2, region_col);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(output.written()));
+    output.clearRetainingCapacity();
+    try transcript.writeAll("\x92\xbb!");
+    try transcript.flush();
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "💻!") != null);
+    try std.testing.expectEqual(regionBottom(), region_row);
+    try std.testing.expectEqual(contentLeft() + 3, region_col);
+
+    _ = try mouseSelection(gpa, .press, 2, 3);
+    try transcript.writeAll("\nnew\x1b[3");
+    try transcript.flush();
+    clearSelection();
+    output.clearRetainingCapacity();
+    try transcript.writeAll("1mX");
+    try transcript.flush();
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[31mX") != null);
+    try std.testing.expectEqual(contentLeft() + 4, region_col);
+}
+
+test "selection uses the paged viewport and excludes popup and chrome rows" {
+    const gpa = std.testing.allocator;
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    const transcript = try enterMeasured(gpa, std.testing.io, &output.writer, .{ .rows = 12, .cols = 40 }, false);
+    defer exit();
+    for (0..20) |index| try transcript.print("line{d}\n", .{index});
+    try transcript.flush();
+    try std.testing.expect(scrollLines(true, 3));
+    _ = try mouseSelection(gpa, .press, 2, 3);
+    const copied = (try mouseSelection(gpa, .release, 7, 4)).?;
+    defer gpa.free(copied);
+    try std.testing.expectEqualStrings("line14\nline15", copied);
+    _ = beginPopup(2);
+    _ = try mouseSelection(gpa, .press, 2, regionBottom());
+    try std.testing.expect(try mouseSelection(gpa, .release, 10, regionBottom()) == null);
+    _ = try mouseSelection(gpa, .press, 2, topBarRow());
+    try std.testing.expect(try mouseSelection(gpa, .release, 10, topBarRow()) == null);
+}
+
+test "wheel scrolling starts from the selected viewport after output advances" {
+    const gpa = std.testing.allocator;
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    const transcript = try enterMeasured(gpa, std.testing.io, &output.writer, .{ .rows = 12, .cols = 40 }, false);
+    defer exit();
+    for (0..20) |index| try transcript.print("line{d}\n", .{index});
+    try transcript.flush();
+    _ = try mouseSelection(gpa, .press, 2, 3);
+    _ = try mouseSelection(gpa, .drag, 7, 3);
+    for (20..25) |index| try transcript.print("line{d}\n", .{index});
+    try transcript.flush();
+    try std.testing.expect(scrollLines(true, 1));
+    try std.testing.expectEqual(@as(usize, 6), scroll_offset);
+    try std.testing.expect(try selectionText(gpa) == null);
+    _ = try mouseSelection(gpa, .press, 2, 3);
+    const copied = (try mouseSelection(gpa, .release, 7, 3)).?;
+    defer gpa.free(copied);
+    try std.testing.expectEqualStrings("line16", copied);
+}
+
+test "selection clears on resize transcript reset and ring eviction" {
+    const gpa = std.testing.allocator;
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    const transcript = try enterMeasured(gpa, std.testing.io, &output.writer, .{ .rows = 24, .cols = 80 }, false);
+    defer exit();
+    try transcript.writeAll("select this\n");
+    try transcript.flush();
+    _ = try mouseSelection(gpa, .press, 2, 3);
+    _ = try mouseSelection(gpa, .drag, 6, 3);
+    try std.testing.expect(resizeMeasured(.{ .rows = 24, .cols = 40 }));
+    try std.testing.expect(try selectionText(gpa) == null);
+    _ = try mouseSelection(gpa, .press, 2, 3);
+    _ = try mouseSelection(gpa, .drag, 6, 3);
+    clearTranscript();
+    try std.testing.expect(try selectionText(gpa) == null);
+    try transcript.writeAll("select again\n");
+    try transcript.flush();
+    _ = try mouseSelection(gpa, .press, 2, 3);
+    _ = try mouseSelection(gpa, .drag, 6, 3);
+    try transcript.writeAll("x\n" ** max_lines);
+    try transcript.flush();
+    try std.testing.expect(try selectionText(gpa) == null);
 }
 
 test "clearing a fullscreen transcript releases history and parser state" {

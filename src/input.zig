@@ -26,6 +26,9 @@ const tui = @import("tui.zig");
 /// Set by main when both stdin and stdout are terminals.
 pub var interactive = false;
 
+/// Applied from persisted settings before entering the prompt loop.
+pub var copy_on_select = true;
+
 pub const Suggestion = struct {
     name: []const u8,
     alias: ?[]const u8 = null,
@@ -369,6 +372,7 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
             };
         };
         const dismissed_startup_hint = tui.dismissStartupHint();
+        if (byte != 0x1b and byte != 0x19) tui.clearSelection();
         if (interrupt_armed and byte != 0x03) {
             // Any other key withdraws the pending exit and clears the hint.
             interrupt_armed = false;
@@ -548,6 +552,7 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                 hist_pos = null;
                 dirty = true;
             },
+            0x19 => copyCurrentSelection(gpa), // ctrl-y: copy a highlighted transcript selection
             '\t' => if (slashPopupActive(buffer.items)) {
                 if (nthMatch(suggestions, buffer.items[1..], selected)) |suggestion| {
                     try fill(gpa, &buffer, suggestion.name, suggestion.args.len > 0);
@@ -568,7 +573,11 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                 }
             },
             0x1b => {
-                const second = (try takeSequenceByte(reader, options.stop)) orelse continue;
+                const second = (try takeSequenceByte(reader, options.stop)) orelse {
+                    tui.clearSelection();
+                    popup_rows = try renderEditor(output, suggestions, &files, pasted_image_paths.items, buffer.items, selected, cursor, popup_rows);
+                    continue;
+                };
                 if (options.busy and (second == '\r' or second == '\n')) {
                     submission_kind = .follow_up;
                     pending = '\n';
@@ -576,17 +585,17 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                 }
                 var final: u8 = 0;
                 var param: usize = 0;
-                var mouse_wheel: ?bool = null;
+                var mouse_event: ?MouseEvent = null;
                 if (second == '[') {
                     const sequence = (try readCsi(reader, options.stop)) orelse continue;
                     final = sequence.final;
                     param = sequence.parameters[0];
-                    mouse_wheel = sgrWheelDirection(sequence);
+                    mouse_event = sgrMouseEvent(sequence);
                     if (isLegacyMousePrefix(sequence)) {
                         const encoded_button = (try takeSequenceByte(reader, options.stop)) orelse continue;
-                        _ = (try takeSequenceByte(reader, options.stop)) orelse continue; // column
-                        _ = (try takeSequenceByte(reader, options.stop)) orelse continue; // row
-                        mouse_wheel = legacyWheelDirection(encoded_button);
+                        const column = (try takeSequenceByte(reader, options.stop)) orelse continue;
+                        const row = (try takeSequenceByte(reader, options.stop)) orelse continue;
+                        mouse_event = legacyMouseEvent(encoded_button, column, row);
                     }
                 } else if (second == 'O') {
                     final = (try takeSequenceByte(reader, options.stop)) orelse 0;
@@ -610,8 +619,8 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                     pending = second;
                     continue;
                 }
-                if (mouse_wheel) |up| {
-                    if (tui.scrollLines(up, mouse_scroll_lines)) dirty = true;
+                if (mouse_event) |event| {
+                    if (handleMouseEvent(gpa, event)) dirty = true;
                     final = 0;
                 }
                 switch (final) {
@@ -1210,6 +1219,7 @@ pub fn pick(reader: *Io.Reader, output: *Io.Writer, items: []const []const u8, i
                 return selected;
             },
             0x03, 0x04, 'q' => break,
+            0x19 => copyCurrentSelection(std.heap.page_allocator),
             'k' => selected -|= 1,
             'j' => selected = @min(selected + 1, items.len - 1),
             0x1b => {
@@ -1219,11 +1229,19 @@ pub fn pick(reader: *Io.Reader, output: *Io.Writer, items: []const []const u8, i
                 const second = (try takeByteWithin(reader, escape_sequence_timeout_ms)) orelse break;
                 var final: u8 = 0;
                 if (second == '[') {
-                    var next = (try takeByteOrNull(reader)) orelse break;
-                    while (next < 0x40 or next > 0x7e) {
-                        next = (try takeByteOrNull(reader)) orelse break;
+                    const sequence = (try readCsi(reader, null)) orelse continue;
+                    var mouse_event = sgrMouseEvent(sequence);
+                    if (isLegacyMousePrefix(sequence)) {
+                        const button = (try takeSequenceByte(reader, null)) orelse continue;
+                        const column = (try takeSequenceByte(reader, null)) orelse continue;
+                        const row = (try takeSequenceByte(reader, null)) orelse continue;
+                        mouse_event = legacyMouseEvent(button, column, row);
                     }
-                    if (next >= 0x40 and next <= 0x7e) final = next;
+                    if (mouse_event) |event| {
+                        _ = handleMouseEvent(std.heap.page_allocator, event);
+                        continue;
+                    }
+                    final = sequence.final;
                 } else if (second == 'O') {
                     final = (try takeByteOrNull(reader)) orelse 0;
                 } else break;
@@ -1263,6 +1281,14 @@ fn drawPickInline(output: *Io.Writer, items: []const []const u8, selected: usize
 /// Fullscreen picker rendering: rows overlay the transcript bottom,
 /// windowed so the selection stays visible.
 fn drawPickOverlay(items: []const []const u8, selected: usize) !void {
+    var cursor_row: usize = 0;
+    var cursor_col: usize = 0;
+    const ready = tui.beginInputFrame();
+    defer tui.endInputFrame(cursor_row, cursor_col);
+    if (!ready) return;
+    const area = tui.inputArea();
+    cursor_row = area.row;
+    cursor_col = area.col;
     const granted = tui.beginPopup(items.len);
     if (granted == 0) return;
     const first = if (selected >= granted) selected + 1 - granted else 0;
@@ -1283,6 +1309,15 @@ fn drawPickOverlay(items: []const []const u8, selected: usize) !void {
 
 fn endPick(output: *Io.Writer, drawn_rows: usize) !void {
     if (tui.active) {
+        var cursor_row: usize = 0;
+        var cursor_col: usize = 0;
+        const ready = tui.beginInputFrame();
+        defer tui.endInputFrame(cursor_row, cursor_col);
+        if (ready) {
+            const area = tui.inputArea();
+            cursor_row = area.row;
+            cursor_col = area.col;
+        }
         tui.closePopup();
         return;
     }
@@ -1968,12 +2003,31 @@ fn readCsi(reader: *Io.Reader, stop: ?*const std.atomic.Value(bool)) !?CsiSequen
     return sequence;
 }
 
-fn sgrWheelDirection(sequence: CsiSequence) ?bool {
-    if (sequence.private_marker != '<' or sequence.final != 'M' or sequence.parameter_count < 3) return null;
-    const modifiers = @as(usize, 4 | 8 | 16);
-    return switch (sequence.parameters[0] & ~modifiers) {
-        64 => true,
-        65 => false,
+const MouseEvent = union(enum) {
+    wheel: bool,
+    selection: struct { action: tui.MouseAction, column: usize, row: usize },
+};
+
+// Xterm SGR mouse reports use one-based coordinates, motion bit 32, and
+// a lowercase final 'm' for release. Legacy reports add 32 to each byte.
+// https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h2-Mouse-Tracking
+fn sgrMouseEvent(sequence: CsiSequence) ?MouseEvent {
+    if (sequence.private_marker != '<' or sequence.parameter_count != 3 or
+        (sequence.final != 'M' and sequence.final != 'm')) return null;
+    return decodeMouseEvent(sequence.parameters[0], sequence.parameters[1], sequence.parameters[2], sequence.final == 'm');
+}
+
+fn decodeMouseEvent(button: usize, column: usize, row: usize, released: bool) ?MouseEvent {
+    if (column == 0 or row == 0) return null;
+    const code = button & ~@as(usize, 4 | 8 | 16);
+    if (released) {
+        if (code != 0 and code != 3) return null;
+        return .{ .selection = .{ .action = .release, .column = column, .row = row } };
+    }
+    return switch (code) {
+        0, 32 => .{ .selection = .{ .action = if (code == 0) .press else .drag, .column = column, .row = row } },
+        64 => .{ .wheel = true },
+        65 => .{ .wheel = false },
         else => null,
     };
 }
@@ -1983,14 +2037,52 @@ fn isLegacyMousePrefix(sequence: CsiSequence) bool {
         sequence.parameter_count == 1 and sequence.parameters[0] == 0;
 }
 
-fn legacyWheelDirection(encoded_button: u8) ?bool {
-    if (encoded_button < 32) return null;
-    const modifiers = @as(usize, 4 | 8 | 16);
-    return switch ((@as(usize, encoded_button) - 32) & ~modifiers) {
-        64 => true,
-        65 => false,
-        else => null,
+fn legacyMouseEvent(encoded_button: u8, column: u8, row: u8) ?MouseEvent {
+    if (encoded_button < 32 or column <= 32 or row <= 32) return null;
+    const code = @as(usize, encoded_button) - 32;
+    return decodeMouseEvent(code, column - 32, row - 32, code & ~@as(usize, 4 | 8 | 16) == 3);
+}
+
+fn handleMouseEvent(gpa: std.mem.Allocator, event: MouseEvent) bool {
+    if (!tui.active) return false;
+    switch (event) {
+        .wheel => |up| return tui.scrollLines(up, mouse_scroll_lines),
+        .selection => |selection| {
+            const text = tui.mouseSelection(gpa, selection.action, selection.column, selection.row) catch {
+                tui.showStartupHint("Could not select text");
+                return false;
+            };
+            if (text) |value| {
+                defer gpa.free(value);
+                if (copy_on_select) copySelection(value);
+            }
+            // Repaint the prompt and any completion popup after selection
+            // repaints the transcript underneath them.
+            return true;
+        },
+    }
+}
+
+fn copyCurrentSelection(gpa: std.mem.Allocator) void {
+    if (!tui.active) return;
+    const text = tui.selectionText(gpa) catch {
+        tui.showStartupHint("Could not copy selection");
+        return;
     };
+    const value = text orelse {
+        tui.showStartupHint("Drag over transcript text to select it");
+        return;
+    };
+    defer gpa.free(value);
+    copySelection(value);
+}
+
+fn copySelection(text: []const u8) void {
+    tui.copyText(text) catch |err| {
+        tui.showStartupHint(if (err == error.ClipboardTooLarge) "Selection too large to copy" else "Could not copy selection; try Shift-drag");
+        return;
+    };
+    tui.showStartupHint("Selection sent to clipboard");
 }
 
 fn takeByteWithin(reader: *Io.Reader, timeout_ms: i32) !?u8 {
@@ -2340,15 +2432,15 @@ test "CSI parser recognizes SGR mouse wheel events" {
 
     var up_reader = Io.Reader.fixed("<64;12;8M");
     const up = (try readCsi(&up_reader, null)).?;
-    try std.testing.expectEqual(@as(?bool, true), sgrWheelDirection(up));
+    try std.testing.expectEqual(@as(?bool, true), sgrMouseEvent(up).?.wheel);
 
     var modified_down_reader = Io.Reader.fixed("<77;12;8M"); // 65 + alt + shift
     const modified_down = (try readCsi(&modified_down_reader, null)).?;
-    try std.testing.expectEqual(@as(?bool, false), sgrWheelDirection(modified_down));
+    try std.testing.expectEqual(@as(?bool, false), sgrMouseEvent(modified_down).?.wheel);
 
     var click_reader = Io.Reader.fixed("<0;12;8M");
     const click = (try readCsi(&click_reader, null)).?;
-    try std.testing.expectEqual(@as(?bool, null), sgrWheelDirection(click));
+    try std.testing.expectEqual(tui.MouseAction.press, sgrMouseEvent(click).?.selection.action);
 
     var page_reader = Io.Reader.fixed("5;2~");
     const page = (try readCsi(&page_reader, null)).?;
@@ -2358,14 +2450,43 @@ test "CSI parser recognizes SGR mouse wheel events" {
     var legacy_reader = Io.Reader.fixed("M");
     const legacy = (try readCsi(&legacy_reader, null)).?;
     try std.testing.expect(isLegacyMousePrefix(legacy));
-    try std.testing.expectEqual(@as(?bool, true), legacyWheelDirection(96));
-    try std.testing.expectEqual(@as(?bool, false), legacyWheelDirection(97));
+    try std.testing.expectEqual(@as(?bool, true), legacyMouseEvent(96, 44, 40).?.wheel);
+    try std.testing.expectEqual(@as(?bool, false), legacyMouseEvent(97, 44, 40).?.wheel);
 }
 
 test "history navigation keeps arrows when recall opens the popup" {
     try std.testing.expect(popupHandlesArrows(true, null));
     try std.testing.expect(!popupHandlesArrows(true, 3));
     try std.testing.expect(!popupHandlesArrows(false, null));
+}
+
+test "mouse parser distinguishes left drags releases and unrelated terminal reports" {
+    const previous_interactive = interactive;
+    defer interactive = previous_interactive;
+    interactive = false;
+    const cases = .{
+        .{ "<0;12;8M", tui.MouseAction.press },
+        .{ "<32;12;8M", tui.MouseAction.drag },
+        .{ "<48;12;8M", tui.MouseAction.drag }, // Ctrl + left drag
+        .{ "<0;12;8m", tui.MouseAction.release },
+    };
+    inline for (cases) |case| {
+        var reader = Io.Reader.fixed(case[0]);
+        const event = sgrMouseEvent((try readCsi(&reader, null)).?).?.selection;
+        try std.testing.expectEqual(case[1], event.action);
+        try std.testing.expectEqual(@as(usize, 12), event.column);
+        try std.testing.expectEqual(@as(usize, 8), event.row);
+        try std.testing.expectEqual(case[0].len, reader.seek);
+    }
+    for ([_][]const u8{ "<1;12;8M", "<2;12;8m", "<35;12;8M", "<0;0;8M", "<0;12;0M", "<0;12M", "<0;12;8;1M", "12;8R", "<64;12;8m" }) |source| {
+        var reader = Io.Reader.fixed(source);
+        try std.testing.expectEqual(null, sgrMouseEvent((try readCsi(&reader, null)).?));
+    }
+    try std.testing.expectEqual(tui.MouseAction.press, legacyMouseEvent(32, 44, 40).?.selection.action);
+    try std.testing.expectEqual(tui.MouseAction.drag, legacyMouseEvent(64, 44, 40).?.selection.action);
+    try std.testing.expectEqual(tui.MouseAction.release, legacyMouseEvent(35, 44, 40).?.selection.action);
+    try std.testing.expectEqual(null, legacyMouseEvent(31, 44, 40));
+    try std.testing.expectEqual(null, legacyMouseEvent(32, 32, 40));
 }
 
 test "suggestion matching walks names and aliases in order" {

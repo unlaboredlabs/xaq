@@ -434,6 +434,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
         };
     };
     defer session.deinit();
+    input_mod.copy_on_select = session.settings.value.copy_on_select;
     session.refreshSuggestions();
     var signal_scope = cancel.Scope.install();
     defer signal_scope.deinit();
@@ -1071,7 +1072,7 @@ const command_specs = [_]CommandSpec{
     .{ .command = .verbose, .name = "verbose", .args = " [on|off]", .help = "show tool output inline" },
     .{ .command = .firecrawl, .name = "firecrawl", .args = " [status|clear]", .help = "configure Firecrawl web tools" },
     .{ .command = .agents, .name = "agents", .help = "list subagents and their status" },
-    .{ .command = .settings, .name = "settings", .alias = "config", .help = "configure context compaction" },
+    .{ .command = .settings, .name = "settings", .alias = "config", .help = "configure compaction, subagents, and copying" },
     .{ .command = .status, .name = "status", .help = "show session and token usage" },
     .{ .command = .compact, .name = "compact", .help = "compact older context now" },
     .{ .command = .clear, .name = "clear", .help = "clear the current thread" },
@@ -1317,6 +1318,7 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
                 "  thread    {s}\n  provider  {s}\n  model     {s}\n  effort    {s}\n  fast      {s}\n  web       {s}\n  cwd       {s}\n  turns     {d}\n  context   ~{d} / {d} tokens\n",
                 .{ if (session.thread) |thread| thread.id else "ephemeral", @tagName(session.provider), session.model, if (session.effort) |value| @tagName(value) else "provider-default", fast_state, if (session.settings.value.firecrawl_api_key != null) "Firecrawl" else "off", session.cwd, session.turn, estimatedContextTokens(session), context_tokens },
             );
+            try output.print("  auto-copy {s}\n", .{if (session.settings.value.copy_on_select) "on" else "off"});
             try output.writeAll("  tokens    ");
             try writeTokens(output, session.usage.input);
             try output.writeAll(" input \u{b7} ");
@@ -1730,7 +1732,7 @@ fn effectiveCompactEffort(session: *const Session) ?Effort {
 fn printSettings(session: *Session) !void {
     const configured_model = configuredCompactModel(session);
     try session.output.print(
-        "  auto compact       {s}\n  threshold          {d}%\n  compaction model   {s}\n  compaction effort  {s}\n  subagents          {s}\n  agent concurrency  {d}\n  agent default      {s}\n  agent panel        {s}\n",
+        "  auto compact       {s}\n  threshold          {d}%\n  compaction model   {s}\n  compaction effort  {s}\n  subagents          {s}\n  agent concurrency  {d}\n  agent default      {s}\n  agent panel        {s}\n  copy on select     {s}\n",
         .{
             if (session.settings.value.auto_compact) "on" else "off",
             session.settings.value.compact_threshold_percent,
@@ -1740,12 +1742,60 @@ fn printSettings(session: *Session) !void {
             session.settings.value.subagent_max_concurrent,
             if (session.settings.value.subagent_default_background) "background" else "foreground",
             if (session.settings.value.subagent_panel) "on" else "off",
+            if (session.settings.value.copy_on_select) "on" else "off",
         },
     );
 }
 
 fn saveSettings(session: *Session) !void {
     try settings_mod.save(session.gpa, session.io, session.home, session.settings.value);
+}
+
+fn setCopyOnSelect(session: *Session, enabled: bool) !void {
+    var next = session.settings.value;
+    next.copy_on_select = enabled;
+    try settings_mod.save(session.gpa, session.io, session.home, next);
+    session.settings.value = next;
+    input_mod.copy_on_select = enabled;
+}
+
+test "copy on select changes apply only after settings save succeeds" {
+    const FailSave = struct {
+        fn rename(_: ?*anyopaque, _: Io.Dir, _: []const u8, _: Io.Dir, _: []const u8) Io.Dir.RenameError!void {
+            return error.AccessDenied;
+        }
+    };
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = try std.process.currentPath(std.testing.io, &cwd_buffer);
+    const home = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd_buffer[0..cwd_len], temporary.sub_path });
+    defer std.testing.allocator.free(home);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var session = try testSession(home, &output.writer);
+    defer session.deinit();
+    const previous_copy_on_select = input_mod.copy_on_select;
+    defer input_mod.copy_on_select = previous_copy_on_select;
+    input_mod.copy_on_select = true;
+
+    try setCopyOnSelect(&session, false);
+    try std.testing.expect(!session.settings.value.copy_on_select);
+    try std.testing.expect(!input_mod.copy_on_select);
+    var failing_vtable = std.testing.io.vtable.*;
+    failing_vtable.dirRename = FailSave.rename;
+    session.io = .{ .userdata = std.testing.io.userdata, .vtable = &failing_vtable };
+    const failed = setCopyOnSelect(&session, true);
+    session.io = std.testing.io;
+    try std.testing.expectError(error.AccessDenied, failed);
+    try std.testing.expect(!session.settings.value.copy_on_select);
+    try std.testing.expect(!input_mod.copy_on_select);
+    var saved = try settings_mod.load(std.testing.allocator, std.testing.io, home);
+    defer saved.deinit();
+    try std.testing.expect(!saved.value.copy_on_select);
+    try setCopyOnSelect(&session, true);
+    try std.testing.expect(session.settings.value.copy_on_select);
+    try std.testing.expect(input_mod.copy_on_select);
 }
 
 /// Remember the tuple the user just confirmed so the next fresh session
@@ -1777,7 +1827,7 @@ fn writeSelection(session: *Session) !void {
 
 fn pickSettings(session: *Session, reader: *Io.Reader) !void {
     while (true) {
-        var storage: [8][160]u8 = undefined;
+        var storage: [9][160]u8 = undefined;
         const items = [_][]const u8{
             try std.fmt.bufPrint(&storage[0], "auto compact       {s}", .{if (session.settings.value.auto_compact) "on" else "off"}),
             try std.fmt.bufPrint(&storage[1], "threshold          {d}%", .{session.settings.value.compact_threshold_percent}),
@@ -1787,6 +1837,7 @@ fn pickSettings(session: *Session, reader: *Io.Reader) !void {
             try std.fmt.bufPrint(&storage[5], "agent concurrency  {d}", .{session.settings.value.subagent_max_concurrent}),
             try std.fmt.bufPrint(&storage[6], "agent default      {s}", .{if (session.settings.value.subagent_default_background) "background" else "foreground"}),
             try std.fmt.bufPrint(&storage[7], "agent panel        {s}", .{if (session.settings.value.subagent_panel) "on" else "off"}),
+            try std.fmt.bufPrint(&storage[8], "copy on select     {s}", .{if (session.settings.value.copy_on_select) "on" else "off"}),
         };
         try session.output.print("{s}settings for {s} \u{b7} enter edits \u{b7} esc/q closes{s}\r\n", .{ term.dim(), @tagName(session.provider), term.reset() });
         try session.output.flush();
@@ -1894,6 +1945,15 @@ fn pickSettings(session: *Session, reader: *Io.Reader) !void {
                     session.settings.value.subagent_panel = index == 0;
                     try saveSettings(session);
                     syncTui(session);
+                }
+            },
+            8 => {
+                const labels = [_][]const u8{ "on", "off" };
+                const initial: usize = if (session.settings.value.copy_on_select) 0 else 1;
+                try session.output.print("{s}copy transcript selection on release; when off, press Ctrl-Y to copy{s}\r\n", .{ term.dim(), term.reset() });
+                try session.output.flush();
+                if (try input_mod.pick(reader, session.output, &labels, initial)) |index| {
+                    try setCopyOnSelect(session, index == 0);
                 }
             },
             else => unreachable,
