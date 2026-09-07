@@ -89,6 +89,23 @@ pub fn save(gpa: std.mem.Allocator, io: Io, home: []const u8, value: State) !voi
     try settings.saveJsonFile(gpa, io, path, value);
 }
 
+/// Remember one provider without losing another session's latest choices.
+/// The lock covers the complete read/modify/write, including the reload.
+pub fn remember(gpa: std.mem.Allocator, io: Io, home: []const u8, provider: auth.Provider, value: Selection) !void {
+    const path = try pathFor(gpa, home);
+    defer gpa.free(path);
+    var lock = settings.lockJsonFile(gpa, io, path) catch |err| switch (err) {
+        error.WouldBlock => return error.StateInUse,
+        else => return err,
+    };
+    defer lock.close(io);
+    var latest = try load(gpa, io, home);
+    defer latest.deinit();
+    latest.value.provider = provider;
+    latest.value.setSelection(provider, value);
+    try save(gpa, io, home, latest.value);
+}
+
 fn pathFor(gpa: std.mem.Allocator, home: []const u8) ![]u8 {
     return std.fs.path.join(gpa, &.{ home, ".config", "xaq", "state.json" });
 }
@@ -177,4 +194,26 @@ test "missing or corrupt state degrades to defaults" {
     defer corrupt.deinit();
     try std.testing.expectEqual(null, corrupt.value.provider);
     try std.testing.expectEqual(null, corrupt.value.selection(.chatgpt));
+}
+
+test "remember serializes provider edits and preserves other providers" {
+    const gpa = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const home = try testHome(gpa, &temporary.sub_path);
+    defer gpa.free(home);
+    try remember(gpa, std.testing.io, home, .chatgpt, .{ .model = "gpt-5.6-sol", .effort = .max, .fast = true });
+    const path = try pathFor(gpa, home);
+    defer gpa.free(path);
+    {
+        var held = try settings.lockJsonFile(gpa, std.testing.io, path);
+        defer held.close(std.testing.io);
+        try std.testing.expectError(error.StateInUse, remember(gpa, std.testing.io, home, .claude, .{ .model = "claude-sonnet-5" }));
+    }
+    try remember(gpa, std.testing.io, home, .claude, .{ .model = "claude-sonnet-5", .effort = .high });
+    var loaded = try load(gpa, std.testing.io, home);
+    defer loaded.deinit();
+    try std.testing.expectEqual(auth.Provider.claude, loaded.value.provider.?);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", loaded.value.selection(.chatgpt).?.model);
+    try std.testing.expectEqualStrings("claude-sonnet-5", loaded.value.selection(.claude).?.model);
 }

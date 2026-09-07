@@ -1271,8 +1271,9 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
             if (std.mem.eql(u8, args, "status")) {
                 try output.print("Firecrawl web tools {s}\n", .{if (session.settings.value.firecrawl_api_key != null) "on" else "off"});
             } else if (std.mem.eql(u8, args, "clear")) {
-                session.settings.value.firecrawl_api_key = null;
-                try saveSettings(session);
+                var next = session.settings.value;
+                next.firecrawl_api_key = null;
+                if (!try changeSettings(session, next)) return true;
                 try output.writeAll("Firecrawl API key removed; web tools are off\n");
             } else if (args.len > 0) {
                 try output.writeAll("usage: /firecrawl [status|clear]\nRun /firecrawl with no argument to paste the key into a hidden prompt.\n");
@@ -1290,8 +1291,9 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
                     try output.flush();
                     return true;
                 }
-                session.settings.value.firecrawl_api_key = try session.settings.arena.allocator().dupe(u8, entered);
-                try saveSettings(session);
+                var next = session.settings.value;
+                next.firecrawl_api_key = entered;
+                if (!try changeSettings(session, next)) return true;
                 try output.writeAll("Firecrawl configured; web_fetch and web_search are now available\n");
             }
         },
@@ -1747,16 +1749,26 @@ fn printSettings(session: *Session) !void {
     );
 }
 
-fn saveSettings(session: *Session) !void {
-    try settings_mod.save(session.gpa, session.io, session.home, session.settings.value);
+fn applySettings(session: *Session, desired: settings_mod.Config) !void {
+    const next = try settings_mod.saveChanges(session.gpa, session.io, session.home, session.settings.value, desired);
+    session.settings.deinit();
+    session.settings = next;
+    input_mod.copy_on_select = next.value.copy_on_select;
+    syncTui(session);
 }
 
-fn setCopyOnSelect(session: *Session, enabled: bool) !void {
-    var next = session.settings.value;
-    next.copy_on_select = enabled;
-    try settings_mod.save(session.gpa, session.io, session.home, next);
-    session.settings.value = next;
-    input_mod.copy_on_select = enabled;
+fn changeSettings(session: *Session, desired: settings_mod.Config) !bool {
+    applySettings(session, desired) catch |err| {
+        try session.output.print("cannot save settings: {s}\n", .{if (err == error.SettingsInUse) "another session is saving settings; try again" else @errorName(err)});
+        try session.output.flush();
+        return false;
+    };
+    applySubagentSettings(session) catch |err| {
+        try session.output.print("settings saved; cannot update subagents: {s}\n", .{@errorName(err)});
+        try session.output.flush();
+    };
+    syncTui(session);
+    return true;
 }
 
 test "copy on select changes apply only after settings save succeeds" {
@@ -1779,13 +1791,13 @@ test "copy on select changes apply only after settings save succeeds" {
     defer input_mod.copy_on_select = previous_copy_on_select;
     input_mod.copy_on_select = true;
 
-    try setCopyOnSelect(&session, false);
+    try applySettings(&session, .{ .copy_on_select = false });
     try std.testing.expect(!session.settings.value.copy_on_select);
     try std.testing.expect(!input_mod.copy_on_select);
     var failing_vtable = std.testing.io.vtable.*;
     failing_vtable.dirRename = FailSave.rename;
     session.io = .{ .userdata = std.testing.io.userdata, .vtable = &failing_vtable };
-    const failed = setCopyOnSelect(&session, true);
+    const failed = applySettings(&session, .{ .copy_on_select = true });
     session.io = std.testing.io;
     try std.testing.expectError(error.AccessDenied, failed);
     try std.testing.expect(!session.settings.value.copy_on_select);
@@ -1793,9 +1805,53 @@ test "copy on select changes apply only after settings save succeeds" {
     var saved = try settings_mod.load(std.testing.allocator, std.testing.io, home);
     defer saved.deinit();
     try std.testing.expect(!saved.value.copy_on_select);
-    try setCopyOnSelect(&session, true);
+    try applySettings(&session, .{ .copy_on_select = true });
     try std.testing.expect(session.settings.value.copy_on_select);
     try std.testing.expect(input_mod.copy_on_select);
+}
+
+test "settings edits merge other sessions and failed commands preserve live values" {
+    const FailSave = struct {
+        fn rename(_: ?*anyopaque, _: Io.Dir, _: []const u8, _: Io.Dir, _: []const u8) Io.Dir.RenameError!void {
+            return error.AccessDenied;
+        }
+    };
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const home = try temporary.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(home);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var first = try testSession(home, &output.writer);
+    defer first.deinit();
+    var second = try testSession(home, &output.writer);
+    defer second.deinit();
+    const previous_copy_on_select = input_mod.copy_on_select;
+    defer input_mod.copy_on_select = previous_copy_on_select;
+
+    try applySettings(&first, .{ .firecrawl_api_key = "fc-shared" });
+    try applySettings(&second, .{ .copy_on_select = false });
+    try std.testing.expectEqualStrings("fc-shared", second.settings.value.firecrawl_api_key.?);
+    var desired = first.settings.value;
+    desired.auto_compact = false;
+    try applySettings(&first, desired);
+    try std.testing.expect(!first.settings.value.copy_on_select);
+    try std.testing.expect(!input_mod.copy_on_select);
+
+    var failing_vtable = std.testing.io.vtable.*;
+    failing_vtable.dirRename = FailSave.rename;
+    first.io = .{ .userdata = std.testing.io.userdata, .vtable = &failing_vtable };
+    var reader: Io.Reader = .fixed("");
+    const keep_going = runCommand(&first, &reader, "firecrawl clear");
+    first.io = std.testing.io;
+    try std.testing.expect(try keep_going);
+    try std.testing.expectEqualStrings("fc-shared", first.settings.value.firecrawl_api_key.?);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "cannot save settings: AccessDenied") != null);
+    var saved = try settings_mod.load(std.testing.allocator, std.testing.io, home);
+    defer saved.deinit();
+    try std.testing.expectEqualStrings("fc-shared", saved.value.firecrawl_api_key.?);
+    try std.testing.expect(!saved.value.copy_on_select);
+    try std.testing.expect(!saved.value.auto_compact);
 }
 
 /// Remember the tuple the user just confirmed so the next fresh session
@@ -1812,17 +1868,11 @@ fn persistSelection(session: *Session) void {
 }
 
 fn writeSelection(session: *Session) !void {
-    // Reload before writing so a parallel session's selections for other
-    // providers survive; last writer wins only on the shared fields.
-    var loaded = try state_mod.load(session.gpa, session.io, session.home);
-    defer loaded.deinit();
-    loaded.value.provider = session.provider;
-    loaded.value.setSelection(session.provider, .{
+    try state_mod.remember(session.gpa, session.io, session.home, session.provider, .{
         .model = session.model,
         .effort = session.effort,
         .fast = session.fast,
     });
-    try state_mod.save(session.gpa, session.io, session.home, loaded.value);
 }
 
 fn pickSettings(session: *Session, reader: *Io.Reader) !void {
@@ -1849,8 +1899,9 @@ fn pickSettings(session: *Session, reader: *Io.Reader) !void {
                 try session.output.print("{s}automatic compaction{s}\r\n", .{ term.dim(), term.reset() });
                 try session.output.flush();
                 if (try input_mod.pick(reader, session.output, &labels, initial)) |index| {
-                    session.settings.value.auto_compact = index == 0;
-                    try saveSettings(session);
+                    var next = session.settings.value;
+                    next.auto_compact = index == 0;
+                    _ = try changeSettings(session, next);
                 }
             },
             1 => {
@@ -1864,8 +1915,9 @@ fn pickSettings(session: *Session, reader: *Io.Reader) !void {
                 try session.output.print("{s}compact at percent of model context{s}\r\n", .{ term.dim(), term.reset() });
                 try session.output.flush();
                 if (try input_mod.pick(reader, session.output, &labels, initial)) |index| {
-                    session.settings.value.compact_threshold_percent = values[index];
-                    try saveSettings(session);
+                    var next = session.settings.value;
+                    next.compact_threshold_percent = values[index];
+                    _ = try changeSettings(session, next);
                 }
             },
             2 => {
@@ -1881,8 +1933,9 @@ fn pickSettings(session: *Session, reader: *Io.Reader) !void {
                 try session.output.print("{s}model used to summarize old context{s}\r\n", .{ term.dim(), term.reset() });
                 try session.output.flush();
                 if (try input_mod.pick(reader, session.output, labels[0..count], initial)) |index| {
-                    session.settings.value.setCompactModel(session.provider, labels[index]);
-                    try saveSettings(session);
+                    var next = session.settings.value;
+                    next.setCompactModel(session.provider, labels[index]);
+                    _ = try changeSettings(session, next);
                 }
             },
             3 => {
@@ -1899,8 +1952,9 @@ fn pickSettings(session: *Session, reader: *Io.Reader) !void {
                 try session.output.print("{s}reasoning effort used for summaries{s}\r\n", .{ term.dim(), term.reset() });
                 try session.output.flush();
                 if (try input_mod.pick(reader, session.output, labels[0..count], initial)) |index| {
-                    session.settings.value.setCompactEffort(session.provider, if (index == 0) null else supported[index - 1]);
-                    try saveSettings(session);
+                    var next = session.settings.value;
+                    next.setCompactEffort(session.provider, if (index == 0) null else supported[index - 1]);
+                    _ = try changeSettings(session, next);
                 }
             },
             4 => {
@@ -1909,9 +1963,9 @@ fn pickSettings(session: *Session, reader: *Io.Reader) !void {
                 try session.output.print("{s}make subagent tools available to the model{s}\r\n", .{ term.dim(), term.reset() });
                 try session.output.flush();
                 if (try input_mod.pick(reader, session.output, &labels, initial)) |index| {
-                    session.settings.value.subagents_enabled = index == 0;
-                    try saveSettings(session);
-                    try applySubagentSettings(session);
+                    var next = session.settings.value;
+                    next.subagents_enabled = index == 0;
+                    _ = try changeSettings(session, next);
                 }
             },
             5 => {
@@ -1920,9 +1974,9 @@ fn pickSettings(session: *Session, reader: *Io.Reader) !void {
                 try session.output.print("{s}maximum subagent processes running at once{s}\r\n", .{ term.dim(), term.reset() });
                 try session.output.flush();
                 if (try input_mod.pick(reader, session.output, &labels, initial)) |index| {
-                    session.settings.value.subagent_max_concurrent = @intCast(index + 1);
-                    try saveSettings(session);
-                    try applySubagentSettings(session);
+                    var next = session.settings.value;
+                    next.subagent_max_concurrent = @intCast(index + 1);
+                    _ = try changeSettings(session, next);
                 }
             },
             6 => {
@@ -1931,9 +1985,9 @@ fn pickSettings(session: *Session, reader: *Io.Reader) !void {
                 try session.output.print("{s}default when Agent omits run_in_background{s}\r\n", .{ term.dim(), term.reset() });
                 try session.output.flush();
                 if (try input_mod.pick(reader, session.output, &labels, initial)) |index| {
-                    session.settings.value.subagent_default_background = index == 0;
-                    try saveSettings(session);
-                    try applySubagentSettings(session);
+                    var next = session.settings.value;
+                    next.subagent_default_background = index == 0;
+                    _ = try changeSettings(session, next);
                 }
             },
             7 => {
@@ -1942,9 +1996,9 @@ fn pickSettings(session: *Session, reader: *Io.Reader) !void {
                 try session.output.print("{s}show live subagents above the info bar (fullscreen){s}\r\n", .{ term.dim(), term.reset() });
                 try session.output.flush();
                 if (try input_mod.pick(reader, session.output, &labels, initial)) |index| {
-                    session.settings.value.subagent_panel = index == 0;
-                    try saveSettings(session);
-                    syncTui(session);
+                    var next = session.settings.value;
+                    next.subagent_panel = index == 0;
+                    _ = try changeSettings(session, next);
                 }
             },
             8 => {
@@ -1953,7 +2007,9 @@ fn pickSettings(session: *Session, reader: *Io.Reader) !void {
                 try session.output.print("{s}copy transcript selection on release; when off, press Ctrl-Y to copy{s}\r\n", .{ term.dim(), term.reset() });
                 try session.output.flush();
                 if (try input_mod.pick(reader, session.output, &labels, initial)) |index| {
-                    try setCopyOnSelect(session, index == 0);
+                    var next = session.settings.value;
+                    next.copy_on_select = index == 0;
+                    _ = try changeSettings(session, next);
                 }
             },
             else => unreachable,
