@@ -40,8 +40,14 @@ done
 [ -n "$output" ] && [ -n "$url" ] || exit 2
 printf '%s\n' "$url" >> "$REQUEST_LOG"
 case "$url" in
-    */manifest) cp "$FIXTURE_DIR/manifest" "$output" ;;
-    */xaq-linux-x86_64-*) cp "$FIXTURE_DIR/binary" "$output" ;;
+    */manifest)
+        [ "${CURL_FAIL:-}" != manifest ] || { printf partial > "$output"; exit 28; }
+        cp "$FIXTURE_DIR/manifest" "$output"
+        ;;
+    */xaq-linux-x86_64-*)
+        [ "${CURL_FAIL:-}" != binary ] || { printf partial > "$output"; exit 28; }
+        cp "$FIXTURE_DIR/binary" "$output"
+        ;;
     *) exit 22 ;;
 esac
 EOF
@@ -106,3 +112,34 @@ if PATH="$mock_bin:$PATH" FIXTURE_DIR="$fixture" REQUEST_LOG="$request_log" \
     fail 'installer accepted a malformed version digest'
 fi
 cmp "$scratch/expected-old" "$install_dir/xaq" >/dev/null || fail 'version failure replaced the existing executable'
+
+printf 'xaq-edge-v1 %s\nversion %s %s\nxaq-linux-x86_64 %s %s\n' \
+    "$git_sha" "$version" "$version_digest" "$asset" "$digest" > "$fixture/manifest"
+for destination in directory symlink; do
+    destination_dir="$scratch/$destination-install"
+    mkdir -p "$destination_dir"
+    if [ "$destination" = directory ]; then
+        mkdir "$destination_dir/xaq"
+    else
+        mkdir "$scratch/linked-directory"
+        ln -s "$scratch/linked-directory" "$destination_dir/xaq"
+    fi
+    if PATH="$mock_bin:$PATH" FIXTURE_DIR="$fixture" REQUEST_LOG="$request_log" \
+        XAQ_INSTALL_DIR="$destination_dir" sh "$repo/install.sh" > "$scratch/destination-output" 2>&1; then
+        fail "installer reported success with a $destination as the executable destination"
+    fi
+    [ -z "$(find "$destination_dir/xaq/" -mindepth 1 -print -quit)" ] || \
+        fail "installer moved an executable inside the $destination destination"
+    [ -z "$(find "$destination_dir" -maxdepth 1 -name '.xaq.*' -print -quit)" ] || \
+        fail 'failed install left a temporary executable'
+done
+
+mkdir "$scratch/downloads"
+for stage in manifest binary; do
+    if PATH="$mock_bin:$PATH" FIXTURE_DIR="$fixture" REQUEST_LOG="$request_log" CURL_FAIL="$stage" \
+        TMPDIR="$scratch/downloads" XAQ_INSTALL_DIR="$install_dir" sh "$repo/install.sh" >/dev/null 2>&1; then
+        fail "installer accepted a partial $stage after a download timeout"
+    fi
+    cmp "$scratch/expected-old" "$install_dir/xaq" >/dev/null || fail 'failed download replaced the executable'
+    [ -z "$(find "$scratch/downloads" -mindepth 1 -print -quit)" ] || fail 'failed download left temporary files'
+done

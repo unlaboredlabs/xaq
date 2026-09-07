@@ -26,6 +26,10 @@ cp "$repo/tools/publish-edge.sh" "$repo/tools/validate-edge-manifest.sh" "$work/
 cat > "$mock_bin/gh" <<'EOF'
 #!/bin/sh
 set -eu
+printf '%s\n' "$*" >> "$RELEASE_STORE/requests"
+if [ -n "${GH_MUTATE_PATH:-}" ]; then
+    printf 'changed while publishing\n' > "$GH_MUTATE_PATH"
+fi
 
 case "$1/$2" in
     release/view)
@@ -176,6 +180,32 @@ make_dist() {
     done
 }
 
+# A valid manifest must still describe the bytes being published. Fail before
+# creating releases or moving the channel if artifacts changed after prepare.
+bad_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+for corruption in binary archive missing commit; do
+    bad_dist="$work/bad-$corruption"
+    make_dist "$bad_dist" "$bad_sha" 0.1.0-edge.99
+    case "$corruption" in
+        binary) printf changed >> "$bad_dist/xaq-linux-x86_64-$bad_sha" ;;
+        archive) printf changed >> "$bad_dist/xaq-macos-aarch64-$bad_sha.tar.gz" ;;
+        missing) rm "$bad_dist/xaq-macos-x86_64-$bad_sha" ;;
+        commit)
+            sed 's/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/g' \
+                "$bad_dist/edge-manifest-$bad_sha" > "$bad_dist/other-manifest"
+            mv "$bad_dist/other-manifest" "$bad_dist/edge-manifest-$bad_sha"
+            ;;
+    esac
+    if (
+        cd "$work"
+        PATH="$mock_bin:$PATH" RELEASE_STORE="$store" \
+            tools/publish-edge.sh "$bad_dist" example/xaq "$bad_sha" 0.1.0-edge.99 > "$scratch/bad-output" 2>&1
+    ); then
+        fail "publication accepted $corruption inconsistent with its manifest"
+    fi
+    [ ! -f "$store/requests" ] || fail "invalid $corruption reached GitHub before validation"
+done
+
 old_sha=0123456789abcdef0123456789abcdef01234567
 new_sha=89abcdef0123456789abcdef0123456789abcdef
 edge_assets="$store/releases/edge/assets"
@@ -245,3 +275,20 @@ fi
 [ "$(git --git-dir="$remote" rev-parse refs/heads/edge-channel)" = "$old_ref" ] || \
     fail 'signaled publication moved the channel manifest'
 [ -z "$(find "$signal_temp" -mindepth 1 -print -quit)" ] || fail 'signaled publisher left its scratch directory'
+
+# Network calls must use the verified snapshot even if the input directory is
+# changed after preflight, including an asset uploaded later in the sequence.
+mutation_sha=cccccccccccccccccccccccccccccccccccccccc
+mutation_dist="$work/mutation-dist"
+make_dist "$mutation_dist" "$mutation_sha" 0.1.0-edge.4
+mutation_name="xaq-macos-aarch64-$mutation_sha.tar.gz"
+cp "$mutation_dist/$mutation_name" "$scratch/expected-mutation-asset"
+(
+    cd "$work"
+    PATH="$mock_bin:$PATH" RELEASE_STORE="$store" GH_MUTATE_PATH="$mutation_dist/$mutation_name" \
+        tools/publish-edge.sh "$mutation_dist" example/xaq "$mutation_sha" 0.1.0-edge.4 >/dev/null
+)
+for tag in edge v0.1.0-edge.4; do
+    cmp "$scratch/expected-mutation-asset" "$store/releases/$tag/assets/$mutation_name" >/dev/null || \
+        fail "$tag published bytes changed after preflight"
+done

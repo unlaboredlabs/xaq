@@ -14,13 +14,11 @@ version=$4
 channel_branch=edge-channel
 release_tag=edge
 version_tag="v$version"
-manifest="$dist/edge-manifest-$git_sha"
 
 [[ "$repository" == */* ]] || fail 'REPOSITORY must have owner/name form'
 [[ "$git_sha" =~ ^[0-9a-f]{40}$ ]] || fail 'GIT_SHA must contain 40 lowercase hexadecimal characters'
 [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-edge\.[1-9][0-9]*$ ]] || \
     fail 'VERSION must have semantic version form X.Y.Z-edge.N'
-tools/validate-edge-manifest.sh "$manifest" "$version"
 
 scratch=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/xaq-edge-publish.XXXXXX")
 cleanup() {
@@ -34,6 +32,35 @@ for platform in linux-x86_64 linux-aarch64 macos-x86_64 macos-aarch64; do
     assets+=("xaq-$platform-$git_sha" "xaq-$platform-$git_sha.tar.gz")
 done
 assets+=("edge-manifest-$git_sha")
+
+# Freeze and verify the complete set before creating releases. Comparing an
+# upload only with its source can publish stale manifest checksums if dist was
+# changed after preparation or while network requests were in progress.
+staged_dist="$scratch/staged"
+mkdir "$staged_dist"
+for name in "${assets[@]}"; do
+    [[ -f "$dist/$name" ]] || fail "missing release asset: $dist/$name"
+    cp "$dist/$name" "$staged_dist/$name"
+done
+manifest="$staged_dist/edge-manifest-$git_sha"
+tools/validate-edge-manifest.sh "$manifest" "$version"
+[[ "$(awk 'NR == 1 { print $2 }' "$manifest")" == "$git_sha" ]] || \
+    fail 'manifest commit differs from release commit'
+
+digest_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{ print $1 }'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{ print $1 }'
+    else
+        fail 'sha256sum or shasum is required'
+    fi
+}
+while read -r logical filename expected; do
+    [[ "$logical" == xaq-edge-v1 || "$logical" == version ]] && continue
+    [[ "$(digest_file "$staged_dist/$filename")" == "$expected" ]] || \
+        fail "release asset checksum differs from manifest: $filename"
+done < "$manifest"
 
 version_notes="Edge build from main at $git_sha. The floating edge channel points to the newest promoted build."
 if version_draft=$(gh release view "$version_tag" --repo "$repository" \
@@ -58,7 +85,7 @@ upload_and_verify() {
     local name local_asset
     mkdir -p "$remote_dir"
     for name in "${assets[@]}"; do
-        local_asset="$dist/$name"
+        local_asset="$staged_dist/$name"
         [[ -f "$local_asset" ]] || fail "missing release asset: $local_asset"
         if gh release download "$tag" --repo "$repository" --pattern "$name" \
             --dir "$remote_dir" >/dev/null 2>&1; then

@@ -24,3 +24,4 @@ git_sha=0123456789abcdef0123456789abcdef01234567
 zig build --build-file "$repo/build.zig" -Dversion="$version" -Dgit-sha="$git_sha" --prefix "$scratch/install"
 reported=$("$scratch/install/bin/xaq" --version)
 [ "$reported" = "xaq $version" ] || fail "binary reported $reported"
+sh "$repo/tests/update_test.sh" "$scratch/install/bin/xaq" "$git_sha"

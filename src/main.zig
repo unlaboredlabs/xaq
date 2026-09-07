@@ -414,6 +414,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
                 error.MalformedManifest => "the edge manifest is malformed",
                 error.MissingAsset => "the edge manifest has no entry for this platform",
                 error.ChecksumMismatch => "the downloaded edge binary failed checksum verification",
+                error.ExecutableChanged => "the executable changed during download; run update again",
                 error.PermissionDenied, error.ReadOnlyFileSystem => "cannot replace this executable; check its directory permissions",
                 else => @errorName(err),
             };
