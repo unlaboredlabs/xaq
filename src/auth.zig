@@ -3,6 +3,7 @@ const Io = std.Io;
 const cancel = @import("cancel.zig");
 const input_mod = @import("input.zig");
 const spin = @import("spin.zig");
+const settings = @import("settings.zig");
 const term = @import("term.zig");
 const transport = @import("transport.zig");
 
@@ -191,27 +192,7 @@ fn load(gpa: std.mem.Allocator, io: Io, home: []const u8) !Store {
 fn saveUnlocked(gpa: std.mem.Allocator, io: Io, home: []const u8, store: Store) !void {
     const path = try authPath(gpa, home);
     defer gpa.free(path);
-    if (std.fs.path.dirname(path)) |parent| try Io.Dir.cwd().createDirPath(io, parent);
-    var out: Io.Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    try std.json.Stringify.value(store, .{ .whitespace = .indent_2 }, &out.writer);
-    try out.writer.writeByte('\n');
-    var random: [8]u8 = undefined;
-    try io.randomSecure(&random);
-    const hex = std.fmt.bytesToHex(random, .lower);
-    const temporary = try std.fmt.allocPrint(gpa, "{s}.tmp-{s}", .{ path, &hex });
-    defer gpa.free(temporary);
-    errdefer Io.Dir.cwd().deleteFile(io, temporary) catch {};
-    try Io.Dir.cwd().writeFile(io, .{
-        .sub_path = temporary,
-        .data = out.written(),
-        .flags = .{ .exclusive = true, .permissions = @enumFromInt(0o600) },
-    });
-    var file = try Io.Dir.cwd().openFile(io, temporary, .{ .mode = .read_write });
-    defer file.close(io);
-    try file.setPermissions(io, @enumFromInt(0o600));
-    try file.sync(io);
-    try Io.Dir.renameAbsolute(temporary, path, io);
+    try settings.saveJsonFile(gpa, io, path, store);
 }
 
 fn put(gpa: std.mem.Allocator, io: Io, home: []const u8, provider: Provider, value: Credential) !void {
@@ -228,11 +209,18 @@ fn authLock(gpa: std.mem.Allocator, io: Io, home: []const u8) !Io.File {
     try Io.Dir.cwd().createDirPath(io, directory);
     const path = try std.fs.path.join(gpa, &.{ directory, "auth.lock" });
     defer gpa.free(path);
-    return Io.Dir.cwd().createFile(io, path, .{
+    var file = try Io.Dir.cwd().createFile(io, path, .{
         .truncate = false,
-        .lock = .exclusive,
         .permissions = @enumFromInt(0o600),
     });
+    errdefer file.close(io);
+    while (true) {
+        // Another session may hold this lock throughout a token refresh.
+        // Poll without blocking Ctrl-C behind its network request.
+        if (cancel.requested()) return error.Cancelled;
+        if (try file.tryLock(io, .exclusive)) return file;
+        try cancel.processToken().sleep(io, .fromMilliseconds(50));
+    }
 }
 
 fn get(store: Store, provider: Provider) ?Credential {
@@ -290,36 +278,47 @@ fn string(value: std.json.Value, key: []const u8) ![]const u8 {
     };
 }
 
-fn number(value: std.json.Value, key: []const u8, fallback: i64) i64 {
+fn number(value: std.json.Value, key: []const u8, fallback: i64) !i64 {
     const item = switch (value) {
         .object => |o| o.get(key) orelse return fallback,
         else => return fallback,
     };
     return switch (item) {
         .integer => |n| n,
-        .float => |n| @intFromFloat(n),
-        .string => |n| std.fmt.parseInt(i64, n, 10) catch fallback,
-        else => fallback,
+        .float => |n| if (std.math.isFinite(n) and n >= -0x1p63 and n < 0x1p63 and @floor(n) == n)
+            @intFromFloat(n)
+        else
+            error.InvalidTokenResponse,
+        .string, .number_string => |n| std.fmt.parseInt(i64, n, 10) catch error.InvalidTokenResponse,
+        else => error.InvalidTokenResponse,
     };
 }
 
 fn tokenCredential(gpa: std.mem.Allocator, io: Io, body: []const u8, old_refresh: ?[]const u8) !Credential {
     var parsed = try parseJson(gpa, body);
     defer parsed.deinit();
-    const access = try gpa.dupe(u8, try string(parsed.value, "access_token"));
+    const access_text = try string(parsed.value, "access_token");
     const refresh_token = if (switch (parsed.value) {
         .object => |o| o.get("refresh_token"),
         else => null,
     }) |v|
-        try gpa.dupe(u8, switch (v) {
+        switch (v) {
             .string => |s| s,
             else => return error.InvalidTokenResponse,
-        })
-    else if (old_refresh) |old| try gpa.dupe(u8, old) else return error.InvalidTokenResponse;
+        }
+    else if (old_refresh) |old| old else return error.InvalidTokenResponse;
+    if (access_text.len == 0 or refresh_token.len == 0) return error.InvalidTokenResponse;
+    const lifetime = try number(parsed.value, "expires_in", 3600);
+    if (lifetime <= 0) return error.InvalidTokenResponse;
+    const expires = std.math.add(i64, Io.Clock.real.now(io).toSeconds(), lifetime) catch return error.InvalidTokenResponse;
+    const access = try gpa.dupe(u8, access_text);
+    errdefer gpa.free(access);
     return .{
         .access = access,
-        .refresh = refresh_token,
-        .expires = Io.Clock.real.now(io).toSeconds() + number(parsed.value, "expires_in", 3600) - 300,
+        .refresh = try gpa.dupe(u8, refresh_token),
+        // Readers already refresh one minute early. Subtracting a second
+        // margin here made short-lived tokens expire as soon as they arrived.
+        .expires = expires,
     };
 }
 
@@ -523,10 +522,12 @@ fn loginGrok(gpa: std.mem.Allocator, io: Io, output: *Io.Writer) !Credential {
     try requireStatus(gpa, response, output, null);
     var parsed = try parseJson(gpa, response.body);
     defer parsed.deinit();
-    const device = try gpa.dupe(u8, try string(parsed.value, "device_code"));
+    const device = try string(parsed.value, "device_code");
     const user = try string(parsed.value, "user_code");
     const uri = try string(parsed.value, "verification_uri");
-    const interval = number(parsed.value, "interval", 5);
+    const expires = try deviceLoginDeadline(parsed.value, Io.Clock.boot.now(io));
+    var interval = try number(parsed.value, "interval", 5);
+    if (interval <= 0) return error.InvalidTokenResponse;
     openBrowser(gpa, io, uri);
     try output.print("Open {s} and enter: {s}\n", .{ uri, user });
     // The spinner is a no-op without styling (NO_COLOR, dumb terminals,
@@ -535,20 +536,27 @@ fn loginGrok(gpa: std.mem.Allocator, io: Io, output: *Io.Writer) !Credential {
     try output.flush();
     spin.start(io, "waiting for approval");
     defer spin.stop();
+    const poll_body = try transport.formEncode(gpa, &.{
+        .{ "grant_type", "urn:ietf:params:oauth:grant-type:device_code" }, .{ "client_id", xai_client }, .{ "device_code", device },
+    });
+    defer gpa.free(poll_body);
     while (true) {
-        try waitForLoginPoll(io, interval);
-        const poll_body = try transport.formEncode(gpa, &.{
-            .{ "grant_type", "urn:ietf:params:oauth:grant-type:device_code" }, .{ "client_id", xai_client }, .{ "device_code", device },
-        });
-        defer gpa.free(poll_body);
+        waitForLoginPoll(io, interval, expires) catch |err| {
+            if (err != error.DeviceAuthorizationExpired) return err;
+            spin.stop();
+            try output.writeAll("Device login code expired; run xaq login grok again.\n");
+            try output.flush();
+            return error.ProviderRequestFailed;
+        };
         try checkLoginCancellation();
         const poll = try transport.post(gpa, io, "https://auth.x.ai/oauth2/token", "application/x-www-form-urlencoded", &.{}, poll_body);
         defer gpa.free(poll.body);
         if (poll.status >= 200 and poll.status < 300) return tokenCredential(gpa, io, poll.body, null);
-        var problem = parseJson(gpa, poll.body) catch continue;
-        defer problem.deinit();
-        const kind = string(problem.value, "error") catch continue;
-        if (std.mem.eql(u8, kind, "authorization_pending") or std.mem.eql(u8, kind, "slow_down")) continue;
+        if (try devicePollInterval(gpa, poll.body, interval)) |next| {
+            interval = next;
+            continue;
+        }
+        spin.stop();
         try requireStatus(gpa, poll, output, null);
     }
 }
@@ -557,8 +565,39 @@ fn checkLoginCancellation() !void {
     if (cancel.requested()) return error.Cancelled;
 }
 
-fn waitForLoginPoll(io: Io, seconds: i64) !void {
-    try cancel.processToken().sleep(io, .fromSeconds(std.math.clamp(seconds, 1, 60)));
+fn deviceLoginDeadline(response: std.json.Value, now: Io.Timestamp) !Io.Timestamp {
+    const seconds = try number(response, "expires_in", 0);
+    if (seconds <= 0) return error.InvalidTokenResponse;
+    return now.addDuration(.fromSeconds(seconds));
+}
+
+// RFC 8628 section 3.5: only these two errors permit another poll. Every
+// slow_down adds five seconds for this and all subsequent requests.
+fn devicePollInterval(gpa: std.mem.Allocator, body: []const u8, current: i64) !?i64 {
+    var problem = parseJson(gpa, body) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
+    defer problem.deinit();
+    const kind = string(problem.value, "error") catch return null;
+    if (std.mem.eql(u8, kind, "authorization_pending")) return current;
+    if (std.mem.eql(u8, kind, "slow_down")) return current +| 5;
+    return null;
+}
+
+fn waitForLoginPoll(io: Io, seconds: i64, expires: Io.Timestamp) !void {
+    const next_poll = Io.Clock.boot.now(io).addDuration(.fromSeconds(seconds));
+    while (true) {
+        try checkLoginCancellation();
+        const now = Io.Clock.boot.now(io);
+        const remaining = now.durationTo(expires).nanoseconds;
+        if (remaining <= 0) return error.DeviceAuthorizationExpired;
+        const delay = now.durationTo(next_poll).nanoseconds;
+        if (delay <= 0) return;
+        // Include suspended time in the expiry check, and do not sleep past
+        // expiry when the provider's interval exceeds the code's lifetime.
+        try io.sleep(.fromNanoseconds(@min(@min(delay, remaining), 50 * std.time.ns_per_ms)), .awake);
+    }
 }
 
 fn refresh(gpa: std.mem.Allocator, io: Io, provider: Provider, old: Credential, diagnostic: ?*Diagnostic) !Credential {
@@ -622,7 +661,7 @@ test "guided login wait responds to cancellation" {
     var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
     defer threaded.deinit();
     var future = try threaded.io().concurrent(Request.run, .{threaded.io()});
-    try std.testing.expectError(error.Cancelled, waitForLoginPoll(threaded.io(), 5));
+    try std.testing.expectError(error.Cancelled, waitForLoginPoll(threaded.io(), 5, Io.Clock.boot.now(threaded.io()).addDuration(.fromSeconds(60))));
     future.await(threaded.io());
 }
 
@@ -729,4 +768,110 @@ test "credential strings outlive auth file buffer" {
     @memset(overwrite, 'x');
     try std.testing.expectEqualStrings("access-token", store.chatgpt.?.access);
     try std.testing.expectEqualStrings("account-id", store.chatgpt.?.account_id.?);
+}
+
+test "token responses reject malformed lifetimes without leaking credentials" {
+    const gpa = std.testing.allocator;
+    const invalid = [_][]const u8{
+        "{\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"expires_in\":1e300}",
+        "{\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"expires_in\":9223372036854775807}",
+        "{\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"expires_in\":-1}",
+        "{\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"expires_in\":1.5}",
+        "{\"access_token\":\"access\",\"refresh_token\":\"refresh\",\"expires_in\":\"invalid\"}",
+        "{\"access_token\":\"access\",\"refresh_token\":false}",
+        "{\"access_token\":\"access\"}",
+        "{\"access_token\":\"\",\"refresh_token\":\"refresh\"}",
+    };
+    for (invalid) |body| try std.testing.expectError(error.InvalidTokenResponse, tokenCredential(gpa, std.testing.io, body, null));
+    const before = Io.Clock.real.now(std.testing.io).toSeconds();
+    const short = try tokenCredential(gpa, std.testing.io, "{\"access_token\":\"access\",\"expires_in\":120}", "old-refresh");
+    defer gpa.free(short.access);
+    defer gpa.free(short.refresh);
+    try std.testing.expectEqualStrings("old-refresh", short.refresh);
+    try std.testing.expect(short.expires >= before + 120);
+    try std.testing.expect(short.expires > Io.Clock.real.now(std.testing.io).toSeconds() + 60);
+}
+
+test "waiting for another sessions token refresh can be cancelled" {
+    const Request = struct {
+        fn run(io: Io) void {
+            io.sleep(.fromMilliseconds(20), .awake) catch return;
+            cancel.processToken().request();
+        }
+    };
+    const gpa = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const home = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{temporary.sub_path});
+    defer gpa.free(home);
+    cancel.reset();
+    defer cancel.reset();
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    {
+        var held = try authLock(gpa, io, home);
+        defer held.close(io);
+        var future = try io.concurrent(Request.run, .{io});
+        defer future.await(io);
+        const started = Io.Clock.now(.awake, io);
+        try std.testing.expectError(error.Cancelled, authLock(gpa, io, home));
+        try std.testing.expect(started.durationTo(Io.Clock.now(.awake, io)).nanoseconds < 2 * std.time.ns_per_s);
+    }
+    cancel.reset();
+    var acquired = try authLock(gpa, io, home);
+    acquired.close(io);
+}
+
+test "device login polling backs off only for retryable OAuth errors" {
+    const gpa = std.testing.allocator;
+    var interval: i64 = 5;
+    interval = (try devicePollInterval(gpa, "{\"error\":\"slow_down\"}", interval)).?;
+    try std.testing.expectEqual(@as(i64, 10), interval);
+    interval = (try devicePollInterval(gpa, "{\"error\":\"authorization_pending\"}", interval)).?;
+    try std.testing.expectEqual(@as(i64, 10), interval);
+    interval = (try devicePollInterval(gpa, "{\"error\":\"slow_down\"}", interval)).?;
+    try std.testing.expectEqual(@as(i64, 15), interval);
+    try std.testing.expectEqual(@as(?i64, 65), try devicePollInterval(gpa, "{\"error\":\"slow_down\"}", 60));
+    for ([_][]const u8{ "<html>gateway failed</html>", "{}", "{\"error\":false}", "{\"error\":\"access_denied\"}", "{\"error\":\"expired_token\"}", "{\"error\":\"invalid_client\"}" }) |body| {
+        try std.testing.expectEqual(null, try devicePollInterval(gpa, body, interval));
+    }
+}
+
+test "device login expires during polling waits and honors intervals above one minute" {
+    const Clock = struct {
+        now_ns: i96 = 0,
+        fn now(raw: ?*anyopaque, _: Io.Clock) Io.Timestamp {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return .{ .nanoseconds = self.now_ns };
+        }
+        fn sleep(raw: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.now_ns += timeout.duration.raw.nanoseconds;
+        }
+    };
+    cancel.reset();
+    defer cancel.reset();
+    var clock: Clock = .{};
+    var vtable = std.testing.io.vtable.*;
+    vtable.now = Clock.now;
+    vtable.sleep = Clock.sleep;
+    const io: Io = .{ .userdata = &clock, .vtable = &vtable };
+    var parsed = try parseJson(std.testing.allocator, "{\"expires_in\":90}");
+    defer parsed.deinit();
+    const deadline = try deviceLoginDeadline(parsed.value, Io.Clock.boot.now(io));
+    try std.testing.expectEqual(@as(i64, 5), try number(parsed.value, "interval", 5));
+    try waitForLoginPoll(io, 65, deadline);
+    try std.testing.expectEqual(@as(i96, 65 * std.time.ns_per_s), clock.now_ns);
+    try std.testing.expectError(error.DeviceAuthorizationExpired, waitForLoginPoll(io, 65, deadline));
+    try std.testing.expectEqual(@as(i96, 90 * std.time.ns_per_s), clock.now_ns);
+    // Already-expired codes issue no new sleep or poll, including after suspend.
+    clock.now_ns = 200 * std.time.ns_per_s;
+    try std.testing.expectError(error.DeviceAuthorizationExpired, waitForLoginPoll(io, 5, deadline));
+    try std.testing.expectEqual(@as(i96, 200 * std.time.ns_per_s), clock.now_ns);
+    for ([_][]const u8{ "{}", "{\"expires_in\":0}", "{\"expires_in\":-1}" }) |body| {
+        var invalid = try parseJson(std.testing.allocator, body);
+        defer invalid.deinit();
+        try std.testing.expectError(error.InvalidTokenResponse, deviceLoginDeadline(invalid.value, .{ .nanoseconds = 0 }));
+    }
 }
