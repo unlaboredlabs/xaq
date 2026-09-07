@@ -40,11 +40,23 @@ pub const Thread = struct {
     /// given entries. Used for compaction snapshots: append-reset-then-
     /// re-append was neither atomic nor bounded, so a mid-write failure
     /// truncated replayable history and long sessions grew the file
-    /// without limit.
+    /// without limit. Stream the snapshot so large histories do not need
+    /// another full copy in memory.
     pub fn rewrite(self: *Thread, provider: auth.Provider, model: []const u8, effort: ?[]const u8, fast: bool, cwd: []const u8, entries: []const types.Entry) !void {
-        var out: Io.Writer.Allocating = .init(self.gpa);
-        defer out.deinit();
-        var js: std.json.Stringify = .{ .writer = &out.writer };
+        var random: [8]u8 = undefined;
+        try self.io.randomSecure(&random);
+        const hex = std.fmt.bytesToHex(random, .lower);
+        const temporary = try std.fmt.allocPrint(self.gpa, "{s}.tmp-{s}", .{ self.path, &hex });
+        defer self.gpa.free(temporary);
+        const file = try Io.Dir.cwd().createFile(self.io, temporary, .{
+            .exclusive = true,
+            .permissions = @enumFromInt(0o600),
+        });
+        defer file.close(self.io);
+        errdefer Io.Dir.cwd().deleteFile(self.io, temporary) catch {};
+        var buffer: [16 * 1024]u8 = undefined;
+        var out: Io.File.Writer = .init(file, self.io, &buffer);
+        var js: std.json.Stringify = .{ .writer = &out.interface };
         try js.beginObject();
         try field(&js, "type", "meta");
         try field(&js, "id", self.id);
@@ -55,22 +67,12 @@ pub const Thread = struct {
         try js.write(fast);
         try field(&js, "cwd", cwd);
         try js.endObject();
-        try out.writer.writeByte('\n');
+        try out.interface.writeByte('\n');
         for (entries) |entry| {
-            js = .{ .writer = &out.writer };
-            try writeEntryLine(&js, &out.writer, entry);
+            js = .{ .writer = &out.interface };
+            try writeEntryLine(&js, &out.interface, entry);
         }
-        var random: [8]u8 = undefined;
-        try self.io.randomSecure(&random);
-        const hex = std.fmt.bytesToHex(random, .lower);
-        const temporary = try std.fmt.allocPrint(self.gpa, "{s}.tmp-{s}", .{ self.path, &hex });
-        defer self.gpa.free(temporary);
-        errdefer Io.Dir.cwd().deleteFile(self.io, temporary) catch {};
-        try Io.Dir.cwd().writeFile(self.io, .{
-            .sub_path = temporary,
-            .data = out.written(),
-            .flags = .{ .exclusive = true, .permissions = @enumFromInt(0o600) },
-        });
+        try out.interface.flush();
         try Io.Dir.cwd().rename(temporary, Io.Dir.cwd(), self.path, self.io);
     }
 
@@ -1085,6 +1087,96 @@ test "thread previews truncate UTF-8 safely for either JSON field order" {
         try std.testing.expectEqual(@as(usize, 1), summaries.len);
         try std.testing.expectEqualStrings(prefix, summaries[0].preview);
     }
+}
+
+test "thread rewrite streams large snapshots with bounded allocation" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const home = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path});
+    defer std.testing.allocator.free(home);
+    const cwd = "/work/snapshot";
+    const image_data = try std.testing.allocator.alloc(u8, 256 * 1024);
+    defer std.testing.allocator.free(image_data);
+    @memset(image_data, 'A');
+    const entries = [_]types.Entry{
+        .{ .user = .{ .text = "look\n\"here\"", .images = &.{.{ .name = "shot.png", .media_type = "image/png", .data = image_data }} } },
+        .{ .assistant = .{
+            .text = "reading",
+            .calls = &.{.{ .id = "call-1", .name = "read", .arguments = "{\"path\":\"note.txt\"}" }},
+            .raw_items = &.{"{\"type\":\"reasoning\"}"},
+            .usage = .{ .input = 123, .cached = 45, .output = 6 },
+        } },
+        .{ .results = &.{.{ .id = "call-1", .text = "file contents" }} },
+    };
+    const id = blk: {
+        var thread = try create(std.testing.allocator, std.testing.io, home, cwd, .chatgpt, "old-model", null, false);
+        defer thread.deinit();
+        try thread.appendEntry(.{ .user = .{ .text = "discarded history" } });
+        // Only the temporary filename needs heap space, regardless of the
+        // serialized history size. The borrowed thread uses that bounded heap.
+        var heap: [512]u8 = undefined;
+        var bounded = std.heap.FixedBufferAllocator.init(&heap);
+        var snapshot = thread;
+        snapshot.gpa = bounded.allocator();
+        try snapshot.rewrite(.claude, "new-model", "high", true, cwd, &entries);
+        break :blk try std.testing.allocator.dupe(u8, thread.id);
+    };
+    defer std.testing.allocator.free(id);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var loaded = try load(std.testing.allocator, arena.allocator(), std.testing.io, home, cwd, id, null);
+    defer loaded.thread.deinit();
+    try std.testing.expectEqual(auth.Provider.claude, loaded.provider);
+    try std.testing.expectEqualStrings("new-model", loaded.model);
+    try std.testing.expectEqualStrings("high", loaded.effort.?);
+    try std.testing.expect(loaded.fast);
+    try std.testing.expectEqualDeep(@as([]const types.Entry, &entries), loaded.entries.items);
+    const stat = try Io.Dir.cwd().statFile(std.testing.io, loaded.thread.path, .{});
+    try std.testing.expectEqual(@as(std.posix.mode_t, 0o600), stat.permissions.toMode() & 0o777);
+}
+
+test "thread rewrite preserves history and removes partial snapshots on write failure" {
+    const FailAfterFirstWrite = struct {
+        fn write(userdata: ?*anyopaque, file: Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) Io.File.WritePositionalError!usize {
+            if (offset != 0) return error.NoSpaceLeft;
+            return std.testing.io.vtable.fileWritePositional(userdata, file, header, data, splat, offset);
+        }
+    };
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const home = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path});
+    defer std.testing.allocator.free(home);
+    const cwd = "/work/failed-snapshot";
+    var thread = try create(std.testing.allocator, std.testing.io, home, cwd, .chatgpt, "old-model", null, false);
+    defer thread.deinit();
+    try thread.appendEntry(.{ .user = .{ .text = "saved history" } });
+    const before = try Io.Dir.cwd().readFileAlloc(std.testing.io, thread.path, std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(before);
+
+    const text = try std.testing.allocator.alloc(u8, 32 * 1024);
+    defer std.testing.allocator.free(text);
+    @memset(text, 'a');
+    var vtable = std.testing.io.vtable.*;
+    vtable.fileWritePositional = FailAfterFirstWrite.write;
+    var snapshot = thread;
+    snapshot.io.vtable = &vtable;
+    try std.testing.expectError(error.WriteFailed, snapshot.rewrite(.claude, "new-model", null, false, cwd, &.{.{ .user = .{ .text = text } }}));
+
+    const after = try Io.Dir.cwd().readFileAlloc(std.testing.io, thread.path, std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(after);
+    try std.testing.expectEqualStrings(before, after);
+    var dir = try Io.Dir.cwd().openDir(std.testing.io, std.fs.path.dirname(thread.path).?, .{ .iterate = true });
+    defer dir.close(std.testing.io);
+    var iterator = dir.iterate();
+    const lock_name = try std.fmt.allocPrint(std.testing.allocator, "{s}.lock", .{std.fs.path.basename(thread.path)});
+    defer std.testing.allocator.free(lock_name);
+    var file_count: usize = 0;
+    while (try iterator.next(std.testing.io)) |entry| {
+        try std.testing.expect(std.mem.eql(u8, std.fs.path.basename(thread.path), entry.name) or std.mem.eql(u8, lock_name, entry.name));
+        file_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), file_count);
 }
 
 test "thread loader streams files larger than the former aggregate cap" {
