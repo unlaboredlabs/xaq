@@ -17,7 +17,10 @@ BINARY = str(Path(sys.argv.pop(1) if len(sys.argv) > 1 else "zig-out/bin/xaq").r
 PROVIDERS = ("chatgpt", "claude", "grok")
 FAKE_CURL = r'''#!/usr/bin/env python3
 import json, os, pathlib, sys
-sys.stdin.read()
+config = sys.stdin.read()
+data_line = next(line for line in config.splitlines() if line.startswith("data-binary = "))
+request_path = json.loads(data_line.split("=", 1)[1].strip())[1:]
+body = json.loads(pathlib.Path(request_path).read_text())
 with open(os.environ["XAQ_TEST_REQUESTS"], "a") as requests:
     requests.write("request\n")
 mode = os.environ["XAQ_TEST_MODE"]
@@ -28,6 +31,42 @@ sys.stdout.write("HTTP/1.1 200 OK\nContent-Type: text/event-stream\n\n")
 def event(value):
     print("data: " + json.dumps(value) + "\n")
 claude = os.environ["XAQ_TEST_PROVIDER"] == "claude"
+if mode in ("binary_read", "binary_bash", "binary_read_large"):
+    entries = body["messages" if claude else "input"]
+    results = ([block["content"] for entry in entries
+                for block in (entry["content"] if isinstance(entry.get("content"), list) else [])
+                if block.get("type") == "tool_result"] if claude else
+               [entry["output"] for entry in entries if entry.get("type") == "function_call_output"])
+    if results:
+        if mode == "binary_read_large":
+            assert len(results) == 1 and isinstance(results[0], str)
+            assert len(results[0].encode("utf-8")) <= 50 * 1024
+            assert results[0].endswith("\n[tool result truncated]")
+        else:
+            assert results == ["before\ufffdafter"], repr(results)
+        mode = "completed"
+    else:
+        name = "read" if mode.startswith("binary_read") else "bash"
+        arguments = json.dumps({"path":os.environ["XAQ_TEST_BINARY"]} if name == "read" else
+                               {"command":"printf 'before\\377after'"})
+        if claude:
+            event({"type":"content_block_start", "index":0,
+                   "content_block":{"type":"tool_use", "id":"call_1", "name":name, "input":{}}})
+            event({"type":"content_block_delta", "index":0,
+                   "delta":{"type":"input_json_delta", "partial_json":arguments}})
+            event({"type":"message_stop"})
+        else:
+            event({"type":"response.output_item.done", "item":{"type":"function_call",
+                   "call_id":"call_1", "name":name, "arguments":arguments}})
+            event({"type":"response.completed", "response":{"usage":{}}})
+        sys.exit(0)
+if mode == "binary_stdin":
+    entries = body["messages" if claude else "input"]
+    user = next(entry for entry in entries if entry.get("role") == "user")
+    content = user["content"]
+    text = content if isinstance(content, str) else content[0]["text"]
+    assert text == "before\ufffdafter", repr(text)
+    mode = "completed"
 if mode != "tool_only":
     event({"type":"content_block_delta", "index":0,
            "delta":{"type":"text_delta", "text":"answer"}} if claude else
@@ -65,12 +104,15 @@ class CliTests(unittest.TestCase):
         curl.chmod(0o755)
         self.requests = self.work / "requests"
         self.marker = self.work / "must-not-run"
+        binary_file = self.work / "binary.txt"
+        binary_file.write_bytes(b"before\xffafter")
         self.environment = os.environ.copy()
         self.environment.update({
             "HOME": str(self.home),
             "PATH": str(fake_bin) + os.pathsep + self.environment["PATH"],
             "XAQ_TEST_REQUESTS": str(self.requests),
             "XAQ_TEST_MARKER": str(self.marker),
+            "XAQ_TEST_BINARY": str(binary_file),
         })
 
     def start(self, provider, mode, resume=None):
@@ -122,6 +164,37 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(result["stop_reason"], "stream_interrupted")
                 self.assertEqual(result["tool_calls"], 0)
                 self.assertFalse(self.marker.exists())
+
+    def test_binary_tool_output_remains_provider_text(self):
+        for provider in PROVIDERS:
+            for mode in ("binary_read", "binary_bash"):
+                with self.subTest(provider=provider, mode=mode):
+                    process = self.start(provider, mode)
+                    stdout, stderr = process.communicate(timeout=10)
+                    self.assertEqual(process.returncode, 0, stderr)
+                    result = json.loads(stdout)
+                    self.assertEqual(result["text"], "answer")
+                    self.assertEqual(result["tool_calls"], 1)
+
+    def test_non_utf8_stdin_remains_provider_text(self):
+        for provider in PROVIDERS:
+            with self.subTest(provider=provider):
+                completed = subprocess.run(
+                    [BINARY, "--provider", provider, "--no-save", "--output-format", "json"],
+                    cwd=self.work,
+                    env=self.environment | {"XAQ_TEST_PROVIDER": provider, "XAQ_TEST_MODE": "binary_stdin"},
+                    input=b"before\xffafter", stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(json.loads(completed.stdout)["text"], "answer")
+
+    def test_replacement_characters_do_not_expand_tool_budget(self):
+        Path(self.environment["XAQ_TEST_BINARY"]).write_bytes(b"\xff" * (50 * 1024))
+        for provider in PROVIDERS:
+            with self.subTest(provider=provider):
+                process = self.start(provider, "binary_read_large")
+                stdout, stderr = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0, stderr)
+                self.assertEqual(json.loads(stdout)["tool_calls"], 1)
 
     def test_tool_only_interruption_retries_and_fails(self):
         for provider in ("chatgpt", "claude"):

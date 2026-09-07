@@ -373,7 +373,7 @@ pub const Agent = struct {
             .data = try prompt_allocator.dupe(u8, image.data),
         };
         try self.entries.append(self.arena.allocator(), .{ .user = .{
-            .text = try prompt_allocator.dupe(u8, text),
+            .text = try types.dupeText(prompt_allocator, text),
             .images = images,
         } });
 
@@ -609,13 +609,7 @@ pub const Agent = struct {
             break :blk try std.fmt.allocPrint(allocator, "tool error: {s}", .{@errorName(err)});
         };
         if (self.cancellation.isRequested()) return error.Cancelled;
-        if (result.len <= tool_runtime.max_output) return persist.dupe(u8, result);
-        const suffix = "\n[host tool result truncated]";
-        const keep = tool_runtime.max_output - suffix.len;
-        var bounded: Io.Writer.Allocating = .init(persist);
-        try bounded.writer.writeAll(result[0..keep]);
-        try bounded.writer.writeAll(suffix);
-        return bounded.toOwnedSlice();
+        return tool_runtime.resultText(persist, result);
     }
 };
 
@@ -731,7 +725,7 @@ fn cloneEntry(gpa: std.mem.Allocator, entry: Entry) !Entry {
                 .media_type = try gpa.dupe(u8, image.media_type),
                 .data = try gpa.dupe(u8, image.data),
             };
-            break :blk .{ .user = .{ .text = try gpa.dupe(u8, user.text), .images = images } };
+            break :blk .{ .user = .{ .text = try types.dupeText(gpa, user.text), .images = images } };
         },
         .assistant => |answer| blk: {
             const calls = try gpa.alloc(ToolCall, answer.calls.len);
@@ -743,7 +737,7 @@ fn cloneEntry(gpa: std.mem.Allocator, entry: Entry) !Entry {
             const raw_items = try gpa.alloc([]const u8, answer.raw_items.len);
             for (answer.raw_items, 0..) |item, index| raw_items[index] = try gpa.dupe(u8, item);
             break :blk .{ .assistant = .{
-                .text = try gpa.dupe(u8, answer.text),
+                .text = try types.dupeText(gpa, answer.text),
                 .calls = calls,
                 .raw_items = raw_items,
                 .usage = answer.usage,
@@ -753,7 +747,7 @@ fn cloneEntry(gpa: std.mem.Allocator, entry: Entry) !Entry {
             const results = try gpa.alloc(ToolResult, old.len);
             for (old, 0..) |result, index| results[index] = .{
                 .id = try gpa.dupe(u8, result.id),
-                .text = try gpa.dupe(u8, result.text),
+                .text = try types.dupeText(gpa, result.text),
             };
             break :blk .{ .results = results };
         },
@@ -811,6 +805,50 @@ test "embedded agent streams, runs a host tool, and keeps history" {
     try std.testing.expectEqual(@as(usize, 1), turn.tool_calls);
     try std.testing.expectEqual(@as(usize, 4), embedded.history().len);
     try std.testing.expectEqual(@as(u64, 10), turn.usage.input);
+}
+
+test "host tool text stays UTF-8 and bounded before provider serialization" {
+    const Fake = struct {
+        bytes: []const u8,
+
+        fn tool(raw: ?*anyopaque, gpa: std.mem.Allocator, _: Io, _: ToolCall, _: std.json.Value, _: *Cancellation) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            return gpa.dupe(u8, self.bytes);
+        }
+    };
+    const oversized = try std.testing.allocator.alloc(u8, tool_runtime.max_output + 20);
+    defer std.testing.allocator.free(oversized);
+    @memset(oversized, 0xff);
+    const multibyte = "\u{1f600}" ** (tool_runtime.max_output / 4 + 1);
+    for ([_][]const u8{ "before\xffafter", oversized, multibyte }) |bytes| {
+        var fake: Fake = .{ .bytes = bytes };
+        var embedded = try Agent.init(std.testing.allocator, .{
+            .io = std.testing.io,
+            .cwd = "/workspace",
+            .credential = .{ .access = "test", .refresh = "test", .expires = 0 },
+            .tools = &.{.{ .name = "lookup", .description = "Look up data.", .parameters_json = "{\"type\":\"object\"}" }},
+            .tool_host = .{ .context = &fake, .execute = Fake.tool },
+        });
+        defer embedded.deinit();
+        var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+        defer arena.deinit();
+        const result = try embedded.executeTool(.{ .id = "call_1", .name = "lookup", .arguments = "{}" }, arena.allocator());
+        try std.testing.expect(std.unicode.utf8ValidateSlice(result));
+        try std.testing.expect(result.len <= tool_runtime.max_output);
+        if (bytes.len > tool_runtime.max_output) {
+            try std.testing.expect(std.mem.endsWith(u8, result, "\n[tool result truncated]"));
+        } else {
+            try std.testing.expectEqualStrings("before\u{fffd}after", result);
+        }
+        for (std.enums.values(Provider)) |provider| {
+            const body = try request_builder.build(arena.allocator(), provider, models.defaultModel(provider), null, false, .{ .include_builtin = false }, "/work", "", &.{.{ .results = &.{.{ .id = "call_1", .text = result }} }});
+            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{});
+            const items = parsed.object.get(if (provider == .claude) "messages" else "input").?.array.items;
+            const item = items[items.len - 1];
+            const text = if (provider == .claude) item.object.get("content").?.array.items[0].object.get("content").? else item.object.get("output").?;
+            try std.testing.expectEqualStrings(result, text.string);
+        }
+    }
 }
 
 test "clean EOF without provider completion rolls back without executing tools" {

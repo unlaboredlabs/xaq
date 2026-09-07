@@ -42,6 +42,13 @@ pub const Entry = union(enum) {
     results: []const ToolResult,
 };
 
+/// JSON encodes an invalid UTF-8 byte slice as an array of numbers. Keep
+/// user text and tool output textual, even for binary files or clipped output.
+pub fn dupeText(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    if (std.unicode.utf8ValidateSlice(bytes)) return gpa.dupe(u8, bytes);
+    return std.fmt.allocPrint(gpa, "{f}", .{std.unicode.fmtUtf8(bytes)});
+}
+
 pub fn approximateBytes(entries: []const Entry) usize {
     var total: usize = 0;
     for (entries) |entry| switch (entry) {

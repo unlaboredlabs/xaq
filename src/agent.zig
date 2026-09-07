@@ -263,7 +263,7 @@ const Session = struct {
             .data = try self.allocator().dupe(u8, image.data),
         };
         try self.appendEntry(.{ .user = .{
-            .text = try self.allocator().dupe(u8, text),
+            .text = try types.dupeText(self.allocator(), text),
             .images = owned_images,
         } });
     }
@@ -759,7 +759,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
                     },
                 }) catch |err|
                     try std.fmt.allocPrint(scratch_gpa, "tool error: {s}", .{@errorName(err)});
-                results[i] = .{ .id = call.id, .text = try session.allocator().dupe(u8, result) };
+                results[i] = .{ .id = call.id, .text = try tools.resultText(session.allocator(), result) };
             }
             if (toolMayChangeWorktree(call.name)) {
                 refreshGit(&session);
@@ -1031,7 +1031,7 @@ fn runShellEscape(session: *Session, command: []const u8, add_to_context: bool) 
         if (result[result.len - 1] != '\n') try session.output.writeByte('\n');
     }
     if (add_to_context) {
-        const record = try std.fmt.allocPrint(session.allocator(), "Local shell command:\n{s}\n\nOutput:\n{s}", .{ command, if (result.len == 0) "[no output]" else result });
+        const record = try std.fmt.allocPrint(session.allocator(), "Local shell command:\n{f}\n\nOutput:\n{f}", .{ std.unicode.fmtUtf8(command), std.unicode.fmtUtf8(if (result.len == 0) "[no output]" else result) });
         try session.appendEntry(.{ .user = .{ .text = record } });
     }
     refreshGit(session);

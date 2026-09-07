@@ -5,6 +5,7 @@ const cancel = @import("cancel.zig");
 const models = @import("models.zig");
 const subagents = @import("subagents.zig");
 const transport = @import("transport.zig");
+const types = @import("types.zig");
 
 pub const names = [_][]const u8{ "read", "bash", "edit", "write" };
 pub const web_names = [_][]const u8{ "web_fetch", "web_search" };
@@ -267,6 +268,22 @@ pub fn executeWithContext(gpa: std.mem.Allocator, io: Io, name: []const u8, args
 /// model's bash tool.
 pub fn runShell(gpa: std.mem.Allocator, io: Io, command: []const u8, cwd: []const u8) ![]u8 {
     return runBash(gpa, io, command, 600, cancel.processToken(), cwd);
+}
+
+/// Provider tool results must be text, even when a command or binary file
+/// returns arbitrary bytes. Reapply the cap after replacement characters grow.
+pub fn resultText(gpa: std.mem.Allocator, result: []const u8) ![]u8 {
+    const prefix = result[0..@min(result.len, max_output)];
+    const text = try types.dupeText(gpa, prefix);
+    if (result.len <= max_output and text.len <= max_output) return text;
+    errdefer gpa.free(text);
+    const suffix = "\n[tool result truncated]";
+    var keep = max_output - suffix.len;
+    while (keep > 0 and text[keep] & 0xc0 == 0x80) keep -= 1;
+    @memcpy(text[keep..][0..suffix.len], suffix);
+    // Shrink the latest allocation so session arenas can reuse the repaired
+    // bytes beyond the limit instead of retaining a second, temporary copy.
+    return gpa.realloc(text, keep + suffix.len);
 }
 
 fn fieldString(args: std.json.Value, key: []const u8) ![]const u8 {
