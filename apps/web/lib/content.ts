@@ -1,7 +1,7 @@
 export const site = {
   name: "xaq",
   domain: "xaq.sh",
-  tagline: "A coding agent in about 540 KiB.",
+  tagline: "A coding agent in a single native binary.",
   description:
     "your subscriptions should work with the tools you choose. xaq connects straight to chatgpt, claude, and grok with one binary, a short system prompt, and four plain tools.",
   install: "curl -fsSL https://xaq.sh/install | sh",

@@ -1,10 +1,10 @@
 # xaq
 
-**A coding agent in 540 KiB, taking prompts 3.14 ms after you hit Enter.**
+**A coding agent in a single native binary.**
 
 `xaq` is a single binary that talks straight to your ChatGPT, Claude, and Grok subscriptions. Nothing runs between your terminal and the model: no daemon, no proxy server, no package runtime, no plugin system. The agent gets one conversation and four local tools. Written in Zig, inspired by [Vercel's `fx`](https://github.com/vercel-labs/fx) and [Pi](https://github.com/earendil-works/pi).
 
-<sub>540 KiB and 3.14 ms measured on Linux, ReleaseSmall, warm cache. Run `zig build perf` to get your own numbers.</sub>
+<sub>Run `zig build perf` to measure binary size, startup, and input readiness on your machine.</sub>
 
 > [!WARNING]
 > `xaq` has the full permissions of the user who runs it. It can execute commands and read, create, or overwrite any accessible file. There is no approval prompt or internal sandbox. Use a container or restricted account when you need isolation.
@@ -204,10 +204,12 @@ The default log is `~/.config/xaq/trace.log`. It rotates at 2 MiB.
 zig build check    # type-check without installing
 zig build fmt      # format Zig sources
 zig build test     # run tests
-zig build perf     # enforce startup and prompt-readiness limits
+zig build perf     # measure size and check startup/readiness limits
 ```
 
 CI checks formatting, tests, and release builds on Linux and macOS. On Linux, the performance gate measures stripped ReleaseSmall help/version startup and fullscreen prompt readiness in the local Git worktree. Binary size and cache-discarded help startup are reported without limiting them.
+
+Use `zig build perf -- --runs 200 --no-check` to collect measurements without enforcing latency limits. Record the commit, OS, CPU, and Zig version with the results. The benchmark measures local process startup and editor readiness without model requests; timings vary with hardware, filesystem cache, and worktree contents.
 
 After building, `python3 tests/cli_test.py zig-out/bin/xaq` checks stream recovery, retry cancellation, and thread ownership with a local mock transport. These tests run in CI and require no provider login or network access.
 
