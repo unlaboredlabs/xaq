@@ -42,33 +42,56 @@ pub fn run(gpa: std.mem.Allocator, io: Io, current_git_sha: []const u8) !RunResu
     const asset_url = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ release_base, selected.filename });
     defer gpa.free(asset_url);
 
+    // Capture the destination before downloading the binary. Resolving it after
+    // another installer replaces this process's executable returns a path
+    // ending in " (deleted)", which must never become an install target.
+    const executable = std.process.executablePathAlloc(io, gpa) catch |err| switch (err) {
+        error.FileNotFound, error.ProcessNotFound => return error.ExecutableChanged,
+        else => return err,
+    };
+    defer gpa.free(executable);
+    const original = try executableStat(io, executable);
     const binary = try download(gpa, io, asset_url, max_binary_bytes);
     defer gpa.free(binary);
     const actual = sha256(binary);
     if (!std.mem.eql(u8, &selected.checksum, &actual)) return error.ChecksumMismatch;
 
-    const executable = try std.process.executablePathAlloc(io, gpa);
-    defer gpa.free(executable);
+    try installBinary(gpa, io, executable, original, binary);
+    return .{
+        .status = .updated,
+        .version = release_version,
+    };
+}
+
+fn installBinary(gpa: std.mem.Allocator, io: Io, executable: []const u8, original: Io.File.Stat, binary: []const u8) !void {
     var random: [8]u8 = undefined;
     try io.randomSecure(&random);
     const suffix = std.fmt.bytesToHex(random, .lower);
     const temporary = try std.fmt.allocPrint(gpa, "{s}.update-{s}", .{ executable, &suffix });
     defer gpa.free(temporary);
-    errdefer Io.Dir.deleteFileAbsolute(io, temporary) catch {};
-
-    try Io.Dir.cwd().writeFile(io, .{
-        .sub_path = temporary,
-        .data = binary,
-        .flags = .{ .exclusive = true, .permissions = @enumFromInt(0o755) },
+    var file = try Io.Dir.cwd().createFile(io, temporary, .{
+        .exclusive = true,
+        .permissions = @enumFromInt(0o755),
     });
-    var file = try Io.Dir.cwd().openFile(io, temporary, .{ .mode = .read_write });
+    // A failed exclusive create does not give us ownership of this path.
+    errdefer Io.Dir.deleteFileAbsolute(io, temporary) catch {};
     defer file.close(io);
+    try file.writeStreamingAll(io, binary);
     try file.setPermissions(io, @enumFromInt(0o755));
     try file.sync(io);
+    const latest = try executableStat(io, executable);
+    if (original.inode != latest.inode or original.size != latest.size or
+        original.mtime.nanoseconds != latest.mtime.nanoseconds or original.ctime.nanoseconds != latest.ctime.nanoseconds)
+    {
+        return error.ExecutableChanged;
+    }
     try Io.Dir.renameAbsolute(temporary, executable, io);
-    return .{
-        .status = .updated,
-        .version = release_version,
+}
+
+fn executableStat(io: Io, path: []const u8) !Io.File.Stat {
+    return Io.Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => error.ExecutableChanged,
+        else => return err,
     };
 }
 
@@ -204,6 +227,58 @@ fn sha256(bytes: []const u8) [64]u8 {
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     return std.fmt.bytesToHex(digest, .lower);
+}
+
+test "update staging retains other writers and rolls back partial writes and rename failures" {
+    const Fault = struct {
+        fn random(_: ?*anyopaque, bytes: []u8) Io.RandomSecureError!void {
+            @memset(bytes, 0);
+        }
+        fn partial(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
+            if (operation == .file_write_streaming) {
+                var write = operation.file_write_streaming;
+                const bytes = write.data[0];
+                if (bytes[0] != 'n') return .{ .file_write_streaming = error.NoSpaceLeft };
+                write.data = &.{bytes[0..3]};
+                return std.testing.io.vtable.operate(userdata, .{ .file_write_streaming = write });
+            }
+            return std.testing.io.vtable.operate(userdata, operation);
+        }
+        fn rename(_: ?*anyopaque, _: Io.Dir, _: []const u8, _: Io.Dir, _: []const u8) Io.Dir.RenameError!void {
+            return error.AccessDenied;
+        }
+    };
+    const gpa = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var directory_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const directory_len = try temporary.dir.realPath(std.testing.io, &directory_buffer);
+    const path = try std.fs.path.join(gpa, &.{ directory_buffer[0..directory_len], "xaq" });
+    defer gpa.free(path);
+    const temp_path = try std.fmt.allocPrint(gpa, "{s}.update-0000000000000000", .{path});
+    defer gpa.free(temp_path);
+    try Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "original executable" });
+    const original = try executableStat(std.testing.io, path);
+    try Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = temp_path, .data = "another writer" });
+    var vtable = std.testing.io.vtable.*;
+    vtable.randomSecure = Fault.random;
+    const io: Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    try std.testing.expectError(error.PathAlreadyExists, installBinary(gpa, io, path, original, "new executable"));
+    const other = try Io.Dir.cwd().readFileAlloc(std.testing.io, temp_path, gpa, .limited(1024));
+    defer gpa.free(other);
+    try std.testing.expectEqualStrings("another writer", other);
+    try Io.Dir.cwd().deleteFile(std.testing.io, temp_path);
+
+    vtable.operate = Fault.partial;
+    try std.testing.expectError(error.NoSpaceLeft, installBinary(gpa, io, path, original, "new executable"));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().openFile(std.testing.io, temp_path, .{}));
+    vtable.operate = std.testing.io.vtable.operate;
+    vtable.dirRename = Fault.rename;
+    try std.testing.expectError(error.AccessDenied, installBinary(gpa, io, path, original, "new executable"));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().openFile(std.testing.io, temp_path, .{}));
+    const retained = try Io.Dir.cwd().readFileAlloc(std.testing.io, path, gpa, .limited(1024));
+    defer gpa.free(retained);
+    try std.testing.expectEqualStrings("original executable", retained);
 }
 
 test "manifest selects an immutable asset and checksum" {

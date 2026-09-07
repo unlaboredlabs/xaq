@@ -49,7 +49,7 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 
-curl -fsSL "$manifest_url" -o "$download_dir/manifest"
+curl -fsSL --connect-timeout 10 --max-time 300 "$manifest_url" -o "$download_dir/manifest"
 release_sha=$(awk 'NR == 1 && NF == 2 && $1 == "xaq-edge-v1" { print $2 }' "$download_dir/manifest")
 [ "${#release_sha}" -eq 40 ] || fail 'edge manifest header is malformed'
 case "$release_sha" in *[!0-9a-f]*) fail 'edge manifest commit is malformed' ;; esac
@@ -93,11 +93,12 @@ expected=${record#*"$tab"}
 [ "${#expected}" -eq 64 ] || fail 'edge manifest checksum is malformed'
 case "$expected" in *[!0-9a-f]*) fail 'edge manifest checksum is malformed' ;; esac
 
-curl -fsSL "$release_url/$filename" -o "$download_dir/$filename"
+curl -fsSL --connect-timeout 10 --max-time 300 "$release_url/$filename" -o "$download_dir/$filename"
 
 actual=$(digest_file "$download_dir/$filename")
 [ "$actual" = "$expected" ] || fail 'downloaded edge binary failed checksum verification'
 
+[ ! -d "$install_dir/xaq" ] || fail "install target is a directory: $install_dir/xaq"
 mkdir -p "$install_dir"
 install_tmp=$(mktemp "$install_dir/.xaq.XXXXXX")
 install -m 755 "$download_dir/$filename" "$install_tmp"
