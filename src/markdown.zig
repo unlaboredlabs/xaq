@@ -388,6 +388,7 @@ pub const Writer = struct {
         }
         if (self.escaped) {
             try self.resolveMarker(byte);
+            if (!std.ascii.isPunctuation(byte)) try self.output.writeByte('\\');
             try self.output.writeByte(byte);
             self.last_visible = byte;
             self.escaped = false;
@@ -700,6 +701,27 @@ test "renders links and preserves non-links" {
     try markdown.write("see [docs](https://example.com) and [literal]\n");
     try markdown.finish();
     try std.testing.expectEqualStrings("see docs (https://example.com) and [literal]\n", output.written());
+}
+
+test "backslashes before letters remain literal across stream chunks" {
+    const previous_enabled = term.enabled;
+    const previous_presentation = term.presentation;
+    defer {
+        term.enabled = previous_enabled;
+        term.presentation = previous_presentation;
+    }
+    term.enabled = false;
+    term.presentation = true;
+    const source = "C:\\Users\\alice\\file.txt and \\界 and \\*literal\\*";
+    for (0..source.len + 1) |split| {
+        var output: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        var markdown = Writer.init(&output.writer);
+        try markdown.write(source[0..split]);
+        try markdown.write(source[split..]);
+        try markdown.finish();
+        try std.testing.expectEqualStrings("C:\\Users\\alice\\file.txt and \\界 and *literal*", output.written());
+    }
 }
 
 test "rendering is independent of stream chunk boundaries" {

@@ -192,6 +192,7 @@ var display_utf8_expected: usize = 0;
 var display_joined = false;
 var display_cluster_width: usize = 0;
 var display_regional_pending = false;
+var display_reflow_pending = false;
 
 var popup_rows: usize = 0;
 
@@ -292,6 +293,7 @@ fn resetTranscriptLocked() void {
     display_joined = false;
     display_cluster_width = 0;
     display_regional_pending = false;
+    display_reflow_pending = false;
 }
 
 /// Drop the conversation while keeping the fullscreen chrome and status.
@@ -1496,11 +1498,11 @@ fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!
 fn forward(bytes: []const u8) !void {
     const was_scrolled = scroll_offset != 0;
     const was_selected = selection != null;
-    if (layout_ready) {
-        // Keep split control sequences and Unicode clusters current while
-        // the user views a frozen transcript, without changing that view.
-        for (bytes) |byte| try processDisplayByte(byte, !was_scrolled and !was_selected);
-    }
+    display_reflow_pending = false;
+    defer display_reflow_pending = false;
+    // Keep split control sequences and Unicode clusters current while the
+    // viewport is frozen or too small to draw, without changing that view.
+    for (bytes) |byte| try processDisplayByte(byte, layout_ready and !was_scrolled and !was_selected and !display_reflow_pending);
     const bottom_delta = ingest(bytes, was_scrolled);
     if (was_scrolled) {
         if (bottom_delta > 0) {
@@ -1509,10 +1511,11 @@ fn forward(bytes: []const u8) !void {
             scroll_offset -|= @intCast(-bottom_delta);
         }
     }
-    if (layout_ready and selection == null and (was_scrolled or was_selected)) try repaint();
+    if (layout_ready and selection == null and (was_scrolled or was_selected or display_reflow_pending)) try repaint();
 }
 
 fn advanceDisplayRow(emit: bool) !void {
+    if (!layout_ready) return;
     if (emit) {
         try sink.writeByte('\n');
         try sink.print("\x1b[{d}G", .{contentLeft()});
@@ -1522,6 +1525,7 @@ fn advanceDisplayRow(emit: bool) !void {
 }
 
 fn writeDisplayGlyph(glyph: []const u8, width: usize, emit: bool) !void {
+    if (!layout_ready) return;
     if (width > 0 and region_col - contentLeft() + width > contentWidth()) {
         try advanceDisplayRow(emit);
     }
@@ -1599,8 +1603,18 @@ fn writeDisplayTextByte(byte: u8, emit: bool) !void {
         display_utf8_len += 1;
         if (display_utf8_len == display_utf8_expected) {
             const glyph = display_utf8[0..display_utf8_len];
-            const width: usize = if (std.unicode.utf8Decode(glyph)) |cp| displayCellWidth(cp) else |_| 1;
-            try writeDisplayGlyph(glyph, width, emit);
+            const width: usize = if (std.unicode.utf8Decode(glyph)) |cp| width: {
+                const extends_cluster = display_joined or cp == 0xfe0f;
+                const extra = displayCellWidth(cp);
+                // A variation selector or joined glyph can widen a cluster
+                // already drawn at the right edge. Reflow the complete
+                // retained text instead of wrapping just its final bytes.
+                if (layout_ready and extends_cluster and extra > 0 and region_col - contentLeft() + extra > contentWidth()) {
+                    display_reflow_pending = true;
+                }
+                break :width extra;
+            } else |_| 1;
+            try writeDisplayGlyph(glyph, width, emit and !display_reflow_pending);
             display_utf8_len = 0;
             display_utf8_expected = 0;
         }
@@ -2388,6 +2402,32 @@ test "resize reclamps popup and suspends tiny layouts" {
     try std.testing.expectEqual(@as(usize, 40), cols);
 }
 
+test "stream parser survives a tiny terminal between UTF-8 and CSI chunks" {
+    const gpa = std.testing.allocator;
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    const transcript = try enterMeasured(gpa, std.testing.io, &output.writer, .{ .rows = 24, .cols = 40 }, false);
+    defer exit();
+    try transcript.writeAll("before \xf0\x9f");
+    try transcript.flush();
+    try std.testing.expect(resizeMeasured(.{ .rows = 1, .cols = 1 }));
+    output.clearRetainingCapacity();
+    try transcript.writeAll("\x92\xbb\nnew \x1b[3");
+    try transcript.flush();
+    try std.testing.expectEqualStrings("", output.written());
+    try std.testing.expectEqual(@as(usize, 0), display_utf8_len);
+    try std.testing.expectEqual(.csi, display_state);
+    try std.testing.expect(resizeMeasured(.{ .rows = 24, .cols = 40 }));
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "💻") != null);
+    output.clearRetainingCapacity();
+    try transcript.writeAll("1mX");
+    try transcript.flush();
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "\x1b[31mX") != null);
+    try std.testing.expectEqual(regionTop() + 1, region_row);
+    try std.testing.expectEqual(contentLeft() + 5, region_col);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(output.written()));
+}
+
 test "repaint reserves an empty live insertion row" {
     var output: Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
@@ -2569,6 +2609,24 @@ test "visual row layout reflows narrow and wide glyphs" {
     try std.testing.expectEqual(LineLayout{ .rows = 2, .column = 2 }, lineLayout(("中" ** 20)));
     try std.testing.expectEqual(LineLayout{ .rows = 1, .column = 2 }, lineLayout("👩‍💻"));
     try std.testing.expectEqual(LineLayout{ .rows = 1, .column = 2 }, lineLayout("❤️"));
+}
+
+test "a streamed widening cluster wraps whole and stays selectable" {
+    const gpa = std.testing.allocator;
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    const transcript = try enterMeasured(gpa, std.testing.io, &output.writer, .{ .rows = 24, .cols = 40 }, false);
+    defer exit();
+    try transcript.writeAll(("a" ** 37) ++ "❤");
+    try transcript.flush();
+    try transcript.writeAll("\u{fe0f}!");
+    try transcript.flush();
+    try std.testing.expectEqual(regionTop() + 1, region_row);
+    try std.testing.expectEqual(contentLeft() + 3, region_col);
+    _ = try mouseSelection(gpa, .press, contentLeft(), regionTop() + 1);
+    const copied = (try mouseSelection(gpa, .release, contentLeft() + 2, regionTop() + 1)).?;
+    defer gpa.free(copied);
+    try std.testing.expectEqualStrings("❤️!", copied);
 }
 
 test "live renderer keeps emoji clusters in one cell pair" {

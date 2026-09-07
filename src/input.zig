@@ -314,7 +314,7 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
     var stash_truncated = false;
     var dirty_after_hint = false;
     var input_truncated = false;
-    var utf8_dropping = false;
+    var typed_utf8: TypedUtf8 = .{};
     var resize_wait = ResizeWait.init();
 
     if (initial) |text| {
@@ -380,6 +380,7 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
         }
         var dirty = dirty_after_hint or dismissed_startup_hint;
         dirty_after_hint = false;
+        if (byte < 0x20 or byte == 0x7f) typed_utf8 = .{};
         switch (byte) {
             '\r', '\n' => {
                 const line = buffer.items;
@@ -723,29 +724,12 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                 }
             },
             else => if (byte >= 0x20) {
-                // Admit whole code points only: a lead byte reserves room
-                // for its full sequence, so the limit can never split a
-                // multibyte character into invalid UTF-8.
-                const continuation = byte & 0xc0 == 0x80;
-                if (continuation) {
-                    if (utf8_dropping) {
-                        input_truncated = true;
-                    } else {
-                        try buffer.insert(gpa, cursor, byte);
-                        cursor += 1;
-                        dirty = true;
-                    }
-                } else {
-                    const needed: usize = if (byte < 0x80) 1 else if (byte & 0xe0 == 0xc0) 2 else if (byte & 0xf0 == 0xe0) 3 else 4;
-                    if (buffer.items.len + needed <= max_input_bytes) {
-                        utf8_dropping = false;
-                        try buffer.insert(gpa, cursor, byte);
-                        cursor += 1;
+                if (try typed_utf8.insert(gpa, &buffer, &cursor, byte)) |admitted| {
+                    if (admitted) {
                         selected = 0;
                         hist_pos = null;
                         dirty = true;
                     } else {
-                        utf8_dropping = true;
                         input_truncated = true;
                     }
                 }
@@ -756,6 +740,32 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
         }
     }
 }
+
+/// Assemble typed code points before editing or drawing. Stray continuation
+/// bytes and malformed sequences must neither bypass the cap nor leave a
+/// partial glyph on screen between input events.
+const TypedUtf8 = struct {
+    bytes: [4]u8 = undefined,
+    len: usize = 0,
+    expected: usize = 0,
+
+    fn insert(self: *TypedUtf8, gpa: std.mem.Allocator, buffer: *std.ArrayList(u8), cursor: *usize, byte: u8) !?bool {
+        if (byte & 0xc0 != 0x80) {
+            self.len = 0;
+            self.expected = std.unicode.utf8ByteSequenceLength(byte) catch return null;
+        } else if (self.len == 0) return null;
+        self.bytes[self.len] = byte;
+        self.len += 1;
+        if (self.len < self.expected) return null;
+        const text = self.bytes[0..self.len];
+        self.len = 0;
+        if (!std.unicode.utf8ValidateSlice(text)) return null;
+        if (text.len > max_input_bytes -| buffer.items.len) return false;
+        try buffer.insertSlice(gpa, cursor.*, text);
+        cursor.* += text.len;
+        return true;
+    }
+};
 
 fn renderEditor(output: *Io.Writer, suggestions: []const Suggestion, files: *FileIndex, pasted_image_paths: []const []const u8, line: []const u8, selected: usize, cursor: usize, previous_popup_rows: usize) !usize {
     if (fileQuery(line, cursor) != null) try files.ensureLoaded();
@@ -1719,7 +1729,7 @@ const WindowRender = struct { used: usize, cursor: usize };
 fn writeWindow(output: *Io.Writer, line: []const u8, cursor_cols: usize, avail: usize) !WindowRender {
     if (avail == 0) return .{ .used = 0, .cursor = 0 };
     const total = columns(line);
-    if (total <= avail) {
+    if (total < avail or (total == avail and cursor_cols < avail)) {
         try writeVisible(output, line);
         return .{ .used = total, .cursor = @min(cursor_cols, avail - 1) };
     }
@@ -2659,6 +2669,46 @@ test "bracketed paste grows beyond the old editor buffer and inserts once" {
     try std.testing.expectEqualStrings("tail", buffer.items[paste_len..]);
 }
 
+test "typed input inserts complete UTF-8 and rejects malformed sequences" {
+    const gpa = std.testing.allocator;
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(gpa);
+    try buffer.appendSlice(gpa, "ac");
+    var cursor: usize = 1;
+    var typed: TypedUtf8 = .{};
+    try std.testing.expectEqual(null, try typed.insert(gpa, &buffer, &cursor, 0xc3));
+    try std.testing.expectEqualStrings("ac", buffer.items);
+    try std.testing.expectEqual(@as(?bool, true), try typed.insert(gpa, &buffer, &cursor, 0xa9));
+    try std.testing.expectEqualStrings("aéc", buffer.items);
+    for ("\x80\xc0\x80\xed\xa0\x80\xf4\x90\x80\x80\xff") |byte| {
+        try std.testing.expectEqual(null, try typed.insert(gpa, &buffer, &cursor, byte));
+    }
+    try std.testing.expectEqualStrings("aéc", buffer.items);
+    try std.testing.expectEqual(null, try typed.insert(gpa, &buffer, &cursor, 0xf0));
+    try std.testing.expectEqual(@as(?bool, true), try typed.insert(gpa, &buffer, &cursor, 'b'));
+    try std.testing.expectEqualStrings("aébc", buffer.items);
+}
+
+test "typed UTF-8 and stray continuation bytes cannot exceed the input cap" {
+    const gpa = std.testing.allocator;
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(gpa);
+    try buffer.resize(gpa, max_input_bytes - 1);
+    @memset(buffer.items, 'a');
+    var cursor = buffer.items.len;
+    var typed: TypedUtf8 = .{};
+    try std.testing.expectEqual(null, try typed.insert(gpa, &buffer, &cursor, 0x80));
+    try std.testing.expectEqual(null, try typed.insert(gpa, &buffer, &cursor, 0xc3));
+    try std.testing.expectEqual(@as(?bool, false), try typed.insert(gpa, &buffer, &cursor, 0xa9));
+    try std.testing.expectEqual(max_input_bytes - 1, buffer.items.len);
+    try std.testing.expectEqual(@as(?bool, true), try typed.insert(gpa, &buffer, &cursor, 'b'));
+    for (0..8) |_| try std.testing.expectEqual(null, try typed.insert(gpa, &buffer, &cursor, 0x80));
+    try std.testing.expectEqual(@as(?bool, false), try typed.insert(gpa, &buffer, &cursor, 'c'));
+    try std.testing.expectEqual(max_input_bytes, buffer.items.len);
+    try std.testing.expectEqual(buffer.items.len, cursor);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(buffer.items));
+}
+
 test "bracketed paste normalizes line endings and control bytes" {
     var reader = Io.Reader.fixed("a\r\nb\tc\x01\x1b[201~");
     var buffer: std.ArrayList(u8) = .empty;
@@ -3001,6 +3051,21 @@ test "editor window never exceeds odd budgets with wide text" {
     const hidden = try writeWindow(&zero.writer, text, 0, 0);
     try std.testing.expectEqual(@as(usize, 0), hidden.used);
     try std.testing.expectEqualStrings("", zero.written());
+}
+
+test "an exactly full editor row leaves a visible insertion cell" {
+    const previous_enabled = term.enabled;
+    defer term.enabled = previous_enabled;
+    term.enabled = false;
+    for ([_][]const u8{ "abcd", "ab中", "👩‍💻ab" }) |text| {
+        var output: Io.Writer.Allocating = .init(std.testing.allocator);
+        defer output.deinit();
+        const rendered = try writeWindow(&output.writer, text, columns(text), 4);
+        try std.testing.expect(rendered.used < 4);
+        try std.testing.expectEqual(rendered.used, rendered.cursor);
+        try std.testing.expect(std.mem.startsWith(u8, output.written(), "…"));
+        try std.testing.expect(std.unicode.utf8ValidateSlice(output.written()));
+    }
 }
 
 test "inline cleanup erases only its temporary rows" {
