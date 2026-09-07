@@ -558,14 +558,7 @@ fn checkLoginCancellation() !void {
 }
 
 fn waitForLoginPoll(io: Io, seconds: i64) !void {
-    var remaining_ms: i64 = @min(@max(seconds, @as(i64, 1)), @as(i64, 60)) * @as(i64, 1000);
-    while (remaining_ms > 0) {
-        try checkLoginCancellation();
-        const step = @min(remaining_ms, 100);
-        try io.sleep(.fromMilliseconds(step), .awake);
-        remaining_ms -= step;
-    }
-    try checkLoginCancellation();
+    try cancel.processToken().sleep(io, .fromSeconds(std.math.clamp(seconds, 1, 60)));
 }
 
 fn refresh(gpa: std.mem.Allocator, io: Io, provider: Provider, old: Credential, diagnostic: ?*Diagnostic) !Credential {

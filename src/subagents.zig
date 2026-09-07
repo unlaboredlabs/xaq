@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const auth = @import("auth.zig");
 const cancel = @import("cancel.zig");
@@ -7,6 +8,7 @@ const models = @import("models.zig");
 pub const default_max_concurrent = 4;
 const max_records = 32;
 const result_limit = 50 * 1024;
+const stop_grace_ms = 1000;
 
 pub const Status = enum { queued, running, completed, failed, stopped };
 
@@ -121,6 +123,9 @@ pub const Manager = struct {
     pub fn configure(self: *Manager, config: Config) !void {
         try validateConfig(config);
         self.config = config;
+        if (!config.enabled) {
+            for (self.records.items) |record| if (record.status == .queued) self.stop(record);
+        }
         try self.refreshAll();
     }
 
@@ -152,20 +157,59 @@ pub const Manager = struct {
     }
 
     fn stopAll(self: *Manager) void {
-        for (self.records.items) |record| {
-            if (record.status == .running) self.stop(record);
-        }
+        self.stopRecords(self.records.items);
     }
 
     fn stop(self: *Manager, record: *Record) void {
-        if (record.process) |*child| {
-            if (child.id) |pid| {
-                std.posix.kill(-pid, .KILL) catch {};
-                _ = child.wait(self.io) catch {};
-            }
+        self.stopRecords(&.{record});
+    }
+
+    fn stopRecords(self: *Manager, records: []const *Record) void {
+        if (records.len == 0) return;
+        const protection = self.io.swapCancelProtection(.blocked);
+        defer _ = self.io.swapCancelProtection(protection);
+        var groups: [max_records]std.posix.pid_t = @splat(0);
+        std.debug.assert(records.len <= groups.len);
+        for (records, 0..) |record, index| {
+            if (record.status != .running and record.status != .queued) continue;
+            record.status = .stopped;
+            record.completed_ms = nowMs(self.io);
+            if (record.process) |child| if (child.id) |pid| {
+                groups[index] = pid;
+                std.posix.kill(-pid, .INT) catch {};
+            };
         }
-        record.status = .stopped;
-        record.completed_ms = nowMs(self.io);
+
+        // The shell can exit before its worker. Keep tracking the group while
+        // SIGINT lets each worker stop tools running in separate groups.
+        // All workers share one grace period, regardless of concurrency.
+        const started = Io.Clock.now(.awake, self.io);
+        var escalated = false;
+        while (true) {
+            var live = false;
+            for (records, 0..) |record, index| {
+                if (groups[index] == 0) continue;
+                if (record.process) |*child| _ = reapFinished(child) catch false;
+                if (processGroupExists(groups[index])) live = true else groups[index] = 0;
+            }
+            if (!live) break;
+            const elapsed = started.durationTo(Io.Clock.now(.awake, self.io)).nanoseconds;
+            if (elapsed >= stop_grace_ms * std.time.ns_per_ms) break;
+            if (!escalated and elapsed >= 250 * std.time.ns_per_ms) {
+                // The worker's second interrupt escalates its active tool to
+                // KILL before we forcibly terminate the worker itself.
+                for (groups[0..records.len]) |pid| if (pid != 0) std.posix.kill(-pid, .INT) catch {};
+                escalated = true;
+            }
+            self.io.sleep(.fromMilliseconds(10), .awake) catch break;
+        }
+        for (groups[0..records.len]) |pid| if (pid != 0) std.posix.kill(-pid, .KILL) catch {};
+        for (records) |record| {
+            if (record.status != .stopped) continue;
+            if (record.process) |*child| if (child.id != null) {
+                _ = child.wait(self.io) catch {};
+            };
+        }
     }
 
     pub fn execute(self: *Manager, gpa: std.mem.Allocator, name: []const u8, args: std.json.Value, launch: Launch) ![]u8 {
@@ -257,11 +301,14 @@ pub const Manager = struct {
             const result = try self.resultText(gpa, record, false);
             defer gpa.free(result);
             try out.writer.print("<subagent-notification>\nAgent {s} finished with status {s}.\nDescription: {s}\n{s}\n</subagent-notification>\n", .{ record.id, @tagName(record.status), record.description, result });
-            record.notified = true;
             count += 1;
         }
         if (count == 0) return null;
-        return try out.toOwnedSlice();
+        const notification = try out.toOwnedSlice();
+        for (self.records.items) |record| {
+            if (record.background and !record.consumed and record.status != .queued and record.status != .running) record.notified = true;
+        }
+        return notification;
     }
 
     fn agent(self: *Manager, gpa: std.mem.Allocator, args: std.json.Value, launch: Launch) ![]u8 {
@@ -304,6 +351,34 @@ pub const Manager = struct {
             }
         }
 
+        const record = try self.createRecord(gpa, prompt, description, .{
+            .provider = launch.provider,
+            .model = selected_model,
+            .effort = selected_effort,
+            .fast = inherits_model and launch.fast,
+        }, background);
+        self.records.append(self.gpa, record) catch |err| {
+            record.deinit(self.gpa);
+            return err;
+        };
+
+        // Once registered, the manager keeps ownership even when producing
+        // the tool response fails. Its worker must remain observable/reapable.
+        if (record.status == .running) self.start(record) catch |err| {
+            record.status = .failed;
+            record.completed_ms = nowMs(self.io);
+            record.error_text = try std.fmt.allocPrint(self.gpa, "could not start subagent: {s}", .{@errorName(err)});
+        };
+        if (!background) try self.waitFor(record, true);
+        if (!background or record.status == .failed) {
+            const result = try self.resultText(gpa, record, true);
+            record.consumed = true;
+            return result;
+        }
+        return self.launchResult(gpa, record);
+    }
+
+    fn createRecord(self: *Manager, gpa: std.mem.Allocator, prompt: []const u8, description: []const u8, launch: Launch, background: bool) !*Record {
         try self.ensureTempDir();
         var random: [6]u8 = undefined;
         try self.io.randomSecure(&random);
@@ -326,19 +401,29 @@ pub const Manager = struct {
         const briefing = try buildBriefing(gpa, prompt);
         defer gpa.free(briefing);
         try writePrivate(self.io, prompt_path, briefing);
+        errdefer Io.Dir.cwd().deleteFile(self.io, prompt_path) catch {};
         try writePrivate(self.io, control_path, "");
+        errdefer Io.Dir.cwd().deleteFile(self.io, control_path) catch {};
+
+        const description_copy = try self.gpa.dupe(u8, description);
+        errdefer self.gpa.free(description_copy);
+        const provider_copy = try self.gpa.dupe(u8, launch.provider);
+        errdefer self.gpa.free(provider_copy);
+        const model_copy = try self.gpa.dupe(u8, launch.model);
+        errdefer self.gpa.free(model_copy);
+        const effort_copy = if (launch.effort) |value| try self.gpa.dupe(u8, value) else null;
+        errdefer if (effort_copy) |value| self.gpa.free(value);
 
         const record = try self.gpa.create(Record);
-        errdefer self.gpa.destroy(record);
         record.* = .{
             .id = id,
-            .description = try self.gpa.dupe(u8, description),
-            .provider = try self.gpa.dupe(u8, launch.provider),
-            .model = try self.gpa.dupe(u8, selected_model),
-            .effort = if (selected_effort) |value| try self.gpa.dupe(u8, value) else null,
-            .fast = inherits_model and launch.fast,
+            .description = description_copy,
+            .provider = provider_copy,
+            .model = model_copy,
+            .effort = effort_copy,
+            .fast = launch.fast,
             .background = background,
-            .status = if (background and self.counts().running >= self.config.max_concurrent) .queued else .running,
+            .status = if (self.counts().running >= self.config.max_concurrent) .queued else .running,
             .started_ms = nowMs(self.io),
             .prompt_path = prompt_path,
             .output_path = output_path,
@@ -347,24 +432,7 @@ pub const Manager = struct {
             .control_path = control_path,
             .status_path = status_path,
         };
-        try self.records.append(self.gpa, record);
-        errdefer _ = self.records.pop();
-
-        if (record.status == .running) self.start(record) catch |err| {
-            record.status = .failed;
-            record.completed_ms = nowMs(self.io);
-            record.error_text = try std.fmt.allocPrint(self.gpa, "could not start subagent: {s}", .{@errorName(err)});
-        };
-        if (!background) {
-            try self.waitFor(record, true);
-            record.consumed = true;
-            return self.resultText(gpa, record, true);
-        }
-        if (record.status == .failed) {
-            record.consumed = true;
-            return self.resultText(gpa, record, true);
-        }
-        return self.launchResult(gpa, record);
+        return record;
     }
 
     fn launchResult(self: *const Manager, gpa: std.mem.Allocator, record: *const Record) ![]u8 {
@@ -408,8 +476,9 @@ pub const Manager = struct {
         const resolved = self.resolve(id) catch return try gpa.dupe(u8, "agent reference is ambiguous");
         const record = resolved orelse return std.fmt.allocPrint(gpa, "agent not found: {s}", .{id});
         if (optionalBool(args, "wait") orelse false) try self.waitFor(record, false) else try self.refreshAll();
+        const result = try self.resultText(gpa, record, true);
         if (record.status != .running and record.status != .queued) record.consumed = true;
-        return self.resultText(gpa, record, true);
+        return result;
     }
 
     fn steer(self: *Manager, gpa: std.mem.Allocator, args: std.json.Value) ![]u8 {
@@ -499,14 +568,18 @@ pub const Manager = struct {
     fn refresh(self: *Manager, record: *Record) !void {
         if (record.status != .running) return;
         self.refreshWorkerStatus(record);
+        if (record.process) |*child| if (!try reapFinished(child)) return;
         const done = Io.Dir.cwd().readFileAlloc(self.io, record.done_path, self.gpa, .limited(64)) catch |err| switch (err) {
-            error.FileNotFound => return,
+            error.FileNotFound => {
+                record.status = .failed;
+                record.completed_ms = nowMs(self.io);
+                record.error_text = try self.gpa.dupe(u8, "subagent exited without writing its completion status");
+                self.captureFailureLine(record);
+                return;
+            },
             else => return err,
         };
         defer self.gpa.free(done);
-        if (record.process) |*child| {
-            if (child.id != null) _ = child.wait(self.io) catch {};
-        }
         const code = std.fmt.parseInt(u8, std.mem.trim(u8, done, " \r\n\t"), 10) catch 1;
         record.status = if (code == 0) .completed else .failed;
         record.completed_ms = nowMs(self.io);
@@ -551,7 +624,7 @@ pub const Manager = struct {
     }
 
     fn drainQueue(self: *Manager) !void {
-        if (!self.config.enabled) return;
+        if (!self.config.enabled or cancel.requested()) return;
         var running = self.counts().running;
         for (self.records.items) |record| {
             if (running >= self.config.max_concurrent) break;
@@ -568,10 +641,14 @@ pub const Manager = struct {
 
     fn waitFor(self: *Manager, record: *Record, stop_on_cancel: bool) !void {
         while (record.status == .queued or record.status == .running) {
+            if (cancel.requested()) {
+                if (stop_on_cancel) self.stop(record);
+                return;
+            }
             try self.refreshAll();
             if (record.status != .queued and record.status != .running) break;
             if (cancel.requested()) {
-                if (stop_on_cancel and record.status == .running) self.stop(record);
+                if (stop_on_cancel) self.stop(record);
                 return;
             }
             try self.io.sleep(.fromMilliseconds(50), .awake);
@@ -638,20 +715,21 @@ pub const Manager = struct {
             },
         }
         const text = try out.toOwnedSlice();
+        errdefer gpa.free(text);
         if (text.len <= result_limit) return text;
         var capped: Io.Writer.Allocating = .init(gpa);
         defer capped.deinit();
         try capped.writer.writeAll(text[0 .. result_limit - 192]);
         try capped.writer.print("\n[truncated; full output: {s}; errors: {s}]", .{ record.output_path, record.error_path });
+        const result = try capped.toOwnedSlice();
         gpa.free(text);
-        return capped.toOwnedSlice();
+        return result;
     }
 
     fn readCapped(self: *Manager, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
         var file = try Io.Dir.cwd().openFile(self.io, path, .{});
         defer file.close(self.io);
         const stat = try file.stat(self.io);
-        if (stat.size > 4 * 1024 * 1024) return error.StreamTooLong;
         const truncated = stat.size > result_limit;
         const read_len: usize = @intCast(if (truncated) result_limit - 96 else stat.size);
         const bytes = try gpa.alloc(u8, read_len);
@@ -664,10 +742,36 @@ pub const Manager = struct {
         defer out.deinit();
         try out.writer.writeAll(bytes);
         try out.writer.print("\n[truncated; full subagent output: {s}]", .{path});
+        const result = try out.toOwnedSlice();
         gpa.free(bytes);
-        return out.toOwnedSlice();
+        return result;
     }
 };
+
+/// Workers use no pipes or resource-usage tracking. Reap their wrapper without
+/// blocking the UI, including wrappers killed before they can write .done.
+fn reapFinished(child: *std.process.Child) !bool {
+    const pid = child.id orelse return true;
+    std.debug.assert(child.stdin == null and child.stdout == null and child.stderr == null);
+    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    while (true) {
+        const result = std.posix.system.waitpid(pid, &status, std.posix.W.NOHANG);
+        switch (std.posix.errno(result)) {
+            .SUCCESS => {
+                if (result == 0) return false;
+                child.id = null;
+                return true;
+            },
+            .INTR => continue,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
+
+fn processGroupExists(pid: std.posix.pid_t) bool {
+    std.posix.kill(-pid, @enumFromInt(0)) catch |err| return err != error.ProcessNotFound;
+    return true;
+}
 
 fn rejection(gpa: std.mem.Allocator, code: []const u8, message: []const u8, launch: Launch, config: Config) ![]u8 {
     var out: Io.Writer.Allocating = .init(gpa);
@@ -1129,4 +1233,326 @@ test "foreground and background agents return worker results" {
     });
     defer std.testing.allocator.free(queued_result);
     try std.testing.expect(std.mem.indexOf(u8, queued_result, "Status: completed") != null);
+}
+
+test "a worker wrapper killed before its completion file releases the queue" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "worker",
+        .data = "#!/bin/sh\nkill -KILL \"$PPID\"\n",
+        .flags = .{ .permissions = @enumFromInt(0o700) },
+    });
+    var manager = try Manager.init(std.testing.allocator, std.testing.io, "/tmp", .{ .max_concurrent = 1 });
+    defer manager.deinit();
+    std.testing.allocator.free(manager.executable);
+    manager.executable = try temporary.dir.realPathFileAlloc(std.testing.io, "worker", std.testing.allocator);
+    var args = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"prompt":"finish","description":"Killed wrapper"}
+    , .{});
+    defer args.deinit();
+    const launch: Launch = .{ .provider = "chatgpt", .model = "test-model", .effort = null, .fast = false };
+    for (0..2) |_| {
+        const launched = try manager.execute(std.testing.allocator, "Agent", args.value, launch);
+        std.testing.allocator.free(launched);
+    }
+    for (0..100) |_| {
+        try manager.refreshAll();
+        if (manager.records.items[0].status != .running) break;
+        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try std.testing.expectEqual(Status.failed, manager.records.items[0].status);
+    try std.testing.expectEqual(@as(?std.process.Child.Id, null), manager.records.items[0].process.?.id);
+    try std.testing.expect(manager.records.items[1].status != .queued);
+}
+
+test "foreground workers obey the same concurrency limit as background workers" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "worker",
+        .data = "#!/bin/sh\nmkdir occupied || exit 23\nsleep 0.2\nrmdir occupied\nprintf done\n",
+        .flags = .{ .permissions = @enumFromInt(0o700) },
+    });
+    const cwd = try temporary.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    var manager = try Manager.init(std.testing.allocator, std.testing.io, cwd, .{ .max_concurrent = 1 });
+    defer manager.deinit();
+    std.testing.allocator.free(manager.executable);
+    manager.executable = try temporary.dir.realPathFileAlloc(std.testing.io, "worker", std.testing.allocator);
+    var background = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"prompt":"finish","description":"Background worker"}
+    , .{});
+    defer background.deinit();
+    const launch: Launch = .{ .provider = "chatgpt", .model = "test-model", .effort = null, .fast = false };
+    const started = try manager.execute(std.testing.allocator, "Agent", background.value, launch);
+    defer std.testing.allocator.free(started);
+    for (0..100) |_| {
+        _ = temporary.dir.statFile(std.testing.io, "occupied", .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                try std.testing.io.sleep(.fromMilliseconds(1), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        break;
+    }
+    _ = try temporary.dir.statFile(std.testing.io, "occupied", .{});
+    var foreground = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"prompt":"finish","description":"Foreground worker","run_in_background":false}
+    , .{});
+    defer foreground.deinit();
+    const result = try manager.execute(std.testing.allocator, "Agent", foreground.value, launch);
+    defer std.testing.allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Status: completed") != null);
+    try std.testing.expectEqual(Status.completed, manager.records.items[0].status);
+}
+
+test "response allocation failure keeps ownership of a launched worker" {
+    var manager = try Manager.init(std.testing.allocator, std.testing.io, "/tmp", .{});
+    defer manager.deinit();
+    std.testing.allocator.free(manager.executable);
+    manager.executable = try std.testing.allocator.dupeZ(u8, "/bin/echo");
+    var args = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"prompt":"finish","description":"Retained worker"}
+    , .{});
+    defer args.deinit();
+    var probe = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const briefing = try buildBriefing(probe.allocator(), "finish");
+    probe.allocator().free(briefing);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = probe.alloc_index });
+    try std.testing.expectError(error.WriteFailed, manager.execute(failing.allocator(), "Agent", args.value, .{
+        .provider = "chatgpt",
+        .model = "test-model",
+        .effort = null,
+        .fast = false,
+    }));
+    try std.testing.expectEqual(@as(usize, 1), manager.records.items.len);
+    try manager.waitFor(manager.records.items[0], false);
+    try std.testing.expectEqual(Status.completed, manager.records.items[0].status);
+}
+
+test "failed result delivery leaves completed workers available" {
+    var manager = try Manager.init(std.testing.allocator, std.testing.io, "/tmp", .{});
+    defer manager.deinit();
+    std.testing.allocator.free(manager.executable);
+    manager.executable = try std.testing.allocator.dupeZ(u8, "/bin/echo");
+    var args = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"prompt":"finish","description":"Retry delivery"}
+    , .{});
+    defer args.deinit();
+    const launch: Launch = .{ .provider = "chatgpt", .model = "test-model", .effort = null, .fast = false };
+    for (0..2) |_| {
+        const started = try manager.execute(std.testing.allocator, "Agent", args.value, launch);
+        std.testing.allocator.free(started);
+    }
+    for (manager.records.items) |record| try manager.waitFor(record, false);
+    const result_args_text = try std.fmt.allocPrint(std.testing.allocator, "{{\"agent_id\":\"{s}\"}}", .{manager.records.items[0].id});
+    defer std.testing.allocator.free(result_args_text);
+    var result_args = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result_args_text, .{});
+    defer result_args.deinit();
+    try std.testing.expectError(error.WriteFailed, manager.getResult(std.testing.failing_allocator, result_args.value));
+    try std.testing.expect(!manager.records.items[0].consumed);
+
+    for (0..50) |index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = index });
+        const notification = manager.takeNotifications(failing.allocator()) catch {
+            for (manager.records.items) |record| try std.testing.expect(!record.notified);
+            continue;
+        };
+        defer if (notification) |text| std.testing.allocator.free(text);
+        try std.testing.expect(notification != null);
+        for (manager.records.items) |record| try std.testing.expect(record.notified);
+        return;
+    }
+    return error.NotificationNeverSucceeded;
+}
+
+test "large worker outputs return a bounded prefix" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const file = try temporary.dir.createFile(std.testing.io, "large", .{});
+    defer file.close(std.testing.io);
+    try file.setLength(std.testing.io, 8 * 1024 * 1024);
+    try file.writePositionalAll(std.testing.io, "answer", 0);
+    const path = try temporary.dir.realPathFileAlloc(std.testing.io, "large", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    var manager = try Manager.init(std.testing.allocator, std.testing.io, "/tmp", .{});
+    defer manager.deinit();
+    const result = try manager.readCapped(std.testing.allocator, path);
+    defer std.testing.allocator.free(result);
+    try std.testing.expect(std.mem.startsWith(u8, result, "answer"));
+    try std.testing.expect(std.mem.indexOf(u8, result, "[truncated; full subagent output:") != null);
+    try std.testing.expect(result.len < result_limit + path.len);
+    for (0..20) |index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = index, .resize_fail_index = 0 });
+        const bounded = manager.readCapped(failing.allocator(), path) catch {
+            try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            continue;
+        };
+        failing.allocator().free(bounded);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        return;
+    }
+    return error.ResultNeverSucceeded;
+}
+
+test "disabling subagents stops queued workers and result waits return" {
+    var manager = try Manager.init(std.testing.allocator, std.testing.io, "/tmp", .{ .max_concurrent = 1 });
+    defer manager.deinit();
+    std.testing.allocator.free(manager.executable);
+    manager.executable = try std.testing.allocator.dupeZ(u8, "/bin/echo");
+    var args = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"prompt":"finish","description":"Queued worker"}
+    , .{});
+    defer args.deinit();
+    const launch: Launch = .{ .provider = "chatgpt", .model = "test-model", .effort = null, .fast = false };
+    for (0..2) |_| {
+        const started = try manager.execute(std.testing.allocator, "Agent", args.value, launch);
+        std.testing.allocator.free(started);
+    }
+    const queued = manager.records.items[1];
+    try std.testing.expectEqual(Status.queued, queued.status);
+    try manager.configure(.{ .enabled = false, .max_concurrent = 1 });
+    try std.testing.expectEqual(Status.stopped, queued.status);
+    try std.testing.expect(queued.process == null);
+    const result_args_text = try std.fmt.allocPrint(std.testing.allocator, "{{\"agent_id\":\"{s}\",\"wait\":true}}", .{queued.id});
+    defer std.testing.allocator.free(result_args_text);
+    var result_args = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result_args_text, .{});
+    defer result_args.deinit();
+    const result = try manager.getResult(std.testing.allocator, result_args.value);
+    defer std.testing.allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Status: stopped") != null);
+    try manager.configure(.{ .max_concurrent = 1 });
+    try std.testing.expectEqual(Status.stopped, queued.status);
+    try std.testing.expect(queued.process == null);
+}
+
+test "stopping a worker interrupts and reaps its separate tool group" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "worker",
+        .data =
+        \\#!/bin/bash
+        \\set -m
+        \\interrupts=0
+        \\on_interrupt() {
+        \\  interrupts=$((interrupts + 1))
+        \\  if [ "$interrupts" -eq 1 ]; then kill -TERM -- "-$tool"; else kill -KILL -- "-$tool"; fi
+        \\}
+        \\trap on_interrupt INT
+        \\trap 'printf stopped > worker-exit' EXIT
+        \\/bin/bash -c 'trap "" TERM; printf ready > tool-ready; sleep 30' &
+        \\tool=$!
+        \\while [ ! -f tool-ready ]; do sleep 0.01; done
+        \\printf '%s %s\n' "$$" "$tool" > pids
+        \\kill -KILL "$PPID"
+        \\while kill -0 "$tool" 2>/dev/null; do wait "$tool"; done
+        \\
+        ,
+        .flags = .{ .permissions = @enumFromInt(0o700) },
+    });
+    const cwd = try temporary.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    var manager = try Manager.init(std.testing.allocator, std.testing.io, cwd, .{});
+    defer manager.deinit();
+    std.testing.allocator.free(manager.executable);
+    manager.executable = try temporary.dir.realPathFileAlloc(std.testing.io, "worker", std.testing.allocator);
+    var args = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"prompt":"wait","description":"Separate tool group"}
+    , .{});
+    defer args.deinit();
+    const launched = try manager.execute(std.testing.allocator, "Agent", args.value, .{
+        .provider = "chatgpt",
+        .model = "test-model",
+        .effort = null,
+        .fast = false,
+    });
+    defer std.testing.allocator.free(launched);
+    const record = manager.records.items[0];
+    const pids = try waitTestFile(temporary.dir, "pids");
+    defer std.testing.allocator.free(pids);
+    var fields = std.mem.tokenizeAny(u8, pids, " \n");
+    const worker_pid = try std.fmt.parseInt(std.posix.pid_t, fields.next().?, 10);
+    const tool_pid = try std.fmt.parseInt(std.posix.pid_t, fields.next().?, 10);
+    defer std.posix.kill(-tool_pid, .KILL) catch {};
+
+    manager.stop(record);
+    try std.testing.expectEqual(Status.stopped, record.status);
+    try std.testing.expectEqual(@as(?std.process.Child.Id, null), record.process.?.id);
+    const exited = try temporary.dir.readFileAlloc(std.testing.io, "worker-exit", std.testing.allocator, .limited(64));
+    defer std.testing.allocator.free(exited);
+    try std.testing.expectEqualStrings("stopped", exited);
+    try std.testing.expect(!processGroupExists(tool_pid));
+
+    // The wrapper was deliberately killed. An exited orphan can remain a
+    // zombie until the system's init process reaps it; it must not be running.
+    const pid_text = try std.fmt.allocPrint(std.testing.allocator, "{d}", .{worker_pid});
+    defer std.testing.allocator.free(pid_text);
+    const status = try std.process.run(std.testing.allocator, std.testing.io, .{
+        .argv = &.{ "ps", "-o", "stat=", "-p", pid_text },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    });
+    defer std.testing.allocator.free(status.stdout);
+    defer std.testing.allocator.free(status.stderr);
+    const state = std.mem.trim(u8, status.stdout, " \r\n\t");
+    try std.testing.expect(state.len == 0 or state[0] == 'Z');
+}
+
+test "stopping all workers shares one bounded grace period" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "worker",
+        .data = "#!/bin/bash\ntrap '' INT\nprintf ready\nwhile :; do sleep 30; done\n",
+        .flags = .{ .permissions = @enumFromInt(0o700) },
+    });
+    var manager = try Manager.init(std.testing.allocator, std.testing.io, "/tmp", .{ .max_concurrent = 3 });
+    defer manager.deinit();
+    std.testing.allocator.free(manager.executable);
+    manager.executable = try temporary.dir.realPathFileAlloc(std.testing.io, "worker", std.testing.allocator);
+    var args = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"prompt":"wait","description":"Ignores interrupts"}
+    , .{});
+    defer args.deinit();
+    for (0..3) |_| {
+        const started = try manager.execute(std.testing.allocator, "Agent", args.value, .{
+            .provider = "chatgpt",
+            .model = "test-model",
+            .effort = null,
+            .fast = false,
+        });
+        std.testing.allocator.free(started);
+    }
+    for (manager.records.items) |record| {
+        const ready = try waitTestFile(Io.Dir.cwd(), record.output_path);
+        defer std.testing.allocator.free(ready);
+        try std.testing.expectEqualStrings("ready", ready);
+    }
+    const started = Io.Clock.now(.awake, std.testing.io);
+    manager.stopAll();
+    const elapsed = started.durationTo(Io.Clock.now(.awake, std.testing.io)).nanoseconds;
+    try std.testing.expect(elapsed < 2500 * std.time.ns_per_ms);
+    for (manager.records.items) |record| {
+        try std.testing.expectEqual(Status.stopped, record.status);
+        try std.testing.expectEqual(@as(?std.process.Child.Id, null), record.process.?.id);
+    }
+}
+
+fn waitTestFile(dir: Io.Dir, path: []const u8) ![]u8 {
+    for (0..200) |_| {
+        const contents = dir.readFileAlloc(std.testing.io, path, std.testing.allocator, .limited(256)) catch |err| switch (err) {
+            error.FileNotFound => {
+                try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        if (contents.len != 0) return contents;
+        std.testing.allocator.free(contents);
+        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    return error.WorkerNotReady;
 }

@@ -47,7 +47,9 @@ pub const Request = struct {
 /// HTTP adapter. The callback must allocate `Response.body` with `gpa`; xaq
 /// frees it after the call. SSE body lines must be delivered in order through
 /// `on_line`, and no callback may outlive `post_stream`. The default adapter
-/// launches curl without process-global state.
+/// launches curl without process-global state. A successful response must
+/// include the provider's completion event; otherwise the prompt fails with
+/// `IncompleteProviderResponse` before executing that response's tool calls.
 pub const Transport = struct {
     context: ?*anyopaque = null,
     post_stream: *const fn (
@@ -429,7 +431,10 @@ pub const Agent = struct {
                 try self.emit(.{ .tool_start = call });
                 results[index] = .{
                     .id = call.id,
-                    .text = try self.executeTool(call, prompt_allocator),
+                    .text = self.executeTool(call, prompt_allocator) catch |err| {
+                        if (err == error.Cancelled) return self.cancelled();
+                        return err;
+                    },
                 };
                 try self.emit(.{ .tool_finish = .{ .call = call, .result = results[index].text } });
             }
@@ -439,6 +444,7 @@ pub const Agent = struct {
     }
 
     fn completePrompt(self: *Agent, prompt_arena: std.heap.ArenaAllocator, retained: *bool, turn: Turn) !Turn {
+        if (self.cancellation.isRequested()) return self.cancelled();
         try self.prompt_arenas.append(self.gpa, prompt_arena);
         retained.* = true;
         self.emit(.{ .completed = turn }) catch |err| {
@@ -481,7 +487,9 @@ pub const Agent = struct {
         var force_refresh = false;
         while (attempt <= 2) : (attempt += 1) {
             try self.emit(.{ .request_start = .{ .round = round, .attempt = attempt } });
+            if (self.cancellation.isRequested()) return error.Cancelled;
             const credential = try self.loadCredential(request_arena.allocator(), force_refresh);
+            if (self.cancellation.isRequested()) return error.Cancelled;
             var delta_sink: DeltaSink = .{ .agent = self, .output = output };
             var decoder = stream.Decoder.init(
                 self.provider,
@@ -568,6 +576,7 @@ pub const Agent = struct {
     }
 
     fn executeTool(self: *Agent, call: ToolCall, persist: std.mem.Allocator) ![]const u8 {
+        if (self.cancellation.isRequested()) return error.Cancelled;
         var scratch: std.heap.ArenaAllocator = .init(self.gpa);
         defer scratch.deinit();
         const allocator = scratch.allocator();
@@ -577,24 +586,29 @@ pub const Agent = struct {
 
         const custom = isCustomTool(self.tool_definitions, call.name);
         if (self.permissions) |permissions| {
-            if (!try permissions.authorize(permissions.context, call, parsed.value, self.local_tools and isBuiltinTool(call.name))) {
+            const authorized = try permissions.authorize(permissions.context, call, parsed.value, self.local_tools and isBuiltinTool(call.name));
+            if (self.cancellation.isRequested()) return error.Cancelled;
+            if (!authorized) {
                 try self.emit(.{ .tool_denied = call });
                 return persist.dupe(u8, "tool denied by host");
             }
         }
 
-        const result = if (custom) blk: {
+        const result = (if (custom) blk: {
             const host = self.tool_host orelse return error.ToolHostRequired;
-            break :blk host.execute(host.context, allocator, self.io, call, parsed.value, &self.cancellation) catch |err|
-                try std.fmt.allocPrint(allocator, "tool error: {s}", .{@errorName(err)});
+            break :blk host.execute(host.context, allocator, self.io, call, parsed.value, &self.cancellation);
         } else if (self.local_tools)
             tool_runtime.executeWithContext(allocator, self.io, call.name, parsed.value, .{
                 .cwd = self.cwd,
                 .write_enabled = self.write_enabled,
                 .cancellation = &self.cancellation,
-            }) catch |err| try std.fmt.allocPrint(allocator, "tool error: {s}", .{@errorName(err)})
+            })
         else
-            try std.fmt.allocPrint(allocator, "unknown tool: {s}", .{call.name});
+            std.fmt.allocPrint(allocator, "unknown tool: {s}", .{call.name})) catch |err| blk: {
+            if (err == error.Cancelled or self.cancellation.isRequested()) return error.Cancelled;
+            break :blk try std.fmt.allocPrint(allocator, "tool error: {s}", .{@errorName(err)});
+        };
+        if (self.cancellation.isRequested()) return error.Cancelled;
         if (result.len <= tool_runtime.max_output) return persist.dupe(u8, result);
         const suffix = "\n[host tool result truncated]";
         const keep = tool_runtime.max_output - suffix.len;
@@ -797,6 +811,39 @@ test "embedded agent streams, runs a host tool, and keeps history" {
     try std.testing.expectEqual(@as(usize, 1), turn.tool_calls);
     try std.testing.expectEqual(@as(usize, 4), embedded.history().len);
     try std.testing.expectEqual(@as(u64, 10), turn.usage.input);
+}
+
+test "clean EOF without provider completion rolls back without executing tools" {
+    const Fake = struct {
+        executions: usize = 0,
+
+        fn post(_: ?*anyopaque, gpa: std.mem.Allocator, _: Io, _: Request, line_context: ?*anyopaque, on_line: StreamLineFn) !Response {
+            try on_line(line_context, "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"change\",\"arguments\":\"{}\"}}");
+            return .{ .status = 200, .body = try gpa.dupe(u8, "") };
+        }
+
+        fn tool(raw: ?*anyopaque, gpa: std.mem.Allocator, _: Io, _: ToolCall, _: std.json.Value, _: *Cancellation) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.executions += 1;
+            return gpa.dupe(u8, "changed");
+        }
+    };
+
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var fake: Fake = .{};
+    var embedded = try Agent.init(std.testing.allocator, .{
+        .io = threaded.io(),
+        .cwd = "/workspace",
+        .credential = .{ .access = "token", .refresh = "", .expires = 0, .account_id = "account" },
+        .transport = .{ .post_stream = Fake.post },
+        .tools = &.{.{ .name = "change", .description = "Change a file.", .parameters_json = "{\"type\":\"object\"}" }},
+        .tool_host = .{ .context = &fake, .execute = Fake.tool },
+    });
+    defer embedded.deinit();
+    try std.testing.expectError(error.IncompleteProviderResponse, embedded.prompt("change it", .{}));
+    try std.testing.expectEqual(@as(usize, 0), fake.executions);
+    try std.testing.expectEqual(@as(usize, 0), embedded.history().len);
 }
 
 test "embedded agent instances cancel independently" {
@@ -1075,4 +1122,70 @@ test "transport cancellation emits an event and rolls back the turn" {
     try std.testing.expectError(error.Cancelled, embedded.prompt("stop", .{}));
     try std.testing.expectEqual(@as(usize, 1), fake.cancelled_events);
     try std.testing.expectEqual(@as(usize, 0), embedded.history().len);
+}
+
+test "host callbacks cancel before the next request or tool side effect" {
+    const Fake = struct {
+        stage: enum { request_start, tool_start, permission, tool_error },
+        agent: ?*Agent = null,
+        requests: usize = 0,
+        executions: usize = 0,
+        finishes: usize = 0,
+        cancelled_events: usize = 0,
+
+        fn post(raw: ?*anyopaque, gpa: std.mem.Allocator, _: Io, _: Request, line_context: ?*anyopaque, on_line: StreamLineFn) !Response {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.requests == 0) {
+                try on_line(line_context, "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"change\",\"arguments\":\"{}\"}}");
+                try on_line(line_context, "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_2\",\"name\":\"change\",\"arguments\":\"{}\"}}");
+            }
+            self.requests += 1;
+            try on_line(line_context, "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":4,\"output_tokens\":2}}}");
+            return .{ .status = 200, .body = try gpa.dupe(u8, "") };
+        }
+
+        fn event(raw: ?*anyopaque, value: Event) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if ((value == .request_start and self.stage == .request_start) or
+                (value == .tool_start and self.stage == .tool_start)) self.agent.?.cancel();
+            if (value == .tool_finish) self.finishes += 1;
+            if (value == .cancelled) self.cancelled_events += 1;
+        }
+
+        fn authorize(raw: ?*anyopaque, _: ToolCall, _: std.json.Value, _: bool) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.stage == .permission) self.agent.?.cancel();
+            return true;
+        }
+
+        fn tool(raw: ?*anyopaque, gpa: std.mem.Allocator, _: Io, _: ToolCall, _: std.json.Value, _: *Cancellation) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.executions += 1;
+            if (self.stage == .tool_error) return error.Cancelled;
+            return gpa.dupe(u8, "changed");
+        }
+    };
+
+    for (std.enums.values(@FieldType(Fake, "stage"))) |stage| {
+        var fake: Fake = .{ .stage = stage };
+        var embedded = try Agent.init(std.testing.allocator, .{
+            .io = std.testing.io,
+            .cwd = "/workspace",
+            .credential = .{ .access = "token", .refresh = "", .expires = 0, .account_id = "account" },
+            .transport = .{ .context = &fake, .post_stream = Fake.post },
+            .tools = &.{.{ .name = "change", .description = "Change a file.", .parameters_json = "{\"type\":\"object\"}" }},
+            .tool_host = .{ .context = &fake, .execute = Fake.tool },
+            .permissions = .{ .context = &fake, .authorize = Fake.authorize },
+            .events = .{ .context = &fake, .emit = Fake.event },
+        });
+        defer embedded.deinit();
+        fake.agent = &embedded;
+        try std.testing.expectError(error.Cancelled, embedded.prompt("cancel the change", .{}));
+        try std.testing.expectEqual(@as(usize, if (stage == .request_start) 0 else 1), fake.requests);
+        try std.testing.expectEqual(@as(usize, if (stage == .tool_error) 1 else 0), fake.executions);
+        try std.testing.expectEqual(@as(usize, 0), fake.finishes);
+        try std.testing.expectEqual(@as(usize, 1), fake.cancelled_events);
+        try std.testing.expectEqual(@as(usize, 0), embedded.history().len);
+        try std.testing.expectEqual(Usage{}, embedded.usage());
+    }
 }

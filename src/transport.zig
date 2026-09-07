@@ -84,6 +84,26 @@ pub fn postStreamWithToken(
     callback: StreamFn,
     token: *cancel.Token,
 ) !Response {
+    if (token.isRequested()) return error.Cancelled;
+    return postStreamRequest(gpa, io, url, content_type, headers, body, callback_context, callback, token) catch |err| {
+        // Cancellation can also close curl's stdin during config writes.
+        // Preserve the cancellation result throughout request setup and I/O.
+        if (token.isRequested()) return error.Cancelled;
+        return err;
+    };
+}
+
+fn postStreamRequest(
+    gpa: std.mem.Allocator,
+    io: Io,
+    url: []const u8,
+    content_type: []const u8,
+    headers: []const Header,
+    body: []const u8,
+    callback_context: ?*anyopaque,
+    callback: StreamFn,
+    token: *cancel.Token,
+) !Response {
     const path = try requestFile(gpa, io, body);
     defer {
         Io.Dir.cwd().deleteFile(io, path) catch {};
@@ -100,6 +120,7 @@ pub fn postStreamWithToken(
     defer if (child.id != null) child.kill(io);
     token.setChild(child.id.?);
     defer token.clearChild();
+    if (token.isRequested()) return error.Cancelled;
 
     var config_buffer: [4096]u8 = undefined;
     var config: Io.File.Writer = .init(child.stdin.?, io, &config_buffer);
@@ -278,6 +299,36 @@ test "form encoding" {
     const value = try formEncode(std.testing.allocator, &.{ .{ "scope", "a b" }, .{ "x", "+" } });
     defer std.testing.allocator.free(value);
     try std.testing.expectEqualStrings("scope=a+b&x=%2B", value);
+}
+
+test "cancelled requests stop before allocating or spawning curl" {
+    var token: cancel.Token = .{};
+    token.request();
+    const Sink = struct {
+        fn line(_: ?*anyopaque, _: []const u8) !void {
+            return error.UnexpectedResponse;
+        }
+    };
+    try std.testing.expectError(error.Cancelled, postStreamWithToken(std.testing.failing_allocator, std.testing.io, "https://example.invalid", "application/json", &.{}, "{}", null, Sink.line, &token));
+}
+
+test "cancellation during request setup takes precedence over its failure" {
+    var token: cancel.Token = .{};
+    const Setup = struct {
+        fn alloc(raw: *anyopaque, _: usize, _: std.mem.Alignment, _: usize) ?[*]u8 {
+            const cancellation: *cancel.Token = @ptrCast(@alignCast(raw));
+            cancellation.request();
+            return null;
+        }
+
+        fn line(_: ?*anyopaque, _: []const u8) !void {
+            return error.UnexpectedResponse;
+        }
+    };
+    var vtable = std.testing.failing_allocator.vtable.*;
+    vtable.alloc = Setup.alloc;
+    const allocator: std.mem.Allocator = .{ .ptr = &token, .vtable = &vtable };
+    try std.testing.expectError(error.Cancelled, postStreamWithToken(allocator, std.testing.io, "https://example.invalid", "application/json", &.{}, "{}", null, Setup.line, &token));
 }
 
 test "HTTP response helpers" {

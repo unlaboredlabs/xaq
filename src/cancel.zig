@@ -17,6 +17,18 @@ pub const Token = struct {
         return self.requested_flag.load(.seq_cst);
     }
 
+    /// Keep Ctrl-C responsive during provider backoff and login polling.
+    pub fn sleep(self: *const Token, io: std.Io, duration: std.Io.Duration) !void {
+        if (self.isRequested()) return error.Cancelled;
+        const deadline = std.Io.Clock.now(.awake, io).addDuration(duration);
+        while (true) {
+            if (self.isRequested()) return error.Cancelled;
+            const remaining = std.Io.Clock.now(.awake, io).durationTo(deadline);
+            if (remaining.nanoseconds <= 0) return;
+            try io.sleep(.fromNanoseconds(@min(remaining.nanoseconds, 50 * std.time.ns_per_ms)), .awake);
+        }
+    }
+
     pub fn reset(self: *Token) void {
         self.requested_flag.store(false, .seq_cst);
     }
@@ -25,6 +37,9 @@ pub const Token = struct {
         // Do not clear an already-delivered cancellation here. Callers reset
         // only after handling it; clearing during a retry can lose it.
         self.child_group.store(pid, .seq_cst);
+        // Cancellation may have arrived between spawning and registration.
+        // The requester could not signal this group until it was published.
+        if (self.isRequested()) std.posix.kill(-pid, .TERM) catch {};
     }
 
     pub fn clearChild(self: *Token) void {
@@ -96,4 +111,39 @@ test "tokens cancel independently" {
     try std.testing.expect(!second.isRequested());
     first.reset();
     try std.testing.expect(!first.isRequested());
+}
+
+test "backoff sleep stops promptly when cancelled" {
+    var token: Token = .{};
+    const Request = struct {
+        fn run(io: std.Io, value: *Token) void {
+            io.sleep(.fromMilliseconds(20), .awake) catch return;
+            value.request();
+        }
+    };
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var future = try io.concurrent(Request.run, .{ io, &token });
+    defer future.await(io);
+    const started = std.Io.Clock.now(.awake, io);
+    try std.testing.expectError(error.Cancelled, token.sleep(io, .fromSeconds(5)));
+    try std.testing.expect(started.durationTo(std.Io.Clock.now(.awake, io)).nanoseconds < 2 * std.time.ns_per_s);
+    try std.testing.expectError(error.Cancelled, token.sleep(undefined, .zero));
+}
+
+test "child registration delivers an earlier cancellation" {
+    const io = std.testing.io;
+    var token: Token = .{};
+    token.request();
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "/bin/sleep", "1" },
+        .pgid = 0,
+    });
+    defer if (child.id != null) child.kill(io);
+    token.setChild(child.id.?);
+    defer token.clearChild();
+    const term = try child.wait(io);
+    token.clearChild();
+    try std.testing.expectEqual(std.process.Child.Term{ .signal = .TERM }, term);
 }

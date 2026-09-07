@@ -58,6 +58,13 @@ const mouse_scroll_lines = 3;
 const PastedText = struct {
     placeholder: []u8,
     text: []u8,
+    trailing_backslashes: usize,
+};
+
+const ExpandedText = struct {
+    text: []u8,
+    truncated: bool,
+    continued: bool,
 };
 
 pub const SubmissionKind = enum { steer, follow_up };
@@ -70,6 +77,8 @@ pub const Submission = struct {
 const PhysicalResult = struct {
     kind: SubmissionKind = .steer,
     text: []const u8,
+    continued: bool = false,
+    truncated: bool = false,
 };
 
 const PhysicalOptions = struct {
@@ -90,23 +99,36 @@ pub fn readLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
     defer continuation_line = false;
     var first_result = (try physicalLine(gpa, reader, output, suggestions, paths, initial, .{})) orelse return null;
     var first = first_result.text;
-    if (!continues(first)) {
+    if (!first_result.continued) {
         historyPush(gpa, first);
         return first;
     }
     var result: Io.Writer.Allocating = .init(gpa);
     defer result.deinit();
+    var truncated = false;
+    var truncation_notified = false;
     while (true) {
-        const more = continues(first);
-        try result.writer.writeAll(if (more) first[0 .. first.len - 1] else first);
-        gpa.free(first);
+        const more = first_result.continued;
+        {
+            defer gpa.free(first);
+            const part = if (more and !first_result.truncated) first[0 .. first.len - 1] else first;
+            if (!truncated) truncated = !try appendExpandedText(&result, part);
+            truncated = truncated or first_result.truncated;
+            truncation_notified = truncation_notified or first_result.truncated;
+            if (truncated) discardUnretainedClipboardImages(paths, first, result.written());
+        }
         if (!more) break;
-        try result.writer.writeByte('\n');
+        if (!truncated) truncated = !try appendExpandedText(&result, "\n");
         continuation_line = true;
         first_result = (try physicalLine(gpa, reader, output, suggestions, paths, null, .{})) orelse break;
         first = first_result.text;
     }
+    if (truncated and !truncation_notified) {
+        try output.print("{s}[input limited to 4 MiB]{s}\n", .{ term.dim(), term.reset() });
+        try output.flush();
+    }
     const line = try result.toOwnedSlice();
+    errdefer gpa.free(line);
     const trimmed_len = std.mem.trimEnd(u8, line, " \t\r\n").len;
     const trimmed = try gpa.realloc(line, trimmed_len);
     historyPush(gpa, trimmed);
@@ -246,12 +268,10 @@ fn plainSecret(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, l
 
 fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, suggestions: []const Suggestion, paths: ?PathContext, initial: ?[]const u8, options: PhysicalOptions) !?PhysicalResult {
     if (!interactive) {
-        const line = (try plainLine(gpa, reader, output)) orelse return null;
-        return .{ .text = line };
+        return plainLine(gpa, reader, output);
     }
     const raw = RawMode.enter() catch {
-        const line = (try plainLine(gpa, reader, output)) orelse return null;
-        return .{ .text = line };
+        return plainLine(gpa, reader, output);
     };
     defer raw.exit();
     if (tui.active) tui.beginInput();
@@ -337,8 +357,10 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                 },
                 .stop => {
                     if (options.draft) |draft| {
-                        discardUnusedClipboardImages(gpa, files.context, buffer.items, &pasted_image_paths);
-                        draft.* = try expandPastedTexts(gpa, buffer.items, pasted_texts.items);
+                        const expanded = try expandPastedTexts(gpa, buffer.items, pasted_texts.items);
+                        errdefer gpa.free(expanded.text);
+                        try discardUnusedImagePaths(gpa, files.context, expanded.text, &pasted_image_paths);
+                        draft.* = expanded.text;
                         preserve_clipboard_files = true;
                     }
                     try endEditor(output, popup_rows);
@@ -378,7 +400,7 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                 }
                 const trimmed = submissionText(buffer.items, continuation_line) orelse {
                     buffer.clearRetainingCapacity();
-                    discardUnusedClipboardImages(gpa, files.context, buffer.items, &pasted_image_paths);
+                    try discardUnusedImagePaths(gpa, files.context, buffer.items, &pasted_image_paths);
                     input_truncated = false;
                     cursor = 0;
                     selected = 0;
@@ -409,14 +431,22 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                     try output.writeAll("\x1b[K\r\n");
                     try output.flush();
                 }
-                if (input_truncated and !options.busy) {
+                const submitted = try expandPastedTexts(gpa, trimmed, pasted_texts.items);
+                errdefer gpa.free(submitted.text);
+                try discardUnusedImagePaths(gpa, files.context, submitted.text, &pasted_image_paths);
+                if ((input_truncated or submitted.truncated) and !options.busy) {
                     try output.print("{s}[input limited to 4 MiB]{s}\n", .{ term.dim(), term.reset() });
                     try output.flush();
                 }
-                const submitted = try expandPastedTexts(gpa, trimmed, pasted_texts.items);
-                discardUnusedClipboardImages(gpa, files.context, buffer.items, &pasted_image_paths);
-                preserve_clipboard_files = submitted.len > 0 and submitted[0] != '/' and submitted[0] != '!';
-                return .{ .kind = submission_kind, .text = submitted };
+                preserve_clipboard_files = submitted.text.len > 0 and submitted.text[0] != '/' and submitted.text[0] != '!';
+                return .{
+                    .kind = submission_kind,
+                    .text = submitted.text,
+                    // Raw clipping loses the original suffix, so a retained
+                    // backslash must not create a new continuation prompt.
+                    .continued = !input_truncated and submitted.continued,
+                    .truncated = input_truncated or submitted.truncated,
+                };
             },
             0x7f, 0x08 => if (cursor > 0) {
                 const previous = prevBoundary(buffer.items, cursor);
@@ -429,6 +459,7 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
             },
             0x03 => if (buffer.items.len > 0) {
                 buffer.clearRetainingCapacity();
+                try discardUnusedImagePaths(gpa, files.context, buffer.items, &pasted_image_paths);
                 input_truncated = false;
                 cursor = 0;
                 selected = 0;
@@ -495,6 +526,7 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                 return null;
             },
             0x16 => { // ctrl-v: paste a bitmap from the desktop clipboard
+                try discardUnusedImagePaths(gpa, files.context, buffer.items, &pasted_image_paths);
                 if (pasted_image_paths.items.len == image_input.max_images_per_prompt) {
                     try showClipboardHint(output, "at most 4 images");
                     continue;
@@ -658,6 +690,7 @@ fn physicalLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
                         },
                         200 => {
                             const paste_start = cursor;
+                            try discardUnusedImagePaths(gpa, files.context, buffer.items, &pasted_image_paths);
                             discardUnusedPastedTexts(gpa, buffer.items, &pasted_texts);
                             input_truncated = !(try pasteInto(gpa, &buffer, &cursor, reader, options.stop, totalStashedBytes(pasted_texts.items))) or input_truncated;
                             if (shouldStashPaste(buffer.items[paste_start..cursor])) {
@@ -868,14 +901,18 @@ fn pasteInto(gpa: std.mem.Allocator, buffer: *std.ArrayList(u8), cursor: *usize,
     }
     // When clipped at the cap, land on a code-point boundary; the byte
     // cap alone could split a multibyte character into invalid UTF-8.
-    var keep = pasted.items.len;
-    if (!complete) {
-        while (keep > 0 and pasted.items[keep - 1] & 0xc0 == 0x80) keep -= 1;
-        if (keep > 0 and pasted.items[keep - 1] >= 0xc0) keep -= 1;
-    }
+    const keep = if (complete) pasted.items.len else completeUtf8Prefix(pasted.items);
     try buffer.insertSlice(gpa, cursor.*, pasted.items[0..keep]);
     cursor.* += keep;
     return complete;
+}
+
+fn completeUtf8Prefix(text: []const u8) usize {
+    if (text.len == 0) return 0;
+    var start = text.len - 1;
+    while (start > 0 and text[start] & 0xc0 == 0x80) start -= 1;
+    const needed = std.unicode.utf8ByteSequenceLength(text[start]) catch return text.len;
+    return if (needed > text.len - start) start else text.len;
 }
 
 /// Big pastes read better as a placeholder than as a wall of text in a
@@ -912,7 +949,7 @@ fn stashPastedText(gpa: std.mem.Allocator, buffer: *std.ArrayList(u8), cursor: *
     }
     try buffer.replaceRange(gpa, start, region_len, placeholder);
     cursor.* = start + placeholder.len;
-    try pastes.append(gpa, .{ .placeholder = placeholder, .text = text });
+    try pastes.append(gpa, .{ .placeholder = placeholder, .text = text, .trailing_backslashes = trailingBackslashes(text) });
     seq.* += 1;
 }
 
@@ -939,32 +976,65 @@ fn totalStashedBytes(pastes: []const PastedText) usize {
     return total;
 }
 
-/// Rebuild outgoing text with every stashed paste restored in place of its
-/// placeholder. Unrecognized bracketed text passes through untouched.
-fn expandPastedTexts(gpa: std.mem.Allocator, text: []const u8, pastes: []const PastedText) ![]u8 {
-    if (pastes.len == 0) return gpa.dupe(u8, text);
+/// Rebuild outgoing text with stashed pastes restored. Enforce the input
+/// limit after expansion too: users can duplicate a placeholder or type more
+/// text after a large paste. Unrecognized bracketed text passes through.
+fn expandPastedTexts(gpa: std.mem.Allocator, text: []const u8, pastes: []const PastedText) !ExpandedText {
+    if (pastes.len == 0) {
+        const keep = if (text.len <= max_input_bytes) text.len else completeUtf8Prefix(text[0..max_input_bytes]);
+        return .{ .text = try gpa.dupe(u8, text[0..keep]), .truncated = keep != text.len, .continued = continues(text) };
+    }
     var expanded: Io.Writer.Allocating = .init(gpa);
     defer expanded.deinit();
     var offset: usize = 0;
+    var complete = true;
     while (offset < text.len) {
         const bracket = std.mem.indexOfScalarPos(u8, text, offset, '[') orelse {
-            try expanded.writer.writeAll(text[offset..]);
+            complete = try appendExpandedText(&expanded, text[offset..]);
             break;
         };
-        try expanded.writer.writeAll(text[offset..bracket]);
+        complete = try appendExpandedText(&expanded, text[offset..bracket]);
+        if (!complete) break;
         offset = bracket;
         const match = for (pastes) |paste| {
             if (std.mem.startsWith(u8, text[offset..], paste.placeholder)) break paste;
         } else null;
         if (match) |paste| {
-            try expanded.writer.writeAll(paste.text);
+            complete = try appendExpandedText(&expanded, paste.text);
             offset += paste.placeholder.len;
         } else {
-            try expanded.writer.writeByte('[');
+            complete = try appendExpandedText(&expanded, "[");
             offset += 1;
         }
+        if (!complete) break;
     }
-    return expanded.toOwnedSlice();
+    return .{ .text = try expanded.toOwnedSlice(), .truncated = !complete, .continued = expandedContinues(text, pastes) };
+}
+
+fn expandedContinues(text: []const u8, pastes: []const PastedText) bool {
+    var end = text.len;
+    var odd = false;
+    while (end > 0) {
+        if (text[end - 1] == '\\') {
+            odd = !odd;
+            end -= 1;
+            continue;
+        }
+        const suffix = for (pastes) |paste| {
+            if (std.mem.endsWith(u8, text[0..end], paste.placeholder)) break paste;
+        } else return odd;
+        odd = odd != (suffix.trailing_backslashes % 2 == 1);
+        if (suffix.trailing_backslashes != suffix.text.len) return odd;
+        end -= suffix.placeholder.len;
+    }
+    return odd;
+}
+
+fn appendExpandedText(expanded: *Io.Writer.Allocating, text: []const u8) !bool {
+    const available = max_input_bytes - expanded.written().len;
+    const keep = if (text.len <= available) text.len else completeUtf8Prefix(text[0..available]);
+    try expanded.writer.writeAll(text[0..keep]);
+    return keep == text.len;
 }
 
 /// Remember image paths from a bracketed paste so the editor can draw the
@@ -1051,19 +1121,11 @@ fn noteClipboardImagePaths(gpa: std.mem.Allocator, text: []const u8, known: *std
     }
 }
 
-fn promptContainsClipboardImage(text: []const u8, candidate: []const u8) bool {
-    var offset: usize = 0;
-    while (nextClipboardImagePath(text, &offset)) |path| {
-        if (std.mem.eql(u8, path, candidate)) return true;
-    }
-    return false;
-}
-
-fn discardUnusedClipboardImages(gpa: std.mem.Allocator, context: ?PathContext, text: []const u8, known: *std.ArrayList([]u8)) void {
+fn discardUnusedImagePaths(gpa: std.mem.Allocator, context: ?PathContext, text: []const u8, known: *std.ArrayList([]u8)) !void {
     var index: usize = 0;
     while (index < known.items.len) {
         const path = known.items[index];
-        if (promptContainsClipboardImage(text, path)) {
+        if (try image_input.containsPath(gpa, text, path)) {
             index += 1;
             continue;
         }
@@ -1074,9 +1136,19 @@ fn discardUnusedClipboardImages(gpa: std.mem.Allocator, context: ?PathContext, t
 }
 
 fn discardClipboardImagesInText(context: ?PathContext, text: []const u8) void {
+    discardUnretainedClipboardImages(context, text, "");
+}
+
+fn discardUnretainedClipboardImages(context: ?PathContext, text: []const u8, retained: []const u8) void {
     const value = context orelse return;
     var offset: usize = 0;
-    while (nextClipboardImagePath(text, &offset)) |path| image_input.discardClipboardTemp(value.io, path);
+    while (nextClipboardImagePath(text, &offset)) |path| {
+        var retained_offset: usize = 0;
+        const keep = while (nextClipboardImagePath(retained, &retained_offset)) |candidate| {
+            if (std.mem.eql(u8, path, candidate)) break true;
+        } else false;
+        if (!keep) image_input.discardClipboardTemp(value.io, path);
+    }
 }
 
 fn appendPasteByte(gpa: std.mem.Allocator, pasted: *std.ArrayList(u8), byte_in: u8, previous: *u8, available: usize, complete: *bool) !void {
@@ -1095,10 +1167,14 @@ fn appendPasteByte(gpa: std.mem.Allocator, pasted: *std.ArrayList(u8), byte_in: 
 }
 
 fn continues(line: []const u8) bool {
+    return trailingBackslashes(line) % 2 == 1;
+}
+
+fn trailingBackslashes(line: []const u8) usize {
     var count: usize = 0;
     var i = line.len;
     while (i > 0 and line[i - 1] == '\\') : (i -= 1) count += 1;
-    return count % 2 == 1;
+    return count;
 }
 
 /// Inline single-column picker: up/down or j/k moves, enter confirms,
@@ -1214,16 +1290,29 @@ fn endPick(output: *Io.Writer, drawn_rows: usize) !void {
     try output.flush();
 }
 
-fn plainLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer) !?[]const u8 {
+fn plainLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer) !?PhysicalResult {
     try prompt(output, "");
     try output.flush();
     var line: std.ArrayList(u8) = .empty;
     defer line.deinit(gpa);
     var truncated = false;
     var saw_byte = false;
+    var trailing_backslashes: usize = 0;
+    var trailing_whitespace = false;
     while (try takeByteOrNull(reader)) |byte| {
         saw_byte = true;
         if (byte == '\n') break;
+        // Preserve continuation syntax even when it falls beyond the cap.
+        // Whitespace is trimmed, but separates runs of backslashes.
+        if (byte == '\\') {
+            trailing_backslashes = if (trailing_whitespace) 1 else trailing_backslashes + 1;
+            trailing_whitespace = false;
+        } else if (byte == ' ' or byte == '\t' or byte == '\r') {
+            trailing_whitespace = true;
+        } else {
+            trailing_backslashes = 0;
+            trailing_whitespace = false;
+        }
         if (line.items.len < max_input_bytes) {
             try line.append(gpa, byte);
         } else {
@@ -1236,10 +1325,15 @@ fn plainLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer) !?[
         return null;
     }
     if (truncated) {
+        line.items.len = completeUtf8Prefix(line.items);
         try output.print("{s}[input limited to 4 MiB]{s}\n", .{ term.dim(), term.reset() });
         try output.flush();
     }
-    return try gpa.dupe(u8, std.mem.trim(u8, line.items, " \t\r\n"));
+    return .{
+        .text = try gpa.dupe(u8, std.mem.trim(u8, line.items, " \t\r\n")),
+        .continued = trailing_backslashes % 2 == 1,
+        .truncated = truncated,
+    };
 }
 
 /// True while reading the second and later physical lines of a
@@ -1331,7 +1425,10 @@ const FileIndex = struct {
                 self.gpa.free(path);
                 return;
             }
-            try self.items.append(self.gpa, path);
+            self.items.append(self.gpa, path) catch |err| {
+                self.gpa.free(path);
+                return err;
+            };
             self.bytes += path.len;
         }
     }
@@ -1368,7 +1465,10 @@ fn fileQuery(line: []const u8, cursor: usize) ?FileQuery {
 }
 
 fn fileMatches(path: []const u8, query: FileQuery) bool {
-    if (!query.at) return std.mem.startsWith(u8, path, query.text);
+    if (!query.at) {
+        const prefix = if (std.mem.startsWith(u8, query.text, "./")) query.text[2..] else query.text;
+        return std.mem.startsWith(u8, path, prefix);
+    }
     if (query.text.len == 0) return true;
     var matched: usize = 0;
     for (path) |byte| {
@@ -1403,7 +1503,7 @@ fn fillPath(gpa: std.mem.Allocator, buffer: *std.ArrayList(u8), cursor: *usize, 
     defer replacement.deinit();
     if (query.at) try replacement.writer.writeByte('@');
     for (path) |byte| {
-        if (byte == '\\' or std.ascii.isWhitespace(byte)) try replacement.writer.writeByte('\\');
+        if (byte == '\\' or byte == '\'' or byte == '"' or std.ascii.isWhitespace(byte)) try replacement.writer.writeByte('\\');
         try replacement.writer.writeByte(byte);
     }
     try replacement.writer.writeByte(' ');
@@ -2324,9 +2424,38 @@ test "clipboard temp tracking drops paths removed from a draft" {
 
     try noteClipboardImagePaths(std.testing.allocator, "compare @" ++ kept ++ " @" ++ removed, &known);
     try std.testing.expectEqual(@as(usize, 2), known.items.len);
-    discardUnusedClipboardImages(std.testing.allocator, null, "compare @" ++ kept, &known);
+    try discardUnusedImagePaths(std.testing.allocator, null, "compare @" ++ kept, &known);
     try std.testing.expectEqual(@as(usize, 1), known.items.len);
     try std.testing.expectEqualStrings(kept, known.items[0]);
+}
+
+test "discarding an image frees its attachment slot and deletes only owned temporary files" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var random: [12]u8 = undefined;
+    try io.randomSecure(&random);
+    const hex = std.fmt.bytesToHex(random, .lower);
+    const path = try std.fmt.allocPrint(gpa, "/tmp/xaq-clipboard-{s}.png", .{hex});
+    defer gpa.free(path);
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data = "clipboard data",
+        .flags = .{ .exclusive = true },
+    });
+    defer image_input.discardClipboardTemp(io, path);
+    var known: std.ArrayList([]u8) = .empty;
+    defer {
+        for (known.items) |item| gpa.free(item);
+        known.deinit(gpa);
+    }
+    try known.append(gpa, try gpa.dupe(u8, path));
+    try known.append(gpa, try gpa.dupe(u8, "before shot.png"));
+    try discardUnusedImagePaths(gpa, .{ .io = io, .cwd = "." }, "inspect @before\\ shot.png", &known);
+    try std.testing.expectEqual(@as(usize, 1), known.items.len);
+    try std.testing.expectEqualStrings("before shot.png", known.items[0]);
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().openFile(io, path, .{}));
+    try discardUnusedImagePaths(gpa, null, "", &known);
+    try std.testing.expectEqual(@as(usize, 0), known.items.len);
 }
 
 test "path completion replaces its token and escapes spaces" {
@@ -2339,6 +2468,23 @@ test "path completion replaces its token and escapes spaces" {
     try fillPath(std.testing.allocator, &buffer, &cursor, query, "src/agent notes.zig");
 
     try std.testing.expectEqualStrings("inspect @src/agent\\ notes.zig ", buffer.items);
+    try std.testing.expectEqual(buffer.items.len, cursor);
+}
+
+test "path completion accepts dot slash and preserves literal quotes in image names" {
+    const gpa = std.testing.allocator;
+    const query = fileQuery("read ./src/ag", "read ./src/ag".len).?;
+    try std.testing.expect(fileMatches("src/agent.zig", query));
+    try std.testing.expect(!fileMatches("other/src/agent.zig", query));
+    const all = fileQuery("read ./", "read ./".len).?;
+    try std.testing.expect(fileMatches("src/agent.zig", all));
+
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(gpa);
+    try buffer.appendSlice(gpa, "inspect @shot");
+    var cursor = buffer.items.len;
+    try fillPath(gpa, &buffer, &cursor, fileQuery(buffer.items, cursor).?, "\"before\" shot.png");
+    try std.testing.expect(try image_input.containsPath(gpa, buffer.items, "\"before\" shot.png"));
     try std.testing.expectEqual(buffer.items.len, cursor);
 }
 
@@ -2417,6 +2563,72 @@ test "bracketed paste consumes excess input and reports the hard limit" {
     try std.testing.expectEqual(source.len, reader.seek);
 }
 
+test "clipped paste retains every complete UTF-8 character that fits" {
+    const source = "é💻中!\x1b[201~";
+    const expected = [_][]const u8{ "", "", "é", "é", "é", "é", "é💻", "é💻", "é💻", "é💻中" };
+    for (expected, 0..) |text, available| {
+        var reader = Io.Reader.fixed(source);
+        var buffer: std.ArrayList(u8) = .empty;
+        defer buffer.deinit(std.testing.allocator);
+        var cursor: usize = 0;
+        try std.testing.expect(!try pasteInto(std.testing.allocator, &buffer, &cursor, &reader, null, max_input_bytes - available));
+        try std.testing.expectEqualStrings(text, buffer.items);
+        try std.testing.expectEqual(buffer.items.len, cursor);
+        try std.testing.expectEqual(source.len, reader.seek);
+    }
+}
+
+test "clipped plain input preserves UTF-8 and consumes through the newline" {
+    const gpa = std.testing.allocator;
+    const source = try gpa.alloc(u8, max_input_bytes + "é\nnext\n".len - 1);
+    defer gpa.free(source);
+    @memset(source[0 .. max_input_bytes - 1], 'a');
+    @memcpy(source[max_input_bytes - 1 ..], "é\nnext\n");
+    var reader = Io.Reader.fixed(source);
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    const clipped = (try plainLine(gpa, &reader, &output.writer)).?;
+    defer gpa.free(clipped.text);
+    try std.testing.expectEqual(max_input_bytes - 1, clipped.text.len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(clipped.text));
+    const next = (try plainLine(gpa, &reader, &output.writer)).?;
+    defer gpa.free(next.text);
+    try std.testing.expectEqualStrings("next", next.text);
+}
+
+test "continued input shares one byte limit and drains through the final physical line" {
+    const gpa = std.testing.allocator;
+    const previous_interactive = interactive;
+    defer interactive = previous_interactive;
+    interactive = false;
+    defer historyClear(gpa);
+
+    const cases = .{
+        .{ max_input_bytes - 2, "\\\né\\ \t\r\nignored\\\nlast\nnext\n" },
+        .{ max_input_bytes - 1, "é\\ \t\r\nignored\\\nlast\nnext\n" },
+    };
+    inline for (cases) |case| {
+        const source = try gpa.alloc(u8, case[0] + case[1].len);
+        defer gpa.free(source);
+        @memset(source[0..case[0]], 'a');
+        @memcpy(source[case[0]..], case[1]);
+        var reader = Io.Reader.fixed(source);
+        var output: Io.Writer.Allocating = .init(gpa);
+        defer output.deinit();
+        const clipped = (try readLine(gpa, &reader, &output.writer, &.{}, null, null)).?;
+        defer gpa.free(clipped);
+        try std.testing.expectEqual(case[0], clipped.len);
+        try std.testing.expect(std.mem.allEqual(u8, clipped, 'a'));
+        try std.testing.expect(std.unicode.utf8ValidateSlice(clipped));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output.written(), "[input limited to 4 MiB]"));
+
+        const next = (try readLine(gpa, &reader, &output.writer, &.{}, null, null)).?;
+        defer gpa.free(next);
+        try std.testing.expectEqualStrings("next", next);
+        try std.testing.expectEqual(source.len, reader.seek);
+    }
+}
+
 test "large pastes collapse to a placeholder and expand on submit" {
     const gpa = std.testing.allocator;
     var pastes: std.ArrayList(PastedText) = .empty;
@@ -2441,13 +2653,114 @@ test "large pastes collapse to a placeholder and expand on submit" {
     try std.testing.expectEqual(@as(usize, 1), seq);
 
     const expanded = try expandPastedTexts(gpa, buffer.items, pastes.items);
-    defer gpa.free(expanded);
-    try std.testing.expectEqualStrings("review " ++ body ++ " please", expanded);
+    defer gpa.free(expanded.text);
+    try std.testing.expect(!expanded.truncated);
+    try std.testing.expectEqualStrings("review " ++ body ++ " please", expanded.text);
 
     // Unknown bracketed text is preserved; only stashed placeholders expand.
     const partial = try expandPastedTexts(gpa, "[Pasted text #2] [Pasted text #1 +12 lines]", pastes.items);
-    defer gpa.free(partial);
-    try std.testing.expectEqualStrings("[Pasted text #2] " ++ body, partial);
+    defer gpa.free(partial.text);
+    try std.testing.expect(!partial.truncated);
+    try std.testing.expectEqualStrings("[Pasted text #2] " ++ body, partial.text);
+}
+
+test "duplicated paste placeholders cannot expand beyond the input limit" {
+    const gpa = std.testing.allocator;
+    const body = try gpa.alloc(u8, max_input_bytes / 2 + 1);
+    defer gpa.free(body);
+    @memset(body, 'x');
+    const marker = try gpa.dupe(u8, "[Pasted text #1 +1 lines]");
+    defer gpa.free(marker);
+    const text = try std.mem.concat(gpa, u8, &.{ marker, marker, marker });
+    defer gpa.free(text);
+    const expanded = try expandPastedTexts(gpa, text, &.{.{ .placeholder = marker, .text = body, .trailing_backslashes = trailingBackslashes(body) }});
+    defer gpa.free(expanded.text);
+    try std.testing.expect(expanded.truncated);
+    try std.testing.expectEqual(max_input_bytes, expanded.text.len);
+    try std.testing.expect(std.mem.allEqual(u8, expanded.text, 'x'));
+}
+
+test "typing after a full paste clips expansion on a UTF-8 boundary" {
+    const gpa = std.testing.allocator;
+    const body = try gpa.alloc(u8, max_input_bytes - 1);
+    defer gpa.free(body);
+    @memset(body, 'x');
+    const marker = try gpa.dupe(u8, "[Pasted text #1 +1 lines]");
+    defer gpa.free(marker);
+    const text = try std.mem.concat(gpa, u8, &.{ marker, "é" });
+    defer gpa.free(text);
+    const expanded = try expandPastedTexts(gpa, text, &.{.{ .placeholder = marker, .text = body, .trailing_backslashes = trailingBackslashes(body) }});
+    defer gpa.free(expanded.text);
+    try std.testing.expect(expanded.truncated);
+    try std.testing.expectEqual(max_input_bytes - 1, expanded.text.len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(expanded.text));
+}
+
+test "clipped paste continuation follows the full expanded suffix" {
+    const gpa = std.testing.allocator;
+    const body = try gpa.alloc(u8, max_input_bytes / 2);
+    defer gpa.free(body);
+    @memset(body, 'a');
+    body[body.len - 1] = '\\';
+    const marker = try gpa.dupe(u8, "[Pasted text #1 +1 lines]");
+    defer gpa.free(marker);
+    const cases = .{ .{ "done", false }, .{ "done\\", true }, .{ "\\", false }, .{ "\\\\", true } };
+    inline for (cases) |case| {
+        const text = try std.mem.concat(gpa, u8, &.{ marker, marker, case[0] });
+        defer gpa.free(text);
+        const expanded = try expandPastedTexts(gpa, text, &.{.{ .placeholder = marker, .text = body, .trailing_backslashes = 1 }});
+        defer gpa.free(expanded.text);
+        try std.testing.expect(expanded.truncated);
+        try std.testing.expect(continues(expanded.text));
+        try std.testing.expectEqual(case[1], expanded.continued);
+    }
+}
+
+test "continued input discards only clipboard files absent from its retained text" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const previous_interactive = interactive;
+    defer interactive = previous_interactive;
+    interactive = false;
+    defer historyClear(gpa);
+    var random: [12]u8 = undefined;
+    try io.randomSecure(&random);
+    const hex = std.fmt.bytesToHex(random, .lower);
+    const retained = try std.fmt.allocPrint(gpa, "/tmp/xaq-clipboard-{s}.png", .{hex});
+    defer gpa.free(retained);
+    const removed = try std.fmt.allocPrint(gpa, "/tmp/xaq-clipboard-{s}.jpg", .{hex});
+    defer gpa.free(removed);
+    const ordinary = try std.fmt.allocPrint(gpa, "/tmp/xaq-user-image-{s}.png", .{hex});
+    defer gpa.free(ordinary);
+    for ([_][]const u8{ retained, removed, ordinary }) |path| {
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "image", .flags = .{ .exclusive = true } });
+    }
+    defer for ([_][]const u8{ retained, removed, ordinary }) |path| {
+        Io.Dir.deleteFileAbsolute(io, path) catch {};
+    };
+    const prefix = try std.fmt.allocPrint(gpa, "@{s} ", .{retained});
+    defer gpa.free(prefix);
+    const suffix = try std.fmt.allocPrint(gpa, "\\\n@{s} @{s} @{s}\nnext\n", .{ retained, removed, ordinary });
+    defer gpa.free(suffix);
+    const source = try gpa.alloc(u8, max_input_bytes - 1 + suffix.len);
+    defer gpa.free(source);
+    @memcpy(source[0..prefix.len], prefix);
+    @memset(source[prefix.len .. max_input_bytes - 1], 'a');
+    @memcpy(source[max_input_bytes - 1 ..], suffix);
+    var reader = Io.Reader.fixed(source);
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    const clipped = (try readLine(gpa, &reader, &output.writer, &.{}, .{ .io = io, .cwd = "." }, null)).?;
+    defer gpa.free(clipped);
+    try std.testing.expect(std.mem.startsWith(u8, clipped, prefix));
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().openFile(io, removed, .{}));
+    for ([_][]const u8{ retained, ordinary }) |path| {
+        const file = try Io.Dir.cwd().openFile(io, path, .{});
+        file.close(io);
+    }
+    const next = (try readLine(gpa, &reader, &output.writer, &.{}, null, null)).?;
+    defer gpa.free(next);
+    try std.testing.expectEqualStrings("next", next);
 }
 
 test "small pastes stay inline" {
