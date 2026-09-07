@@ -761,6 +761,7 @@ const Capture = struct {
             .exclusive = true,
             .permissions = @enumFromInt(0o600),
         });
+        errdefer Io.Dir.cwd().deleteFile(self.io, path) catch {};
         errdefer file.close(self.io);
         if (self.tail_start == 0) {
             try file.writeStreamingAll(self.io, self.tail.items);
@@ -1222,4 +1223,53 @@ test "Firecrawl documents are capped to the tool output budget" {
     try std.testing.expect(warned.len <= max_output);
     try std.testing.expect(std.mem.indexOf(u8, warned, "[content truncated]") != null);
     try std.testing.expect(std.mem.endsWith(u8, warned, "w]"));
+}
+
+test "initial spill write failures leave no orphan and collisions preserve existing output" {
+    const Fault = struct {
+        threadlocal var bytes: [8]u8 = undefined;
+        fn random(_: ?*anyopaque, buffer: []u8) Io.RandomSecureError!void {
+            @memcpy(buffer, &bytes);
+        }
+        fn partial(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
+            if (operation == .file_write_streaming) {
+                var chunk = operation.file_write_streaming;
+                const body = chunk.data[0];
+                if (!std.mem.startsWith(u8, body, "captured")) return .{ .file_write_streaming = error.NoSpaceLeft };
+                chunk.data = &.{body[0..3]};
+                return std.testing.io.vtable.operate(userdata, .{ .file_write_streaming = chunk });
+            }
+            return std.testing.io.vtable.operate(userdata, operation);
+        }
+    };
+    const gpa = std.testing.allocator;
+    try std.testing.io.randomSecure(&Fault.bytes);
+    const hex = std.fmt.bytesToHex(Fault.bytes, .lower);
+    const path = try std.fmt.allocPrint(gpa, "/tmp/xaq-tool-output-{s}.log", .{&hex});
+    defer gpa.free(path);
+    var vtable = std.testing.io.vtable.*;
+    vtable.randomSecure = Fault.random;
+    vtable.operate = Fault.partial;
+    const io: Io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    var capture = Capture.init(gpa, io);
+    defer capture.deinit();
+    defer capture.discardSpill();
+    try capture.write("captured output");
+    try std.testing.expectError(error.NoSpaceLeft, capture.startSpill());
+    try std.testing.expectEqual(null, capture.spill);
+    try std.testing.expectEqual(null, capture.spill_path);
+    try std.testing.expectError(error.FileNotFound, Io.Dir.cwd().openFile(std.testing.io, path, .{}));
+
+    vtable.operate = std.testing.io.vtable.operate;
+    try Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "other capture", .flags = .{ .exclusive = true } });
+    defer Io.Dir.cwd().deleteFile(std.testing.io, path) catch {};
+    try std.testing.expectError(error.PathAlreadyExists, capture.startSpill());
+    const other = try Io.Dir.cwd().readFileAlloc(std.testing.io, path, gpa, .limited(1024));
+    defer gpa.free(other);
+    try std.testing.expectEqualStrings("other capture", other);
+    try Io.Dir.cwd().deleteFile(std.testing.io, path);
+    try capture.startSpill();
+    const retried = try Io.Dir.cwd().readFileAlloc(std.testing.io, path, gpa, .limited(1024));
+    defer gpa.free(retried);
+    try std.testing.expectEqualStrings("captured output", retried);
 }
