@@ -676,6 +676,10 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
                 try writeRunError(output_format, &json_output, output, "no saved thread for this directory");
                 std.process.exit(1);
             },
+            error.ThreadInUse => {
+                try writeRunError(output_format, &json_output, output, "thread is open in another session; close that session or start a new thread");
+                std.process.exit(1);
+            },
             error.InvalidEffortForModel => {
                 try writeRunError(output_format, &json_output, output, "selected reasoning effort is not supported by this model");
                 std.process.exit(1);

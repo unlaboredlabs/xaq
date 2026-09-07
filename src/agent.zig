@@ -197,31 +197,17 @@ const Session = struct {
     }
 
     fn setModel(self: *Session, value: []const u8) !void {
-        const next = try self.gpa.dupe(u8, value);
-        self.gpa.free(self.model);
-        self.model = next;
-        if (self.thread) |*thread| try thread.appendModel(value);
-        if (self.effort) |effort| {
-            if (!models.supportsEffort(self.provider, value, effort)) {
-                self.effort = null;
-                if (self.thread) |*thread| try thread.appendEffort("default");
-            }
-        }
-        if (self.fast and !models.supportsFast(self.provider, value)) {
-            self.fast = false;
-            if (self.thread) |*thread| try thread.appendFast(false);
-        }
-        self.refreshSuggestions();
+        _ = try self.switchProvider(self.provider, value);
     }
 
     fn setEffort(self: *Session, value: ?Effort) !void {
+        if (self.thread) |*thread| try thread.appendSelection(self.provider, self.model, if (value) |effort| @tagName(effort) else null, self.fast);
         self.effort = value;
-        if (self.thread) |*thread| try thread.appendEffort(if (value) |effort| @tagName(effort) else "default");
     }
 
     fn setFast(self: *Session, enabled: bool) !void {
+        if (self.thread) |*thread| try thread.appendSelection(self.provider, self.model, if (self.effort) |effort| @tagName(effort) else null, enabled);
         self.fast = enabled;
-        if (self.thread) |*thread| try thread.appendFast(enabled);
     }
 
     /// Move the session to another provider, keeping the visible
@@ -231,13 +217,26 @@ const Session = struct {
     /// plain text and tool-call form. That loss is one-way; the returned
     /// summary lets the caller say so at switch time.
     fn switchProvider(self: *Session, provider: auth.Provider, model: []const u8) !ProviderSwitch {
+        return self.setSelection(provider, model, self.effort, self.fast);
+    }
+
+    fn setSelection(self: *Session, provider: auth.Provider, model: []const u8, requested_effort: ?Effort, requested_fast: bool) !ProviderSwitch {
         const effort_before = self.effort;
         const fast_before = self.fast;
+        const next = try self.gpa.dupe(u8, model);
+        errdefer self.gpa.free(next);
+        const effort = if (requested_effort) |value| if (models.supportsEffort(provider, model, value)) value else null else null;
+        const fast = requested_fast and models.supportsFast(provider, model);
+        // Persist one complete selection before changing the live session.
+        // Replay drops private response items at the same provider boundary.
+        if (self.thread) |*thread| try thread.appendSelection(provider, model, if (effort) |value| @tagName(value) else null, fast);
+        const dropped = provider != self.provider and stripRawItems(self.entries.items);
         self.provider = provider;
-        if (self.thread) |*thread| try thread.appendProvider(@tagName(provider));
-        try self.setModel(model);
-        const dropped = stripRawItems(self.entries.items);
-        if (dropped) try persistSnapshot(self);
+        self.gpa.free(self.model);
+        self.model = next;
+        self.effort = effort;
+        self.fast = fast;
+        self.refreshSuggestions();
         return .{
             .reasoning_dropped = dropped,
             .effort_dropped = effort_before != null and self.effort == null,
@@ -246,8 +245,9 @@ const Session = struct {
     }
 
     fn appendEntry(self: *Session, entry: Entry) !void {
-        try self.entries.append(self.allocator(), entry);
+        try self.entries.ensureUnusedCapacity(self.allocator(), 1);
         if (self.thread) |*thread| try thread.appendEntry(entry);
+        self.entries.appendAssumeCapacity(entry);
     }
 
     fn appendUser(self: *Session, text: []const u8) !void {
@@ -275,31 +275,27 @@ const Session = struct {
     }
 
     fn clear(self: *Session) !void {
+        if (self.thread) |*thread| try thread.appendReset();
         self.replaceArena();
         // Counters describe the visible conversation; a resumed thread
         // recomputes them from entries, so an empty thread means zero.
         self.turn = 0;
         self.usage = .{};
-        if (self.thread) |*thread| try thread.appendReset();
     }
 
     fn startThread(self: *Session) !void {
         if (!self.save_thread) return;
-        // Null out before deinit: if create fails, teardown must not
-        // deinit the poisoned old payload a second time.
-        if (self.thread) |*thread| {
-            thread.deinit();
-            self.thread = null;
-        }
-        self.thread = try threads.create(self.gpa, self.io, self.home, self.cwd, self.provider, self.model, if (self.effort) |value| @tagName(value) else null, self.fast);
+        const next = try threads.create(self.gpa, self.io, self.home, self.cwd, self.provider, self.model, if (self.effort) |value| @tagName(value) else null, self.fast);
+        if (self.thread) |*thread| thread.deinit();
+        self.thread = next;
     }
 
     fn newThread(self: *Session) !void {
+        if (self.save_thread) try self.startThread();
         if (self.subagent_manager) |*manager| manager.reset();
         self.replaceArena();
         self.turn = 0;
         self.usage = .{};
-        if (self.save_thread) try self.startThread();
     }
 
     fn recount(self: *Session) void {
@@ -318,7 +314,6 @@ const Session = struct {
 
     fn rewind(self: *Session, count: usize) !void {
         const index = (try rewindIndex(self.entries.items, count)) orelse return error.NotEnoughTurns;
-        if (self.subagent_manager) |*manager| manager.reset();
         const previous_len = self.entries.items.len;
         self.entries.items.len = index;
         self.recount();
@@ -327,11 +322,11 @@ const Session = struct {
             self.recount();
             return err;
         };
+        if (self.subagent_manager) |*manager| manager.reset();
     }
 
     fn forkThread(self: *Session) !void {
         if (!self.save_thread) return error.EphemeralSession;
-        if (self.subagent_manager) |*manager| manager.reset();
         // Refresh the original before create applies the retention limit, so
         // forking a deliberately resumed old thread cannot prune its source.
         try persistSnapshot(self);
@@ -346,23 +341,39 @@ const Session = struct {
             self.cwd,
             self.entries.items,
         );
+        if (self.subagent_manager) |*manager| manager.reset();
         if (self.thread) |*thread| thread.deinit();
         self.thread = fork;
         installed = true;
     }
 
     fn resumeThread(self: *Session, requested: ?[]const u8) !void {
+        if (requested) |id| if (self.thread) |thread| {
+            if (std.mem.eql(u8, id, thread.id)) return;
+        };
         var next_arena: std.heap.ArenaAllocator = .init(self.gpa);
-        // The errdefers must disarm once ownership moves into `self`;
-        // otherwise a late failure frees the live session's arena,
-        // thread, and model while the caller keeps using them.
-        var installed = false;
-        errdefer if (!installed) next_arena.deinit();
+        errdefer next_arena.deinit();
         const excluded = if (requested == null) if (self.thread) |thread| thread.id else null else null;
         var loaded = try threads.load(self.gpa, next_arena.allocator(), self.io, self.home, self.cwd, requested, excluded);
-        errdefer if (!installed) loaded.thread.deinit();
+        errdefer loaded.thread.deinit();
         const loaded_model = try self.gpa.dupe(u8, loaded.model);
-        errdefer if (!installed) self.gpa.free(loaded_model);
+        errdefer self.gpa.free(loaded_model);
+
+        // Repair interrupted tool calls before replacing the current session.
+        // Both the loaded history and its saved record must be ready to use.
+        if (loaded.entries.items.len > 0) switch (loaded.entries.items[loaded.entries.items.len - 1]) {
+            .assistant => |answer| if (answer.calls.len > 0) {
+                const results = try next_arena.allocator().alloc(ToolResult, answer.calls.len);
+                for (answer.calls, 0..) |call, i| results[i] = .{
+                    .id = call.id,
+                    .text = "tool interrupted before its result was saved; inspect current state before retrying",
+                };
+                try loaded.entries.ensureUnusedCapacity(next_arena.allocator(), 1);
+                try loaded.thread.appendEntry(.{ .results = results });
+                loaded.entries.appendAssumeCapacity(.{ .results = results });
+            },
+            else => {},
+        };
 
         if (self.subagent_manager) |*manager| manager.reset();
         if (self.thread) |*thread| thread.deinit();
@@ -373,7 +384,6 @@ const Session = struct {
         self.thread = loaded.thread;
         self.provider = loaded.provider;
         self.model = loaded_model;
-        installed = true;
         self.effort = if (loaded.effort) |value| Effort.parse(value) else null;
         self.fast = loaded.fast and models.supportsFast(loaded.provider, loaded.model);
         if (self.effort) |effort| {
@@ -381,17 +391,6 @@ const Session = struct {
         }
         self.refreshSuggestions();
         self.recount();
-        if (self.entries.items.len > 0) switch (self.entries.items[self.entries.items.len - 1]) {
-            .assistant => |answer| if (answer.calls.len > 0) {
-                const results = try self.allocator().alloc(ToolResult, answer.calls.len);
-                for (answer.calls, 0..) |call, i| results[i] = .{
-                    .id = call.id,
-                    .text = "tool interrupted before its result was saved; inspect current state before retrying",
-                };
-                try self.appendEntry(.{ .results = results });
-            },
-            else => {},
-        };
     }
 };
 
@@ -401,35 +400,39 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
         if (!models.supportsEffort(options.provider, options.model, effort)) return error.InvalidEffortForModel;
     }
     if (options.fast and options.resume_id == null and !models.supportsFast(options.provider, options.model)) return error.InvalidFastForModel;
-    var user_settings = try settings_mod.load(gpa, io, options.home);
-    var settings_owned = true;
-    errdefer if (settings_owned) user_settings.deinit();
-    var session: Session = .{
-        .gpa = gpa,
-        .io = io,
-        .home = options.home,
-        .cwd = options.cwd,
-        .provider = options.provider,
-        .model = try gpa.dupe(u8, options.model),
-        .effort = options.effort,
-        .fast = options.fast,
-        .output = options.output,
-        .trace = options.tool_trace orelse options.output,
-        .interactive = options.input != null,
-        .events = options.events,
-        .subagent_manager = if (options.subagent_control == null) try subagents.Manager.init(gpa, io, options.cwd, .{
-            .enabled = user_settings.value.subagents_enabled,
-            .max_concurrent = user_settings.value.subagent_max_concurrent,
-            .background_by_default = user_settings.value.subagent_default_background,
-        }) else null,
-        .subagent_control = options.subagent_control,
-        .subagent_status = options.subagent_status,
-        .arena = .init(gpa),
-        .instructions = try context.load(gpa, io, options.home, options.cwd),
-        .settings = user_settings,
-        .save_thread = options.save_thread,
+    var session: Session = init: {
+        var user_settings = try settings_mod.load(gpa, io, options.home);
+        errdefer user_settings.deinit();
+        const model = try gpa.dupe(u8, options.model);
+        errdefer gpa.free(model);
+        const instructions = try context.load(gpa, io, options.home, options.cwd);
+        errdefer gpa.free(instructions);
+        break :init .{
+            .gpa = gpa,
+            .io = io,
+            .home = options.home,
+            .cwd = options.cwd,
+            .provider = options.provider,
+            .model = model,
+            .effort = options.effort,
+            .fast = options.fast,
+            .output = options.output,
+            .trace = options.tool_trace orelse options.output,
+            .interactive = options.input != null,
+            .events = options.events,
+            .subagent_manager = if (options.subagent_control == null) try subagents.Manager.init(gpa, io, options.cwd, .{
+                .enabled = user_settings.value.subagents_enabled,
+                .max_concurrent = user_settings.value.subagent_max_concurrent,
+                .background_by_default = user_settings.value.subagent_default_background,
+            }) else null,
+            .subagent_control = options.subagent_control,
+            .subagent_status = options.subagent_status,
+            .arena = .init(gpa),
+            .instructions = instructions,
+            .settings = user_settings,
+            .save_thread = options.save_thread,
+        };
     };
-    settings_owned = false;
     defer session.deinit();
     session.refreshSuggestions();
     var signal_scope = cancel.Scope.install();
@@ -1621,14 +1624,7 @@ fn pickModel(session: *Session, reader: *Io.Reader) !void {
             return;
         };
         const from = session.provider;
-        var changes: ProviderSwitch = .{ .reasoning_dropped = false, .effort_dropped = false, .fast_dropped = false };
-        if (selected_provider != session.provider) {
-            changes = try session.switchProvider(selected_provider, selected_model);
-        } else if (!std.mem.eql(u8, selected_model, session.model)) {
-            try session.setModel(selected_model);
-        }
-        if (session.effort != preferences.effort) try session.setEffort(preferences.effort);
-        if (session.fast != preferences.fast) try session.setFast(preferences.fast);
+        var changes = try session.setSelection(selected_provider, selected_model, preferences.effort, preferences.fast);
         persistSelection(session);
         log.logf("agent", "event=model provider={s} model={s}", .{ @tagName(session.provider), session.model });
         if (from != session.provider) {
@@ -2063,6 +2059,7 @@ fn resumeErrorMessage(err: anyerror) []const u8 {
         error.FileNotFound => "no thread with that ID for this directory",
         error.InvalidThreadId => "invalid thread ID (16 URL-safe base64 characters)",
         error.InvalidThread => "thread file is corrupt or incomplete",
+        error.ThreadInUse => "thread is open in another session; close that session or start a new thread",
         else => @errorName(err),
     };
 }
@@ -2497,19 +2494,17 @@ fn compactIfNeeded(session: *Session, force: bool) !bool {
     }
 
     var next_arena: std.heap.ArenaAllocator = .init(session.gpa);
-    // Disarm once installed: persistSnapshot failing after the swap must
-    // not free the arena the session now owns.
-    var installed = false;
-    errdefer if (!installed) next_arena.deinit();
+    errdefer next_arena.deinit();
     const next_gpa = next_arena.allocator();
     var next_entries: std.ArrayList(Entry) = .empty;
     try next_entries.append(next_gpa, .{ .user = .{ .text = try next_gpa.dupe(u8, summary.written()) } });
     for (session.entries.items[keep_start..]) |entry| try next_entries.append(next_gpa, try cloneEntry(next_gpa, entry));
+    // A failed snapshot must leave both the original history and its arena
+    // intact. No fallible work remains after transferring ownership below.
+    try persistEntries(session, next_entries.items);
     session.arena.deinit();
     session.arena = next_arena;
     session.entries = next_entries;
-    installed = true;
-    try persistSnapshot(session);
     log.logf("agent", "event=compact before_tokens={d} after_tokens={d} model={s}", .{ current_tokens, estimatedContextTokens(session), compact_model });
     return true;
 }
@@ -2675,7 +2670,8 @@ fn summarySnippet(writer: *Io.Writer, prefix: []const u8, value: []const u8) !vo
     const prefix_len = @min(prefix.len, remaining);
     try writer.writeAll(prefix[0..prefix_len]);
     const after_prefix = compact_summary_bytes -| writer.buffered().len;
-    const limit = @min(value.len, @min(after_prefix, 4096));
+    var limit = @min(value.len, @min(after_prefix, 4096));
+    while (limit > 0 and !std.unicode.utf8ValidateSlice(value[0..limit])) limit -= 1;
     try writer.writeAll(value[0..limit]);
     if (limit < value.len and writer.buffered().len + 3 <= compact_summary_bytes) try writer.writeAll("...");
 }
@@ -2719,6 +2715,10 @@ fn cloneEntry(gpa: std.mem.Allocator, entry: Entry) !Entry {
 }
 
 fn persistSnapshot(session: *Session) !void {
+    try persistEntries(session, session.entries.items);
+}
+
+fn persistEntries(session: *Session, entries: []const Entry) !void {
     if (session.thread) |*thread| {
         try thread.rewrite(
             session.provider,
@@ -2726,7 +2726,7 @@ fn persistSnapshot(session: *Session) !void {
             if (session.effort) |value| @tagName(value) else null,
             session.fast,
             session.cwd,
-            session.entries.items,
+            entries,
         );
     }
 }
@@ -2852,9 +2852,12 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
             if (attempt + 1 < 3 and retryableTransport(err)) {
                 spin.start(session.io, "retrying");
                 defer spin.stop();
-                try session.io.sleep(.fromSeconds(@intCast(attempt + 1)), .awake);
-                if (cancel.requested()) return error.Cancelled;
+                try cancel.processToken().sleep(session.io, .fromSeconds(@intCast(attempt + 1)));
                 continue;
+            }
+            if (err == error.IncompleteProviderResponse) {
+                try reportProviderStreamError(session, "Response ended before completion. Please retry.");
+                return error.ProviderRequestFailed;
             }
             return err;
         };
@@ -2863,6 +2866,7 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
         log.logf("agent", "event=response kind={s} turn={d} status={d} attempt={d} speed={s}", .{ kind, session.turn, response.status, attempt + 1, @tagName(decoder.core.speed) });
         if (response.status >= 200 and response.status < 300) {
             if (decoder.core.providerError()) |message| {
+                try decoder.finishRendering();
                 try reportProviderStreamError(session, message);
                 return error.ProviderRequestFailed;
             }
@@ -2887,8 +2891,7 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
             const delay = @min(response.retry_after_seconds orelse @as(u64, @intCast(attempt + 1)), 30);
             spin.start(session.io, "retrying");
             defer spin.stop();
-            try session.io.sleep(.fromSeconds(@intCast(delay)), .awake);
-            if (cancel.requested()) return error.Cancelled;
+            try cancel.processToken().sleep(session.io, .fromSeconds(@intCast(delay)));
             continue;
         }
         // Interactive sessions read the diagnostic in the transcript and
@@ -2934,8 +2937,9 @@ fn noteServedSpeed(session: *Session, fast: bool, served: stream_decoder.ServedS
 }
 
 fn finishRound(decoder: *Decoder, stop_reason: StopReason) !RoundResult {
+    try decoder.finishRendering();
     return .{
-        .answer = try decoder.finish(),
+        .answer = if (stop_reason == .stream_interrupted) try decoder.core.finishPartial() else try decoder.core.finish(),
         .stop_reason = stop_reason,
     };
 }
@@ -2946,12 +2950,12 @@ fn interruptedRound(decoder: *Decoder, compacting: bool, transport_error: anyerr
     // successfully saved partial provider response.
     if (decoder.local_failure) return transport_error;
     if (transport_error == error.Cancelled or transport_error == error.ProviderRequestFailed) return transport_error;
-    if (!decoder.received or compacting) return null;
+    if (decoder.core.text.written().len == 0 or compacting) return null;
     return try finishRound(decoder, .stream_interrupted);
 }
 
 fn retryableTransport(err: anyerror) bool {
-    return err == error.TransportFailed or err == error.InvalidHttpResponse or err == error.ReadFailed;
+    return err == error.TransportFailed or err == error.InvalidHttpResponse or err == error.ReadFailed or err == error.IncompleteProviderResponse;
 }
 
 fn retryableStatus(status: u16) bool {
@@ -2963,7 +2967,7 @@ fn requestStream(gpa: std.mem.Allocator, io: Io, provider: auth.Provider, creden
     defer gpa.free(authorization);
     const routing_hint = try request.chatgptRoutingHint(gpa, model, fast);
     defer gpa.free(routing_hint);
-    return switch (provider) {
+    const response = try switch (provider) {
         .chatgpt => transport.postStream(gpa, io, "https://chatgpt.com/backend-api/codex/responses", "application/json", &.{
             .{ .name = "Authorization", .value = authorization },
             .{ .name = "chatgpt-account-id", .value = credential.account_id orelse return error.InvalidAccessToken },
@@ -2987,6 +2991,14 @@ fn requestStream(gpa: std.mem.Allocator, io: Io, provider: auth.Provider, creden
             .{ .name = "User-Agent", .value = "xaq/0.1" },
         }, body, decoder, decodeLine),
     };
+    errdefer gpa.free(response.body);
+    // curl can exit successfully after a clean but premature EOF. Require
+    // the provider's final event before accepting or executing this response.
+    // Leave provider errors to the caller so it can report their diagnostics.
+    if (response.status >= 200 and response.status < 300 and decoder.core.providerError() == null) {
+        try decoder.core.validateComplete();
+    }
+    return response;
 }
 
 fn decodeLine(context_ptr: ?*anyopaque, line: []const u8) !void {
@@ -2999,7 +3011,6 @@ const Decoder = struct {
     rendered: markdown.Writer,
     events: ?EventSink,
     stop_spinner: bool = true,
-    received: bool = false,
     local_failure: bool = false,
 
     fn init(provider: auth.Provider, parse_gpa: std.mem.Allocator, persist: std.mem.Allocator, output: *Io.Writer, events: ?EventSink) Decoder {
@@ -3024,7 +3035,6 @@ const Decoder = struct {
 
     fn onOutput(raw: ?*anyopaque) !void {
         const self: *Decoder = @ptrCast(@alignCast(raw.?));
-        self.received = true;
         if (self.stop_spinner) spin.stop();
     }
 
@@ -3047,7 +3057,6 @@ const Decoder = struct {
     fn feed(self: *Decoder, line: []const u8) !void {
         self.bind();
         try self.core.feed(line);
-        self.received = self.core.received;
     }
 
     fn finishRendering(self: *Decoder) !void {
@@ -3078,6 +3087,152 @@ test "slash command lookup matches names, aliases, and unique prefixes" {
     try std.testing.expectEqual(Command.exit, (try findCommand("q")).?);
     try std.testing.expectEqual(null, try findCommand("bogus"));
     try std.testing.expectEqual(null, try findCommand(""));
+}
+
+fn testSession(home: []const u8, output: *Io.Writer) !Session {
+    const gpa = std.testing.allocator;
+    const model = try gpa.dupe(u8, "gpt-5.6-sol");
+    errdefer gpa.free(model);
+    return .{
+        .gpa = gpa,
+        .io = std.testing.io,
+        .home = home,
+        .cwd = "/work/session-test",
+        .provider = .chatgpt,
+        .model = model,
+        .effort = .high,
+        .fast = true,
+        .output = output,
+        .trace = output,
+        .arena = .init(gpa),
+        .instructions = try gpa.dupe(u8, ""),
+        .settings = .{ .arena = .init(gpa), .value = .{} },
+    };
+}
+
+test "failed thread appends leave live history and selection unchanged" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const home = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path});
+    defer std.testing.allocator.free(home);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var session = try testSession(home, &output.writer);
+    defer session.deinit();
+    try session.startThread();
+    try session.appendUser("keep this goal");
+    try session.appendEntry(.{ .assistant = .{ .text = "progress", .calls = &.{}, .raw_items = &.{"private"}, .usage = .{ .input = 10, .output = 20 } } });
+    session.recount();
+    try Io.Dir.cwd().deleteFile(std.testing.io, session.thread.?.path);
+
+    try std.testing.expectError(error.ThreadMissing, session.appendUser("not saved"));
+    try std.testing.expectError(error.ThreadMissing, session.clear());
+    try std.testing.expectError(error.ThreadMissing, session.setModel("gpt-5.4-mini"));
+    try std.testing.expectError(error.ThreadMissing, session.setEffort(null));
+    try std.testing.expectError(error.ThreadMissing, session.setFast(false));
+    try std.testing.expectError(error.ThreadMissing, session.switchProvider(.claude, "claude-sonnet-5"));
+    try std.testing.expectError(error.ThreadMissing, session.setSelection(.claude, "claude-sonnet-5", .low, false));
+    try std.testing.expectEqual(@as(usize, 2), session.entries.items.len);
+    try std.testing.expectEqualStrings("keep this goal", session.entries.items[0].user.text);
+    try std.testing.expectEqualStrings("private", session.entries.items[1].assistant.raw_items[0]);
+    try std.testing.expectEqual(@as(u64, 1), session.turn);
+    try std.testing.expectEqual(@as(u64, 10), session.usage.input);
+    try std.testing.expectEqual(auth.Provider.chatgpt, session.provider);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", session.model);
+    try std.testing.expectEqual(Effort.high, session.effort.?);
+    try std.testing.expect(session.fast);
+}
+
+test "failed new thread and compaction preserve the current conversation" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    var cwd_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_len = try std.process.currentPath(std.testing.io, &cwd_buffer);
+    const home = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd_buffer[0..cwd_len], temporary.sub_path });
+    defer std.testing.allocator.free(home);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var session = try testSession(home, &output.writer);
+    defer session.deinit();
+    try session.startThread();
+    try session.appendUser("goal");
+    try session.appendEntry(.{ .assistant = .{ .text = "x" ** 128, .calls = &.{}, .usage = .{ .input = 10 } } });
+    session.recount();
+    const id = try std.testing.allocator.dupe(u8, session.thread.?.id);
+    defer std.testing.allocator.free(id);
+
+    session.gpa = std.testing.failing_allocator;
+    const created = session.newThread();
+    session.gpa = std.testing.allocator;
+    try std.testing.expectError(error.OutOfMemory, created);
+    try std.testing.expectEqualStrings(id, session.thread.?.id);
+    // The model summary falls back locally because this test home has no
+    // credentials. Fail only the final snapshot's allocation.
+    session.thread.?.gpa = std.testing.failing_allocator;
+    const compacted = compactIfNeeded(&session, true);
+    session.thread.?.gpa = std.testing.allocator;
+    try std.testing.expectError(error.WriteFailed, compacted);
+    try std.testing.expectEqual(@as(usize, 2), session.entries.items.len);
+    try std.testing.expectEqualStrings("goal", session.entries.items[0].user.text);
+    try std.testing.expectEqualStrings("x" ** 128, session.entries.items[1].assistant.text);
+    try std.testing.expectEqual(@as(u64, 1), session.turn);
+    try std.testing.expectEqual(@as(u64, 10), session.usage.input);
+    try session.resumeThread(id);
+    try std.testing.expectEqualStrings(id, session.thread.?.id);
+    try session.appendUser("still usable");
+}
+
+test "failed resume repair preserves the current conversation and releases the loaded thread" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const home = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path});
+    defer std.testing.allocator.free(home);
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var session = try testSession(home, &output.writer);
+    defer session.deinit();
+    try session.startThread();
+    try session.appendUser("current goal");
+    const original_id = try std.testing.allocator.dupe(u8, session.thread.?.id);
+    defer std.testing.allocator.free(original_id);
+
+    const resume_id = blk: {
+        var interrupted = try threads.create(std.testing.allocator, std.testing.io, home, session.cwd, .claude, "claude-sonnet-5", null, false);
+        defer interrupted.deinit();
+        try interrupted.appendEntry(.{ .user = .{ .text = "interrupted goal" } });
+        try interrupted.appendEntry(.{ .assistant = .{
+            .text = "",
+            .calls = &.{.{ .id = "call_pending", .name = "write", .arguments = "{}" }},
+        } });
+        break :blk try std.testing.allocator.dupe(u8, interrupted.id);
+    };
+    defer std.testing.allocator.free(resume_id);
+
+    const FailWrite = struct {
+        fn write(_: ?*anyopaque, _: Io.File, _: []const u8, _: []const []const u8, _: usize, _: u64) Io.File.WritePositionalError!usize {
+            return error.NoSpaceLeft;
+        }
+    };
+    var vtable = std.testing.io.vtable.*;
+    vtable.fileWritePositional = FailWrite.write;
+    session.io = .{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    const resumed = session.resumeThread(resume_id);
+    session.io = std.testing.io;
+    try std.testing.expectError(error.WriteFailed, resumed);
+    try std.testing.expectEqualStrings(original_id, session.thread.?.id);
+    try std.testing.expectEqual(auth.Provider.chatgpt, session.provider);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", session.model);
+    try std.testing.expectEqual(@as(usize, 1), session.entries.items.len);
+    try std.testing.expectEqualStrings("current goal", session.entries.items[0].user.text);
+    try session.appendUser("still usable");
+
+    // Retrying must acquire the other thread's lock and save one repair.
+    try session.resumeThread(resume_id);
+    try std.testing.expectEqualStrings(resume_id, session.thread.?.id);
+    try std.testing.expectEqual(auth.Provider.claude, session.provider);
+    try std.testing.expectEqual(@as(usize, 3), session.entries.items.len);
+    try std.testing.expectEqualStrings("call_pending", session.entries.items[2].results[0].id);
+    try std.testing.expect(std.mem.startsWith(u8, session.entries.items[2].results[0].text, "tool interrupted"));
 }
 
 test "slash suggestions hide /fast unless the model supports it" {
@@ -3296,6 +3451,14 @@ test "tool previews do not split UTF-8" {
     try std.testing.expect(std.mem.endsWith(u8, writer.buffered(), "..."));
 }
 
+test "compaction fallback snippets keep valid UTF-8 at the byte limit" {
+    var summary: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer summary.deinit();
+    try summarySnippet(&summary.writer, "User: ", "x" ** 4095 ++ "é");
+    try std.testing.expectEqualStrings("User: " ++ "x" ** 4095 ++ "...", summary.written());
+    try std.testing.expect(std.unicode.utf8ValidateSlice(summary.written()));
+}
+
 test "token count formatting" {
     var buffer: [64]u8 = undefined;
     inline for (.{
@@ -3399,6 +3562,7 @@ test "decode Anthropic SSE" {
     try decoder.feed("data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"pwd\\\"}\"}}");
     try decoder.feed("data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7,\"cache_read_input_tokens\":2,\"output_tokens\":1}}}");
     try decoder.feed("data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":9}}");
+    try decoder.feed("data: {\"type\":\"message_stop\"}");
     const result = try decoder.finish();
     try std.testing.expectEqualStrings("ok", result.text);
     try std.testing.expectEqualStrings("bash", result.calls[0].name);
@@ -3419,6 +3583,7 @@ test "stream decoder renders each Responses delta immediately" {
     try std.testing.expectEqualStrings("one", writer.buffered());
     try decoder.feed("data: {\"type\":\"response.output_text.delta\",\"delta\":\" two\"}");
     try std.testing.expectEqualStrings("one two", writer.buffered());
+    try decoder.feed("data: {\"type\":\"response.completed\",\"response\":{}}");
     const result = try decoder.finish();
     try std.testing.expectEqualStrings("one two", result.text);
 }
@@ -3436,6 +3601,33 @@ test "interrupted stream keeps partial decoder output and stop reason" {
 
     try std.testing.expectEqualStrings("partial", result.answer.text);
     try std.testing.expectEqual(StopReason.stream_interrupted, result.stop_reason);
+}
+
+test "interrupted streams discard pending tools and private replay items" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for ([_]auth.Provider{ .chatgpt, .claude }) |provider| {
+        var buffer: [128]u8 = undefined;
+        var writer: Io.Writer = .fixed(&buffer);
+        var decoder = Decoder.init(provider, std.testing.allocator, arena.allocator(), &writer, null);
+        defer decoder.deinit();
+        try decoder.feed(if (provider == .claude)
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"bash\",\"input\":{}}}"
+        else
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"bash\",\"arguments\":\"{}\"}}");
+        // Tool-only output cannot become an empty assistant history entry.
+        try std.testing.expect((try interruptedRound(&decoder, false, error.IncompleteProviderResponse)) == null);
+        try decoder.feed(if (provider == .claude)
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}"
+        else
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}");
+        try std.testing.expect((try interruptedRound(&decoder, true, error.IncompleteProviderResponse)) == null);
+        const result = (try interruptedRound(&decoder, false, error.IncompleteProviderResponse)).?;
+        try std.testing.expectEqual(StopReason.stream_interrupted, result.stop_reason);
+        try std.testing.expectEqualStrings("partial", result.answer.text);
+        try std.testing.expectEqual(@as(usize, 0), result.answer.calls.len);
+        try std.testing.expectEqual(@as(usize, 0), result.answer.raw_items.len);
+    }
 }
 
 fn rejectTextDelta(_: ?*anyopaque, event: Event) !void {

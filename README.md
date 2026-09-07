@@ -74,6 +74,8 @@ On a capable terminal, `xaq` opens a compact fullscreen view with a scrolling tr
 
 Type `@` to search project files, then use Up and Down to select one and Tab or Enter to insert its path. Tab also completes relative path tokens such as `src/ag`. The index is built on demand and stays in memory for the current prompt.
 
+Interactive prompts are limited to 4 MiB, including expanded pastes and continued lines. Longer input is clipped at a complete UTF-8 character with a notice. Continuation lines beyond the limit are consumed with that prompt.
+
 Tool activity animates on the live transcript row while it runs. Completed calls enter the transcript as dim one-line summaries such as `Read src/main.zig`, `Edited src/tui.zig · 2 edits`, or `Ran zig build test · 3.1s`. Three or more consecutive reads and web lookups collapse into one `Explored…` line; failures and file-changing actions always remain visible. `/verbose on` adds a bounded result preview.
 
 Prefix a prompt with `!` to run a shell command directly. `!command` includes the command and output in model context; `!!command` runs it without adding either to context.
@@ -125,7 +127,7 @@ Use `--output-format json` when a script needs the final answer and run metadata
 xaq --output-format json -p 'review the staged changes' | jq -r '.text'
 ```
 
-The object includes `text`, `stop_reason`, `provider`, `model`, `thread_id`, token `usage`, `num_turns`, and `tool_calls`. `stop_reason` is `completed` unless a transport failure leaves a saved partial answer, which reports `stream_interrupted`. Use `--output-format streaming-json` for live JSONL events. Its event types are `start`, `turn_start`, `text`, `tool_call`, `tool_result`, `usage`, `end`, and `error`; `end` is the authoritative final result. Structured formats work only on one-shot runs and keep tool traces on stderr.
+The object includes `text`, `stop_reason`, `provider`, `model`, `thread_id`, token `usage`, `num_turns`, and `tool_calls`. `stop_reason` is `completed` unless the response ends early and leaves a saved partial answer, which reports `stream_interrupted`. Partial answers retain text but discard pending tool calls, so an interrupted response cannot trigger file changes. This also applies when the connection closes without the provider's completion event. Use `--output-format streaming-json` for live JSONL events. Its event types are `start`, `turn_start`, `text`, `tool_call`, `tool_result`, `usage`, `end`, and `error`; `end` is the authoritative final result. Structured formats work only on one-shot runs and keep tool traces on stderr.
 
 Override model behavior when needed:
 
@@ -142,7 +144,9 @@ Run `xaq --help` for the complete CLI syntax.
 
 ## Threads and context
 
-Interactive turns are saved as cwd-scoped JSONL under `~/.config/xaq/threads/`. Resume the latest thread with `xaq -c`, choose among the newest eight candidates with `/resume`, or list the newest 50 IDs with `xaq threads`. Resuming replays its user and assistant messages into the transcript. When a new thread starts, `xaq` prunes files beyond the newest 50 only if they have not been modified for 24 hours. Recent or active threads remain on disk, so a directory can temporarily contain more than 50. Start with `xaq --no-save` to keep the conversation and its prompt history only in memory.
+Interactive turns are saved as cwd-scoped JSONL under `~/.config/xaq/threads/`. Resume the latest thread with `xaq -c`, choose among the newest eight candidates with `/resume`, or list the newest 50 IDs with `xaq threads`. Resuming replays its user and assistant messages into the transcript. Each thread has one active session. Close that session before resuming the same thread elsewhere, or use `/fork` to work in a separate copy. Ownership releases when the process exits, including after a crash. Older builds do not honor this lock or read the new combined model-selection records. Use the current build when resuming these threads.
+
+When a new thread starts, `xaq` prunes files beyond the newest 50 only if they have not been modified for 24 hours and no session holds them open. Recent or active threads remain on disk, so a directory can temporarily contain more than 50. Start with `xaq --no-save` to keep the conversation and its prompt history only in memory. Failed saves leave the current conversation and model selection intact.
 
 `/rewind` removes the latest user turn and everything after it from the transcript without reverting files. Pass a count to remove more turns. `/fork` copies the visible transcript into a new thread and makes that copy active, leaving the original unchanged.
 
@@ -162,6 +166,8 @@ The model receives four local tools:
 | `write` | create or overwrite files |
 
 The parent agent can also start, inspect, and steer subagents. Workers are separate `xaq` processes in the same working directory, with up to four running at once by default. The `Agent` tool tells the parent the active provider, inherited model and effort, valid model overrides, effective access, and concurrency limit. Model overrides stay on the active provider; effort is selected separately. Workers currently have `workspace_write` access, including full-permission shell commands. Read-only workers are not available. In fullscreen mode, live agents appear in a panel above the info bar: id, status, elapsed time, model and effort, and a heartbeat of what each worker is doing right now. The panel takes no rows while no agents exist. `/agents` shows the same detail inline. `/settings` can disable subagents, change the limit, or turn the panel off.
+
+Foreground and background workers share the concurrency limit. Disabling subagents stops queued workers while running workers finish. Leaving or resetting the session interrupts running workers and their active tools, with a shared one-second grace period before forced shutdown.
 
 For web access, run `/firecrawl` and enter a [Firecrawl API key](https://www.firecrawl.dev/app/api-keys). This adds `web_fetch` and `web_search`. The key is stored in `~/.config/xaq/settings.json` with mode `0600`.
 
@@ -200,6 +206,8 @@ zig build perf     # enforce startup and prompt-readiness limits
 ```
 
 CI checks formatting, tests, and release builds on Linux and macOS. On Linux, the performance gate measures stripped ReleaseSmall help/version startup and fullscreen prompt readiness in the local Git worktree. Binary size and cache-discarded help startup are reported without limiting them.
+
+After building, `python3 tests/cli_test.py zig-out/bin/xaq` checks stream recovery, retry cancellation, and thread ownership with a local mock transport. These tests run in CI and require no provider login or network access.
 
 Minimalism is a project constraint. Proxy servers, MCP and plugin systems, internal sandboxes, session databases, themes, and full cell-grid TUI frameworks are deliberately out of scope. Open an issue before adding a new subsystem.
 

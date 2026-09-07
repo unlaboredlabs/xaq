@@ -255,6 +255,7 @@ fn parsePrompt(gpa: std.mem.Allocator, io: Io, cwd: []const u8, input_text: []u8
 /// pasted path does not leave the cursor moving through hidden bytes.
 pub fn displayPlaceholders(gpa: std.mem.Allocator, text: []const u8, cursor: usize, paths: []const []const u8) !Display {
     if (paths.len == 0) return .{ .gpa = gpa, .text = text, .cursor = cursor };
+    if (paths.len > max_images_per_prompt) return error.TooManyImages;
     var replacements: std.ArrayList(Replacement) = .empty;
     defer replacements.deinit(gpa);
     var assigned: [max_images_per_prompt]?usize = @splat(null);
@@ -283,7 +284,7 @@ fn highestPlaceholderNumber(text: []const u8) usize {
         const digits_start = start + prefix.len;
         const end = std.mem.indexOfScalarPos(u8, text, digits_start, ']') orelse break;
         const number = std.fmt.parseUnsigned(usize, text[digits_start..end], 10) catch 0;
-        highest = @max(highest, number);
+        if (number <= max_images_per_prompt) highest = @max(highest, number);
         offset = end + 1;
     }
     return highest;
@@ -352,6 +353,16 @@ fn imageIndex(images: []const types.Image, path: []const u8) ?usize {
 fn pathIndex(paths: []const []const u8, path: []const u8) ?usize {
     for (paths, 0..) |candidate, index| if (std.mem.eql(u8, candidate, path)) return index;
     return null;
+}
+
+/// Match a path using the same quoting and escaping rules as submission.
+pub fn containsPath(gpa: std.mem.Allocator, text: []const u8, path: []const u8) !bool {
+    var words = WordIterator{ .text = text };
+    while (try words.next(gpa)) |word| {
+        defer if (word.owned) |owned| gpa.free(owned);
+        if (std.mem.eql(u8, word.path, path)) return true;
+    }
+    return false;
 }
 
 const Word = struct {
@@ -433,6 +444,7 @@ fn replaceWithPlaceholders(gpa: std.mem.Allocator, text: []const u8, replacement
 
 fn unescape(gpa: std.mem.Allocator, value: []const u8) ![]u8 {
     const output = try gpa.alloc(u8, value.len);
+    errdefer gpa.free(output);
     var write: usize = 0;
     var read: usize = 0;
     while (read < value.len) : (read += 1) {
@@ -492,6 +504,26 @@ test "pasted image paths render as placeholders outside the active token" {
     var continued = try displayPlaceholders(std.testing.allocator, "[Image #1] then next.png", "[Image #1] then next.png".len, &.{"next.png"});
     defer continued.deinit();
     try std.testing.expectEqualStrings("[Image #1] then [Image #2]", continued.text);
+}
+
+test "image previews ignore out-of-range literal marker numbers" {
+    const gpa = std.testing.allocator;
+    const text = try std.fmt.allocPrint(gpa, "[Image #{d}] then next.png", .{std.math.maxInt(usize)});
+    defer gpa.free(text);
+    var display = try displayPlaceholders(gpa, text, text.len, &.{"next.png"});
+    defer display.deinit();
+    try std.testing.expect(std.mem.endsWith(u8, display.text, "then [Image #1]"));
+    try std.testing.expectEqual(display.text.len, display.cursor);
+    try std.testing.expectError(error.TooManyImages, displayPlaceholders(gpa, "five.png", 8, &.{ "one.png", "two.png", "three.png", "four.png", "five.png" }));
+}
+
+test "image path references respect quotes and escapes" {
+    const gpa = std.testing.allocator;
+    const text = "compare @\"before shot.png\" with after\\ shot.png";
+    try std.testing.expect(try containsPath(gpa, text, "before shot.png"));
+    try std.testing.expect(try containsPath(gpa, text, "after shot.png"));
+    try std.testing.expect(!try containsPath(gpa, text, "shot.png"));
+    try std.testing.expect(!try containsPath(gpa, "@shot.png.old", "shot.png"));
 }
 
 test "loads explicit and prompt image paths" {

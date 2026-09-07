@@ -10,10 +10,12 @@ Install Zig 0.16.0 and `curl`, then:
 zig build check    # type-check without installing
 zig build fmt      # format Zig sources
 zig build test     # run tests
-zig build perf     # enforce size and startup limits (Linux)
+zig build perf     # enforce startup and prompt-readiness limits (Linux)
+zig build -Doptimize=ReleaseSmall
+python3 tests/cli_test.py zig-out/bin/xaq # offline CLI recovery/cancellation tests
 ```
 
-CI additionally runs `zig fmt --check build.zig src tools`, a `ReleaseSmall` build, `shellcheck` over `install.sh tools/*.sh tests/*.sh`, and the shell suites in `tests/`. The performance gate caps the stripped Linux x86_64 binary at 1 MiB and mean startup at 25 ms; changes that break it will not merge.
+CI additionally runs `zig fmt --check build.zig src tools`, a `ReleaseSmall` build, `shellcheck` over `install.sh tools/*.sh tests/*.sh`, and the shell suites in `tests/`. The Linux performance gate limits help and version startup to a 2 ms mean and 5 ms p95, and fullscreen prompt readiness to 15 ms p95. It reports binary size without enforcing a size limit.
 
 For the landing page in `apps/web`:
 

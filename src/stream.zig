@@ -35,7 +35,7 @@ pub const Decoder = struct {
     claude_calls: std.ArrayList(StreamingClaudeCall) = .empty,
     usage: types.Usage = .{},
     speed: ServedSpeed = .unknown,
-    received: bool = false,
+    completed: bool = false,
     provider_error: ?[]const u8 = null,
 
     pub fn init(provider: auth.Provider, parse_gpa: std.mem.Allocator, persist: std.mem.Allocator, hooks: Hooks) Decoder {
@@ -53,7 +53,6 @@ pub const Decoder = struct {
     }
 
     fn beforeOutput(self: *Decoder) !void {
-        self.received = true;
         if (self.hooks.on_output) |callback| try callback(self.hooks.context);
     }
 
@@ -111,8 +110,9 @@ pub const Decoder = struct {
                     .arguments = try self.persist.dupe(u8, eventString(item, "arguments") orelse "{}"),
                 });
             };
-        } else if (std.mem.eql(u8, kind, "response.completed")) {
+        } else if (std.mem.eql(u8, kind, "response.completed") or std.mem.eql(u8, kind, "response.incomplete")) {
             const response = eventObject(value, "response") orelse return;
+            self.completed = std.mem.eql(u8, kind, "response.completed");
             // Every tier other than priority is standard processing; the
             // backend may downgrade silently rather than reject the request.
             if (eventString(response, "service_tier")) |tier| {
@@ -172,6 +172,8 @@ pub const Decoder = struct {
             if (eventInteger(usage_value, "input_tokens")) |number| self.usage.input = number;
             if (eventInteger(usage_value, "output_tokens")) |number| self.usage.output = number;
             self.noteClaudeSpeed(usage_value);
+        } else if (std.mem.eql(u8, kind, "message_stop")) {
+            self.completed = true;
         } else if (std.mem.eql(u8, kind, "error")) {
             try self.captureProviderError(data);
         }
@@ -188,8 +190,25 @@ pub const Decoder = struct {
         }
     }
 
-    pub fn finish(self: *Decoder) !types.Assistant {
+    pub fn validateComplete(self: *const Decoder) !void {
         if (self.provider_error != null) return error.ProviderRequestFailed;
+        if (!self.completed) return error.IncompleteProviderResponse;
+    }
+
+    /// Interrupted responses retain visible text only. Tool calls and private
+    /// replay items belong to an unfinished exchange and must not be executed
+    /// or sent back to the provider on the next turn.
+    pub fn finishPartial(self: *Decoder) !types.Assistant {
+        if (self.provider_error != null) return error.ProviderRequestFailed;
+        return .{
+            .text = try self.text.toOwnedSlice(),
+            .calls = &.{},
+            .usage = self.usage,
+        };
+    }
+
+    pub fn finish(self: *Decoder) !types.Assistant {
+        try self.validateComplete();
         if (self.provider == .claude) {
             for (self.claude_calls.items) |*call| try self.calls.append(self.persist, .{
                 .id = call.id,
@@ -294,6 +313,7 @@ test "decodes Anthropic fragmented tool input" {
     try decoder.feed("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}");
     try decoder.feed("data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"bash\",\"input\":{}}}");
     try decoder.feed("data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"pwd\\\"}\"}}");
+    try decoder.feed("data: {\"type\":\"message_stop\"}");
     const result = try decoder.finish();
     try std.testing.expectEqualStrings("ok", result.text);
     try std.testing.expectEqualStrings("{\"command\":\"pwd\"}", result.calls[0].arguments);
@@ -317,4 +337,40 @@ test "preserves Responses streaming errors" {
     try decoder.feed("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"Model unavailable\"}}}");
     try std.testing.expectEqualStrings("Model unavailable", decoder.providerError().?);
     try std.testing.expectError(error.ProviderRequestFailed, decoder.finish());
+}
+
+test "requires a provider completion event before accepting an answer" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for ([_]auth.Provider{ .chatgpt, .grok, .claude }) |provider| {
+        var decoder = Decoder.init(provider, std.testing.allocator, arena.allocator(), .{});
+        defer decoder.deinit();
+        try std.testing.expectError(error.IncompleteProviderResponse, decoder.finish());
+        try decoder.feed("data: [DONE]");
+        try std.testing.expectError(error.IncompleteProviderResponse, decoder.finish());
+        try decoder.feed(if (provider == .claude)
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}"
+        else
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}");
+        try std.testing.expectError(error.IncompleteProviderResponse, decoder.finish());
+        try decoder.feed(if (provider == .claude)
+            "data: {\"type\":\"message_stop\"}"
+        else
+            "data: {\"type\":\"response.completed\",\"response\":{}}");
+        const result = try decoder.finish();
+        try std.testing.expectEqualStrings("partial", result.text);
+    }
+}
+
+test "incomplete Responses preserve usage without accepting tool calls" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var decoder = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), .{});
+    defer decoder.deinit();
+    try decoder.feed("data: {\"type\":\"response.incomplete\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}");
+    try std.testing.expectError(error.IncompleteProviderResponse, decoder.finish());
+    const result = try decoder.finishPartial();
+    try std.testing.expectEqual(@as(u64, 10), result.usage.input);
+    try std.testing.expectEqual(@as(u64, 5), result.usage.output);
+    try std.testing.expectEqual(@as(usize, 0), result.calls.len);
 }

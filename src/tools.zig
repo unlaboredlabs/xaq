@@ -247,8 +247,10 @@ pub fn execute(gpa: std.mem.Allocator, io: Io, name: []const u8, args: std.json.
 }
 
 pub fn executeWithContext(gpa: std.mem.Allocator, io: Io, name: []const u8, args: std.json.Value, context: ExecuteContext) ![]u8 {
+    const cancellation = context.cancellation orelse cancel.processToken();
+    if (cancellation.isRequested()) return error.Cancelled;
     if (std.mem.eql(u8, name, "read")) return read(gpa, io, args, context.cwd);
-    if (std.mem.eql(u8, name, "bash")) return bash(gpa, io, args, context.cancellation orelse cancel.processToken(), context.cwd);
+    if (std.mem.eql(u8, name, "bash")) return bash(gpa, io, args, cancellation, context.cwd);
     if (std.mem.eql(u8, name, "edit")) return if (context.write_enabled) edit(gpa, io, args, context.cwd) else gpa.dupe(u8, "edit is disabled");
     if (std.mem.eql(u8, name, "write")) return if (context.write_enabled) write(gpa, io, args, context.cwd) else gpa.dupe(u8, "write is disabled");
     if (std.mem.eql(u8, name, "web_fetch")) return webFetch(gpa, io, context.firecrawl_api_key orelse return gpa.dupe(u8, "web_fetch is not configured"), args);
@@ -619,6 +621,7 @@ fn bash(gpa: std.mem.Allocator, io: Io, args: std.json.Value, token: *cancel.Tok
 }
 
 fn runBash(gpa: std.mem.Allocator, io: Io, command: []const u8, seconds: u64, token: *cancel.Token, cwd: ?[]const u8) ![]u8 {
+    if (token.isRequested()) return error.Cancelled;
     const script = try std.fmt.allocPrint(gpa, "exec 2>&1\n{s}", .{command});
     defer gpa.free(script);
     var child = try std.process.spawn(io, .{
@@ -779,18 +782,55 @@ fn ensureParent(io: Io, path: []const u8) !void {
 /// Write via a same-directory temp file plus rename so ENOSPC or a kill
 /// mid-write can never leave the destination truncated.
 fn atomicWrite(gpa: std.mem.Allocator, io: Io, path: []const u8, data: []const u8) !void {
+    const target = try resolveWriteTarget(gpa, io, path);
+    defer gpa.free(target);
+    const existing = Io.Dir.cwd().statFile(io, target, .{}) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (existing) |stat| if (stat.kind != .file) return error.UnsupportedFileType;
+    const permissions: Io.File.Permissions = if (existing) |stat|
+        @enumFromInt(@intFromEnum(stat.permissions) & 0o7777)
+    else
+        .default_file;
+
     var random: [8]u8 = undefined;
     try io.randomSecure(&random);
     const hex = std.fmt.bytesToHex(random, .lower);
-    const temporary = try std.fmt.allocPrint(gpa, "{s}.xaq-tmp-{s}", .{ path, &hex });
+    const temporary = try std.fmt.allocPrint(gpa, "{s}.xaq-tmp-{s}", .{ target, &hex });
     defer gpa.free(temporary);
-    errdefer Io.Dir.cwd().deleteFile(io, temporary) catch {};
-    try Io.Dir.cwd().writeFile(io, .{
-        .sub_path = temporary,
-        .data = data,
-        .flags = .{ .exclusive = true },
+    const file = try Io.Dir.cwd().createFile(io, temporary, .{
+        .exclusive = true,
+        .permissions = permissions,
     });
-    try Io.Dir.cwd().rename(temporary, Io.Dir.cwd(), path, io);
+    errdefer Io.Dir.cwd().deleteFile(io, temporary) catch {};
+    defer file.close(io);
+    try file.writeStreamingAll(io, data);
+    // Creation applies umask. Restore the exact existing mode after writing,
+    // including executable bits and restrictive permissions on private files.
+    if (existing != null) try file.setPermissions(io, permissions);
+    try Io.Dir.cwd().rename(temporary, Io.Dir.cwd(), target, io);
+}
+
+fn resolveWriteTarget(gpa: std.mem.Allocator, io: Io, path: []const u8) ![]u8 {
+    var target = try gpa.dupe(u8, path);
+    errdefer gpa.free(target);
+    var link_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var links: usize = 0;
+    while (true) : (links += 1) {
+        const count = Io.Dir.cwd().readLink(io, target, &link_buffer) catch |err| switch (err) {
+            error.NotLink, error.FileNotFound => return target,
+            else => return err,
+        };
+        if (links == 40) return error.SymLinkLoop;
+        const link = link_buffer[0..count];
+        const next = if (std.fs.path.isAbsolute(link))
+            try gpa.dupe(u8, link)
+        else
+            try std.fs.path.join(gpa, &.{ std.fs.path.dirname(target) orelse ".", link });
+        gpa.free(target);
+        target = next;
+    }
 }
 
 fn write(gpa: std.mem.Allocator, io: Io, args: std.json.Value, cwd: ?[]const u8) ![]u8 {
@@ -924,6 +964,82 @@ test "bash combines stdout and stderr in production order" {
     const result = try execute(std.testing.allocator, std.testing.io, "bash", parsed.value, null);
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("one\ntwo\n", result);
+}
+
+test "bash does not start a command after cancellation" {
+    var token: cancel.Token = .{};
+    token.request();
+    try std.testing.expectError(error.Cancelled, runBash(std.testing.failing_allocator, std.testing.io, "exit 0", 5, &token, null));
+}
+
+test "cancelled tool dispatch stops before file or process access" {
+    var token: cancel.Token = .{};
+    token.request();
+    for ([_][]const u8{ "read", "write", "edit", "bash", "web_fetch", "web_search", "Agent", "steer_subagent" }) |name| {
+        try std.testing.expectError(error.Cancelled, executeWithContext(std.testing.failing_allocator, undefined, name, .null, .{ .cancellation = &token }));
+    }
+}
+
+test "write and edit preserve existing executable and private modes" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const cwd = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path});
+    defer std.testing.allocator.free(cwd);
+    var write_args = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"path":"file","content":"before"}
+    , .{});
+    defer write_args.deinit();
+    var edit_args = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"path":"file","edits":[{"oldText":"before","newText":"after"}]}
+    , .{});
+    defer edit_args.deinit();
+
+    for ([_]Io.File.Permissions{ @enumFromInt(0o751), @enumFromInt(0o600) }) |permissions| {
+        const file = try temporary.dir.createFile(std.testing.io, "file", .{});
+        try file.setPermissions(std.testing.io, permissions);
+        file.close(std.testing.io);
+        const original_mode = (try temporary.dir.statFile(std.testing.io, "file", .{})).permissions;
+        const written = try executeWithContext(std.testing.allocator, std.testing.io, "write", write_args.value, .{ .cwd = cwd });
+        defer std.testing.allocator.free(written);
+        try std.testing.expectEqual(original_mode, (try temporary.dir.statFile(std.testing.io, "file", .{})).permissions);
+        const edited = try executeWithContext(std.testing.allocator, std.testing.io, "edit", edit_args.value, .{ .cwd = cwd });
+        defer std.testing.allocator.free(edited);
+        try std.testing.expectEqual(original_mode, (try temporary.dir.statFile(std.testing.io, "file", .{})).permissions);
+        const contents = try temporary.dir.readFileAlloc(std.testing.io, "file", std.testing.allocator, .limited(1024));
+        defer std.testing.allocator.free(contents);
+        try std.testing.expectEqualStrings("after", contents);
+    }
+}
+
+test "atomic writes follow relative symlink chains and missing targets" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.createDir(std.testing.io, "nested", .default_dir);
+    try temporary.dir.symLink(std.testing.io, "../target", "nested/link", .{});
+    try temporary.dir.symLink(std.testing.io, "nested/link", "link", .{});
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/link", .{temporary.sub_path});
+    defer std.testing.allocator.free(path);
+
+    for ([_][]const u8{ "created", "replaced" }) |value| {
+        try atomicWrite(std.testing.allocator, std.testing.io, path, value);
+        const contents = try temporary.dir.readFileAlloc(std.testing.io, "target", std.testing.allocator, .limited(1024));
+        defer std.testing.allocator.free(contents);
+        try std.testing.expectEqualStrings(value, contents);
+        try std.testing.expectEqual(Io.File.Kind.sym_link, (try temporary.dir.statFile(std.testing.io, "link", .{ .follow_symlinks = false })).kind);
+        try std.testing.expectEqual(Io.File.Kind.sym_link, (try temporary.dir.statFile(std.testing.io, "nested/link", .{ .follow_symlinks = false })).kind);
+    }
+}
+
+test "atomic writes refuse symlink loops and nonregular targets" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.symLink(std.testing.io, "link", "link", .{});
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/link", .{temporary.sub_path});
+    defer std.testing.allocator.free(path);
+    try std.testing.expectError(error.SymLinkLoop, atomicWrite(std.testing.allocator, std.testing.io, path, "unused"));
+    try temporary.dir.deleteFile(std.testing.io, "link");
+    try temporary.dir.createDir(std.testing.io, "link", .default_dir);
+    try std.testing.expectError(error.UnsupportedFileType, atomicWrite(std.testing.allocator, std.testing.io, path, "unused"));
 }
 
 test "tool context anchors relative files and commands to its cwd" {
