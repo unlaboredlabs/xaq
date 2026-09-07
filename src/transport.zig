@@ -148,9 +148,8 @@ fn postStreamRequest(
     child.stdin.?.close(io);
     child.stdin = null;
 
-    // Most SSE lines are small. Grow a retained line buffer only when a tool
-    // call actually carries a large argument instead of reserving 8 MiB for
-    // every request.
+    // Most SSE lines fit in the read buffer. Borrow those directly and grow
+    // a retained line buffer only for large events such as tool arguments.
     var read_buffer: [response_read_buffer_bytes]u8 = undefined;
     var file_reader: Io.File.Reader = .init(child.stdout.?, io, &read_buffer);
     const reader = &file_reader.interface;
@@ -220,6 +219,15 @@ fn postStreamRequest(
 
 fn nextResponseLine(reader: *Io.Reader, line: *Io.Writer.Allocating) !?[]const u8 {
     line.clearRetainingCapacity();
+    if (reader.takeDelimiter('\n')) |maybe_line| {
+        const buffered = maybe_line orelse return null;
+        if (buffered.len > max_response_line_bytes) return error.StreamTooLong;
+        return buffered;
+    } else |err| switch (err) {
+        error.StreamTooLong => {},
+        else => return err,
+    }
+
     _ = try reader.streamDelimiterLimit(&line.writer, '\n', .limited(max_response_line_bytes + 1));
     if (line.written().len > max_response_line_bytes) return error.StreamTooLong;
     const delimiter = reader.takeByte() catch |err| switch (err) {
@@ -358,32 +366,83 @@ test "curl config rejects header injection" {
     try std.testing.expectError(error.InvalidHeader, tryHeader(std.testing.allocator, "Authorization", "x\ny"));
 }
 
-test "response lines retain capacity and include an unterminated tail" {
+test "buffered response lines need no allocation and include an unterminated tail" {
     var reader: Io.Reader = .fixed("one\ntwo\n\ntail");
-    var line: Io.Writer.Allocating = .init(std.testing.allocator);
+    var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = 0 });
+    var line: Io.Writer.Allocating = .init(failing.allocator());
     defer line.deinit();
 
     try std.testing.expectEqualStrings("one", (try nextResponseLine(&reader, &line)).?);
-    const capacity = line.writer.buffer.len;
     try std.testing.expectEqualStrings("two", (try nextResponseLine(&reader, &line)).?);
-    try std.testing.expect(line.writer.buffer.len >= capacity);
     try std.testing.expectEqualStrings("", (try nextResponseLine(&reader, &line)).?);
     try std.testing.expectEqualStrings("tail", (try nextResponseLine(&reader, &line)).?);
     try std.testing.expectEqual(@as(?[]const u8, null), try nextResponseLine(&reader, &line));
 }
 
-test "response lines grow beyond the fixed read buffer" {
+test "response lines grow beyond the read buffer and reuse their allocation" {
     const input = try std.testing.allocator.alloc(u8, response_read_buffer_bytes * 2 + 1);
     defer std.testing.allocator.free(input);
     @memset(input, 'x');
     input[input.len - 1] = '\n';
-    var reader: Io.Reader = .fixed(input);
+    var read_buffer: [response_read_buffer_bytes]u8 = undefined;
+    var reader: std.testing.Reader = .init(&read_buffer, &.{
+        .{ .buffer = input },
+        .{ .buffer = "short\n" },
+        .{ .buffer = input[0 .. input.len - 1] },
+    });
     var line: Io.Writer.Allocating = .init(std.testing.allocator);
     defer line.deinit();
 
-    const result = (try nextResponseLine(&reader, &line)).?;
+    const result = (try nextResponseLine(&reader.interface, &line)).?;
     try std.testing.expectEqual(input.len - 1, result.len);
     try std.testing.expectEqualSlices(u8, input[0 .. input.len - 1], result);
+    const capacity = line.writer.buffer.len;
+    try std.testing.expect(capacity >= result.len);
+    try std.testing.expectEqualStrings("short", (try nextResponseLine(&reader.interface, &line)).?);
+    try std.testing.expectEqualSlices(u8, input[0 .. input.len - 1], (try nextResponseLine(&reader.interface, &line)).?);
+    try std.testing.expectEqual(capacity, line.writer.buffer.len);
+    try std.testing.expectEqual(@as(?[]const u8, null), try nextResponseLine(&reader.interface, &line));
+}
+
+test "response lines handle fragmented reads and buffer rebasing" {
+    var read_buffer: [8]u8 = undefined;
+    var reader: std.testing.Reader = .init(&read_buffer, &.{.{ .buffer = "one\ntwo\nthree\n\ntail" }});
+    reader.artificial_limit = .limited(2);
+    var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{ .fail_index = 0 });
+    var line: Io.Writer.Allocating = .init(failing.allocator());
+    defer line.deinit();
+    for ([_][]const u8{ "one", "two", "three", "", "tail" }) |expected| {
+        try std.testing.expectEqualStrings(expected, (try nextResponseLine(&reader.interface, &line)).?);
+    }
+    try std.testing.expectEqual(@as(?[]const u8, null), try nextResponseLine(&reader.interface, &line));
+}
+
+test "response lines enforce the size limit for buffered and streamed input" {
+    const input = try std.testing.allocator.alloc(u8, max_response_line_bytes + 2);
+    defer std.testing.allocator.free(input);
+    @memset(input, 'x');
+    input[max_response_line_bytes] = '\n';
+    input[max_response_line_bytes + 1] = '\n';
+    var line: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer line.deinit();
+    var read_buffer: [response_read_buffer_bytes]u8 = undefined;
+
+    var fixed: Io.Reader = .fixed(input);
+    try std.testing.expectEqual(max_response_line_bytes, (try nextResponseLine(&fixed, &line)).?.len);
+    var streamed: std.testing.Reader = .init(&read_buffer, &.{.{ .buffer = input }});
+    try std.testing.expectEqual(max_response_line_bytes, (try nextResponseLine(&streamed.interface, &line)).?.len);
+
+    input[max_response_line_bytes] = 'x';
+    fixed = .fixed(input);
+    try std.testing.expectError(error.StreamTooLong, nextResponseLine(&fixed, &line));
+    streamed = .init(&read_buffer, &.{.{ .buffer = input }});
+    try std.testing.expectError(error.StreamTooLong, nextResponseLine(&streamed.interface, &line));
+
+    const unterminated = input[0 .. max_response_line_bytes + 1];
+    fixed = .fixed(unterminated);
+    try std.testing.expectError(error.StreamTooLong, nextResponseLine(&fixed, &line));
+    streamed = .init(&read_buffer, &.{.{ .buffer = unterminated }});
+    try std.testing.expectError(error.StreamTooLong, nextResponseLine(&streamed.interface, &line));
 }
 
 test "request body files survive name collisions and failed writes clean up" {
