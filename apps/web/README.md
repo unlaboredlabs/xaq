@@ -12,6 +12,6 @@ pnpm test
 pnpm build
 ```
 
-A single minimal page (`components/landing.tsx`): dark shell transcript — `$ xaq`, tagline, click-to-copy install line, blinking cursor. Copy lives in `lib/content.ts`.
+A single minimal page (`components/landing.tsx`) with a dark shell transcript, `$ xaq`, tagline, install command, and blinking cursor. The install command supports one-click copying and stays selectable when clipboard access is unavailable. Page content lives in `lib/content.ts`.
 
 `/install` redirects to the raw `install.sh`, configured in `next.config.ts` (this replaced the old root `vercel.json`). When deploying to Vercel, set the project **Root Directory** to `apps/web` before merging — otherwise the `/install` redirect drops until the setting is flipped.
