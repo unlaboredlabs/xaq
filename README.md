@@ -55,6 +55,8 @@ ChatGPT and Claude use browser login. ChatGPT may ask you to copy a localhost ca
 
 Already inside an interactive session? Run `/login` to connect or replace any provider login without leaving `xaq`.
 
+During login, select the printed link with your terminal or press Ctrl-Y to copy the complete URL, including any wrapped text. Over SSH, copying uses the terminal clipboard protocol, OSC 52, without needing a clipboard service on the remote machine. Your terminal must allow clipboard writes. Browser opening is skipped over SSH and on Linux without a display. Callback input stays hidden. Grok offers link copying before you press Enter to start waiting for approval.
+
 Credentials live in `~/.config/xaq/auth.json`, written atomically with mode `0600`. Remove one with `xaq logout PROVIDER`. Anthropic may count third-party harness use as extra usage, so check your usage settings before relying on the included plan allowance.
 
 ## Use

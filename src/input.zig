@@ -19,6 +19,7 @@
 const std = @import("std");
 const Io = std.Io;
 const cancel = @import("cancel.zig");
+const clipboard = @import("clipboard.zig");
 const image_input = @import("image.zig");
 const term = @import("term.zig");
 const tui = @import("tui.zig");
@@ -141,6 +142,18 @@ pub fn readLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
 /// Read a credential without echoing it or adding it to prompt history.
 /// Bracketed paste supports API keys and OAuth callback URLs.
 pub fn readSecret(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, label: []const u8) !?[]const u8 {
+    return readSecretOptions(gpa, reader, output, label, null);
+}
+
+const SecretCopy = struct { io: Io, text: []const u8 };
+
+/// Ctrl-Y copies the original login URL, independent of terminal wrapping.
+/// The callback remains hidden and is never copied or added to history.
+pub fn readSecretWithCopy(gpa: std.mem.Allocator, io: Io, reader: *Io.Reader, output: *Io.Writer, label: []const u8, copy_text: []const u8) !?[]const u8 {
+    return readSecretOptions(gpa, reader, output, label, if (interactive) .{ .io = io, .text = copy_text } else null);
+}
+
+fn readSecretOptions(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, label: []const u8, copy: ?SecretCopy) !?[]const u8 {
     const raw = RawMode.enter() catch {
         if (interactive) return error.SecretInputUnavailable;
         return plainSecret(gpa, reader, output, label);
@@ -183,21 +196,28 @@ pub fn readSecret(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer
                 buffer.items.len = prevBoundary(buffer.items, buffer.items.len);
                 try drawSecret(output, label, buffer.items.len);
             },
+            0x19 => if (copy) |action| {
+                const copied = copySecretLink(gpa, action, output) catch false;
+                if (!tui.active) try output.writeAll("\r\x1b[2K");
+                try output.writeAll(if (copied) "Login link sent to clipboard.\n" else "Could not copy link; select the printed URL instead.\n");
+                try output.flush();
+                try drawSecret(output, label, buffer.items.len);
+            },
             0x1b => {
-                const second = (try takeByteOrNull(reader)) orelse continue;
+                const second = (try takeSequenceByte(reader, null)) orelse continue;
                 if (second != '[') continue;
-                var parameter: usize = 0;
-                var final: u8 = 0;
-                while (true) {
-                    const next = (try takeByteOrNull(reader)) orelse break;
-                    if (next >= '0' and next <= '9') {
-                        if (parameter < 100_000) parameter = parameter * 10 + next - '0';
-                    } else if (next >= 0x40 and next <= 0x7e) {
-                        final = next;
-                        break;
+                const sequence = (try readCsi(reader, null)) orelse continue;
+                if (isLegacyMousePrefix(sequence)) {
+                    // A queued X10 report has three bytes after CSI M.
+                    // None belong to the hidden callback or API key.
+                    for (0..3) |_| {
+                        _ = (try takeSequenceByte(reader, null)) orelse break;
                     }
+                    continue;
                 }
-                if (final == '~' and parameter == 200) {
+                if (sequence.final == '~' and sequence.private_marker == 0 and
+                    sequence.parameter_count == 1 and sequence.parameters[0] == 200)
+                {
                     var cursor = buffer.items.len;
                     _ = try pasteInto(gpa, &buffer, &cursor, reader, null, 0);
                     try drawSecret(output, label, buffer.items.len);
@@ -209,6 +229,16 @@ pub fn readSecret(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer
             },
         }
     }
+}
+
+fn copySecretLink(gpa: std.mem.Allocator, action: SecretCopy, output: *Io.Writer) !bool {
+    if (tui.active) {
+        try tui.copyText(action.text);
+    } else if (!try clipboard.copy(gpa, action.io, action.text)) {
+        try clipboard.writeOsc52(output, action.text);
+        try output.flush();
+    }
+    return true;
 }
 
 fn secretPasteMode(output: *Io.Writer, enabled: bool) !void {
