@@ -35,6 +35,13 @@ if mode == "claude_client_version":
                          '{"error":{"message":"Claude Code 2.1.251 or newer is required"}}\n')
         sys.exit(0)
     mode = "completed"
+if mode == "astra":
+    assert body["model"] == "gpt-6-astra", body["model"]
+    assert body["reasoning"]["effort"] == "ultra", body.get("reasoning")
+    assert body["service_tier"] == "priority", body.get("service_tier")
+    assert sys.argv[sys.argv.index("--url") + 1] == "https://chatgpt.com/backend-api/codex/responses"
+    assert 'header = "x-codex-routing-hint: model=gpt-6-astra;tier=priority"' in config
+    mode = "completed"
 if mode == "rate_limit":
     sys.stdout.write('HTTP/1.1 429 Too Many Requests\nRetry-After: 30\n\n{"message":"retry"}\n')
     sys.exit(0)
@@ -163,6 +170,25 @@ class CliTests(unittest.TestCase):
                 result = json.loads(stdout)
                 self.assertEqual(result["text"], "answer")
                 self.assertEqual(result["stop_reason"], "completed")
+
+    def test_astra_model_infers_provider_and_sends_ultra_fast_options(self):
+        # Remember another provider so an unrecognized model would route incorrectly.
+        (self.home / ".config" / "xaq" / "state.json").write_text(json.dumps({
+            "provider": "claude",
+            "claude": {"model": "claude-opus-5"},
+        }))
+        completed = subprocess.run(
+            [BINARY, "--model", "gpt-6-astra", "--effort", "ultra", "--fast",
+             "--no-save", "--output-format", "json", "-p", "test response"],
+            cwd=self.work,
+            env=self.environment | {"XAQ_TEST_PROVIDER": "chatgpt", "XAQ_TEST_MODE": "astra"},
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=10)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["text"], "answer")
+        self.assertEqual(result["stop_reason"], "completed")
+        self.assertEqual(self.request_count(), 1)
 
     def test_partial_responses_do_not_execute_tools(self):
         for provider in PROVIDERS:

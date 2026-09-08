@@ -1210,7 +1210,7 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
             }
         } else {
             const value = if (std.mem.eql(u8, args, "default") or std.mem.eql(u8, args, "provider-default")) null else Effort.parse(args) orelse {
-                try output.writeAll("unknown effort (low, medium, high, xhigh, max, or default)\n");
+                try output.writeAll("unknown effort (low, medium, high, xhigh, max, ultra, or default)\n");
                 try output.flush();
                 return true;
             };
@@ -1675,7 +1675,7 @@ fn pickModelPreferences(session: *Session, reader: *Io.Reader, provider: auth.Pr
     };
     const available_efforts = models.efforts(provider, model);
     if (available_efforts.len > 0) {
-        var labels: [6][]const u8 = undefined;
+        var labels: [@typeInfo(Effort).@"enum".fields.len + 1][]const u8 = undefined;
         labels[0] = "provider-default";
         for (available_efforts, 1..) |effort, index| labels[index] = @tagName(effort);
         try session.output.print("{s}effort for {s} \u{b7} enter confirms \u{b7} esc/q cancels{s}\r\n", .{ term.dim(), model, term.reset() });
@@ -1694,7 +1694,7 @@ fn pickModelPreferences(session: *Session, reader: *Io.Reader, provider: auth.Pr
 }
 
 fn pickEffort(session: *Session, reader: *Io.Reader) !void {
-    var labels: [6][]const u8 = undefined;
+    var labels: [@typeInfo(Effort).@"enum".fields.len + 1][]const u8 = undefined;
     labels[0] = "provider-default";
     var count: usize = 1;
     var initial: usize = 0;
@@ -1939,7 +1939,7 @@ fn pickSettings(session: *Session, reader: *Io.Reader) !void {
                 }
             },
             3 => {
-                var labels: [6][]const u8 = undefined;
+                var labels: [@typeInfo(Effort).@"enum".fields.len + 1][]const u8 = undefined;
                 labels[0] = "provider-default";
                 var count: usize = 1;
                 var initial: usize = 0;

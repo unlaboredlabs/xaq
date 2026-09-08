@@ -162,6 +162,64 @@ class SelectionTests(unittest.TestCase):
         self.until(lambda: len(self.copies()) == 1)
         self.assertEqual(self.copies(), [b"bravo"])
 
+    def test_astra_ultra_and_fast_survive_all_effort_pickers_and_resume(self):
+        self.start()
+        down, up, enter = b"\x1b[B", b"\x1b[A", b"\r"
+        state = self.config / "state.json"
+        settings = self.config / "settings.json"
+        expected = {"model": "gpt-6-astra", "effort": "ultra", "fast": True}
+
+        def choose(command, heading, keys):
+            offset = len(self.output)
+            self.send(command + enter)
+            self.until(lambda: heading in self.output[offset:])
+            self.send(keys)
+            return offset
+
+        # Astra follows the current Sol entry; its sixth effort follows default.
+        offset = choose(b"/model", b"pick a model", down + enter)
+        self.until(lambda: b"effort for gpt-6-astra" in self.output[offset:])
+        self.send(down * 6 + enter)
+        self.until(lambda: b"speed for gpt-6-astra" in self.output[offset:])
+        self.send(enter)  # Fast is the initially selected speed.
+        self.until(lambda: "model gpt-6-astra · effort ultra · fast".encode() in self.output[offset:])
+        self.assertEqual(json.loads(state.read_text())["chatgpt"], expected)
+
+        # Exercise the standalone picker, including a persisted change back to ultra.
+        offset = choose(b"/effort", b"pick reasoning effort", up + enter)
+        self.until(lambda: json.loads(state.read_text())["chatgpt"] == expected | {"effort": "max"}
+                   and b"\x1b[?2004h" in self.output[offset:])
+        offset = choose(b"/effort", b"pick reasoning effort", down + enter)
+        self.until(lambda: json.loads(state.read_text())["chatgpt"] == expected
+                   and b"\x1b[?2004h" in self.output[offset:])
+
+        # Compaction defaults to the current model and low effort, so five
+        # downward moves reach Astra's sixth effort in the third label buffer.
+        offset = choose(b"/settings", b"settings for chatgpt", down * 3 + enter)
+        self.until(lambda: b"reasoning effort used for summaries" in self.output[offset:])
+        self.send(down * 5 + enter)
+        self.until(lambda: settings.exists() and
+                   json.loads(settings.read_text())["compact_efforts"]["chatgpt"] == "ultra")
+        offset = len(self.output)
+        self.send(b"q")
+        self.until(lambda: b"\x1b[?2004h" in self.output[offset:])
+        self.send(b"\x04")
+        self.assertEqual(self.process.wait(timeout=3), 0)
+        self.drain()
+        self.assertIn(b"\x1b[?1002l", self.output)
+
+        # Read the saved thread in a fresh process, with no provider credentials.
+        self.output.clear()
+        self.start()
+        offset = len(self.output)
+        self.send(b"/status\r")
+        self.until(lambda: b"effort    ultra" in self.output[offset:])
+        self.assertIn(b"model     gpt-6-astra", self.output[offset:])
+        self.assertIn(b"fast      on", self.output[offset:])
+        self.assertEqual(json.loads(state.read_text())["chatgpt"], expected)
+        self.assertEqual(json.loads(settings.read_text())["compact_efforts"]["chatgpt"], "ultra")
+        self.assertFalse((self.config / "auth.json").exists())
+
     def test_typed_unicode_is_drawn_complete_and_edited_by_cluster(self):
         self.start(False)
         offset = len(self.output)
