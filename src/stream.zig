@@ -12,9 +12,9 @@ pub const Hooks = struct {
     on_delta: ?*const fn (context: ?*anyopaque, delta: []const u8) anyerror!void = null,
 };
 
-/// The speed a provider reports having served, independent of what the
-/// request asked for. Anthropic echoes `usage.speed`; the Responses API
-/// echoes the applied `service_tier`. Either may be absent.
+/// The processing class reported by the provider, not measured latency.
+/// Anthropic echoes `usage.speed`; the Responses API echoes the applied
+/// `service_tier`. Missing or unfamiliar values stay unknown.
 pub const ServedSpeed = enum { unknown, standard, fast };
 
 const StreamingClaudeCall = struct {
@@ -35,6 +35,9 @@ pub const Decoder = struct {
     claude_calls: std.ArrayList(StreamingClaudeCall) = .empty,
     usage: types.Usage = .{},
     speed: ServedSpeed = .unknown,
+    service_tier_buffer: [64]u8 = undefined,
+    service_tier_len: ?usize = null,
+    service_tier_truncated: bool = false,
     completed: bool = false,
     provider_error: ?[]const u8 = null,
 
@@ -72,6 +75,12 @@ pub const Decoder = struct {
 
     pub fn providerError(self: *const Decoder) ?[]const u8 {
         return self.provider_error;
+    }
+
+    /// A bounded copy survives reuse of the event parser's arena. Callers
+    /// must escape this provider-controlled value when displaying it.
+    pub fn reportedServiceTier(self: *const Decoder) ?[]const u8 {
+        return self.service_tier_buffer[0 .. self.service_tier_len orelse return null];
     }
 
     pub fn feed(self: *Decoder, raw_line: []const u8) !void {
@@ -113,11 +122,7 @@ pub const Decoder = struct {
         } else if (std.mem.eql(u8, kind, "response.completed") or std.mem.eql(u8, kind, "response.incomplete")) {
             const response = eventObject(value, "response") orelse return;
             self.completed = std.mem.eql(u8, kind, "response.completed");
-            // Every tier other than priority is standard processing; the
-            // backend may downgrade silently rather than reject the request.
-            if (eventString(response, "service_tier")) |tier| {
-                self.speed = if (std.mem.eql(u8, tier, "priority")) .fast else .standard;
-            }
+            self.noteResponsesTier(eventString(response, "service_tier"));
             const usage_value = eventObject(response, "usage") orelse return;
             if (eventInteger(usage_value, "input_tokens")) |number| self.usage.input = number;
             if (eventInteger(usage_value, "output_tokens")) |number| self.usage.output = number;
@@ -176,6 +181,24 @@ pub const Decoder = struct {
             self.completed = true;
         } else if (std.mem.eql(u8, kind, "error")) {
             try self.captureProviderError(data);
+        }
+    }
+
+    fn noteResponsesTier(self: *Decoder, value: ?[]const u8) void {
+        self.speed = .unknown;
+        self.service_tier_len = null;
+        self.service_tier_truncated = false;
+        const tier = value orelse return;
+        var len = @min(tier.len, self.service_tier_buffer.len);
+        // A bounded diagnostic must not end inside a UTF-8 character.
+        while (len < tier.len and tier[len] & 0xc0 == 0x80) len -= 1;
+        @memcpy(self.service_tier_buffer[0..len], tier[0..len]);
+        self.service_tier_len = len;
+        self.service_tier_truncated = len < tier.len;
+        if (std.mem.eql(u8, tier, "priority") or std.mem.eql(u8, tier, "fast") or std.mem.eql(u8, tier, "ultrafast")) {
+            self.speed = .fast;
+        } else if (std.mem.eql(u8, tier, "default")) {
+            self.speed = .standard;
         }
     }
 
@@ -273,24 +296,71 @@ test "decodes Responses text, calls, and usage" {
     try std.testing.expectEqual(@as(u64, 5), result.usage.output);
 }
 
-test "reports the speed each provider actually served" {
+test "classifies only recognized returned service tiers" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var responses_fast = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), .{});
-    defer responses_fast.deinit();
-    try responses_fast.feed("data: {\"type\":\"response.completed\",\"response\":{\"service_tier\":\"priority\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}");
-    try std.testing.expectEqual(ServedSpeed.fast, responses_fast.speed);
-
-    var responses_downgraded = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), .{});
-    defer responses_downgraded.deinit();
-    try responses_downgraded.feed("data: {\"type\":\"response.completed\",\"response\":{\"service_tier\":\"default\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}");
-    try std.testing.expectEqual(ServedSpeed.standard, responses_downgraded.speed);
+    const cases = [_]struct { tier: []const u8, speed: ServedSpeed }{
+        .{ .tier = "priority", .speed = .fast },
+        .{ .tier = "fast", .speed = .fast },
+        .{ .tier = "ultrafast", .speed = .fast },
+        .{ .tier = "default", .speed = .standard },
+        .{ .tier = "flex", .speed = .unknown },
+        .{ .tier = "auto", .speed = .unknown },
+        .{ .tier = "future-tier", .speed = .unknown },
+        .{ .tier = "", .speed = .unknown },
+    };
+    for (cases) |case| {
+        var decoder = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), .{});
+        defer decoder.deinit();
+        const event = try std.fmt.allocPrint(std.testing.allocator, "data: {{\"type\":\"response.completed\",\"response\":{{\"service_tier\":{f}}}}}", .{std.json.fmt(case.tier, .{})});
+        defer std.testing.allocator.free(event);
+        try decoder.feed(event);
+        try std.testing.expectEqual(case.speed, decoder.speed);
+        try std.testing.expectEqualStrings(case.tier, decoder.reportedServiceTier().?);
+        try std.testing.expect(!decoder.service_tier_truncated);
+    }
 
     var responses_silent = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), .{});
     defer responses_silent.deinit();
     try responses_silent.feed("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}");
     try std.testing.expectEqual(ServedSpeed.unknown, responses_silent.speed);
+    try std.testing.expectEqual(null, responses_silent.reportedServiceTier());
+    // Missing or malformed final metadata must not reuse an earlier value.
+    for ([_][]const u8{ "null", "42" }) |value| {
+        try responses_silent.feed("data: {\"type\":\"response.incomplete\",\"response\":{\"service_tier\":\"default\"}}");
+        const event = try std.fmt.allocPrint(std.testing.allocator, "data: {{\"type\":\"response.completed\",\"response\":{{\"service_tier\":{s}}}}}", .{value});
+        defer std.testing.allocator.free(event);
+        try responses_silent.feed(event);
+        try std.testing.expectEqual(ServedSpeed.unknown, responses_silent.speed);
+        try std.testing.expectEqual(null, responses_silent.reportedServiceTier());
+    }
+}
+
+test "returned service tier diagnostics survive parser reuse and stay bounded" {
+    var decoder = Decoder.init(.chatgpt, std.testing.allocator, std.testing.allocator, .{});
+    defer decoder.deinit();
+    const tier = "x" ** 63 ++ "界\n\x1b[31m";
+    const event = try std.fmt.allocPrint(std.testing.allocator, "data: {{\"type\":\"response.completed\",\"response\":{{\"service_tier\":{f}}}}}", .{std.json.fmt(tier, .{})});
+    defer std.testing.allocator.free(event);
+    try decoder.feed(event);
+    @memset(event, 'x');
+    try decoder.feed("data: {\"type\":\"ignored\",\"payload\":\"overwrite parser storage\"}");
+    try std.testing.expectEqualStrings("x" ** 63, decoder.reportedServiceTier().?);
+    try std.testing.expect(decoder.service_tier_truncated);
+    try std.testing.expectEqual(ServedSpeed.unknown, decoder.speed);
+
+    try decoder.feed("data: {\"type\":\"response.completed\",\"response\":{\"service_tier\":\"future\\n\\u001b[31m\\\"\"}}");
+    try std.testing.expect(!decoder.service_tier_truncated);
+    const diagnostic = try std.fmt.allocPrint(std.testing.allocator, "{f}", .{std.json.fmt(decoder.reportedServiceTier(), .{ .escape_unicode = true })});
+    defer std.testing.allocator.free(diagnostic);
+    try std.testing.expectEqualStrings("\"future\\n\\u001b[31m\\\"\"", diagnostic);
+    try std.testing.expectEqual(ServedSpeed.unknown, decoder.speed);
+}
+
+test "reports explicit Anthropic speed metadata" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
 
     var claude_fast = Decoder.init(.claude, std.testing.allocator, arena.allocator(), .{});
     defer claude_fast.deinit();

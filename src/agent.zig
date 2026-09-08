@@ -2979,7 +2979,7 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
         };
         spin.stop();
         defer session.gpa.free(response.body);
-        log.logf("agent", "event=response kind={s} turn={d} status={d} attempt={d} speed={s}", .{ kind, session.turn, response.status, attempt + 1, @tagName(decoder.core.speed) });
+        log.logf("agent", "event=response kind={s} turn={d} status={d} attempt={d} speed={s} service_tier={f} service_tier_truncated={}", .{ kind, session.turn, response.status, attempt + 1, @tagName(decoder.core.speed), std.json.fmt(decoder.core.reportedServiceTier(), .{ .escape_unicode = true }), decoder.core.service_tier_truncated });
         if (response.status >= 200 and response.status < 300) {
             if (decoder.core.providerError()) |message| {
                 try decoder.finishRendering();
@@ -2987,7 +2987,7 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
                 return error.ProviderRequestFailed;
             }
             const result = try finishRound(&decoder, .completed);
-            try noteServedSpeed(session, fast, decoder.core.speed);
+            try noteServedSpeed(session, fast, &decoder.core);
             return result;
         }
         if (response.status == 401 and !refreshed) {
@@ -3037,19 +3037,56 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
     return error.ProviderRequestFailed;
 }
 
-/// Both providers can serve a fast request at standard speed instead of
-/// rejecting it (ChatGPT downgrades the tier; Anthropic reports
-/// `usage.speed`). Fast mode is billed at a premium, so say so once per
-/// session rather than letting the user assume they are getting it. The
-/// note goes to the transcript even for compaction, whose round output
-/// is a sink.
-fn noteServedSpeed(session: *Session, fast: bool, served: stream_decoder.ServedSpeed) !void {
-    if (!fast or served != .standard) return;
-    log.logf("agent", "event=fast_downgraded provider={s} model={s}", .{ @tagName(session.provider), session.model });
+/// Report explicit provider metadata, not an inference about latency. Keep
+/// requesting fast mode and print once per session, including compaction.
+fn noteServedSpeed(session: *Session, fast: bool, decoder: *const stream_decoder.Decoder) !void {
+    if (!fast or decoder.speed != .standard) return;
+    log.logf("agent", "event=fast_downgraded provider={s} model={s} service_tier={f}", .{ @tagName(session.provider), session.model, std.json.fmt(decoder.reportedServiceTier(), .{ .escape_unicode = true }) });
     if (session.fast_downgrade_noted or !session.interactive) return;
     session.fast_downgrade_noted = true;
-    try session.output.print("\n{s}fast mode requested but {s} served this response at standard speed{s}\n", .{ term.dim(), session.provider.label(), term.reset() });
+    try session.output.print("\n{s}fast mode requested; {s} returned {s}={f} for this response. Fast remains requested.{s}\n", .{
+        term.dim(),
+        session.provider.label(),
+        if (session.provider == .claude) "usage.speed" else "service_tier",
+        std.json.fmt(if (session.provider == .claude) @as([]const u8, "standard") else decoder.reportedServiceTier().?, .{ .escape_unicode = true }),
+        term.reset(),
+    });
     try session.output.flush();
+}
+
+test "fast tier notice reports explicit default once and preserves fast mode" {
+    var output: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    var session = try testSession("/unused", &output.writer);
+    defer session.deinit();
+    var decoder = stream_decoder.Decoder.init(.chatgpt, std.testing.allocator, session.allocator(), .{});
+    defer decoder.deinit();
+    session.interactive = true;
+    for ([_][]const u8{ "priority", "fast", "ultrafast", "flex", "future-tier" }) |tier| {
+        const event = try std.fmt.allocPrint(std.testing.allocator, "data: {{\"type\":\"response.completed\",\"response\":{{\"service_tier\":{f}}}}}", .{std.json.fmt(tier, .{})});
+        defer std.testing.allocator.free(event);
+        try decoder.feed(event);
+        try noteServedSpeed(&session, true, &decoder);
+    }
+    try decoder.feed("data: {\"type\":\"response.completed\",\"response\":{}}");
+    try noteServedSpeed(&session, true, &decoder);
+    try std.testing.expectEqual(@as(usize, 0), output.written().len);
+    try std.testing.expect(!session.fast_downgrade_noted);
+
+    try decoder.feed("data: {\"type\":\"response.completed\",\"response\":{\"service_tier\":\"default\"}}");
+    try noteServedSpeed(&session, false, &decoder);
+    session.interactive = false;
+    try noteServedSpeed(&session, true, &decoder);
+    try std.testing.expectEqual(@as(usize, 0), output.written().len);
+    try std.testing.expect(!session.fast_downgrade_noted);
+    session.interactive = true;
+    try noteServedSpeed(&session, true, &decoder);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "ChatGPT returned service_tier=\"default\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output.written(), "Fast remains requested.") != null);
+    const notice_len = output.written().len;
+    try noteServedSpeed(&session, true, &decoder);
+    try std.testing.expectEqual(notice_len, output.written().len);
+    try std.testing.expect(session.fast);
 }
 
 fn finishRound(decoder: *Decoder, stop_reason: StopReason) !RoundResult {
