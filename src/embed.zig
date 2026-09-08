@@ -554,7 +554,7 @@ pub const Agent = struct {
                     .{ .name = "anthropic-version", .value = "2023-06-01" },
                     .{ .name = "anthropic-beta", .value = request_builder.claudeBetaHeader(self.fast) },
                     .{ .name = "anthropic-dangerous-direct-browser-access", .value = "true" },
-                    .{ .name = "User-Agent", .value = "claude-cli/2.1.75" },
+                    .{ .name = "User-Agent", .value = request_builder.claude_user_agent },
                     .{ .name = "x-app", .value = "cli" },
                 },
                 .body = body,
@@ -805,6 +805,47 @@ test "embedded agent streams, runs a host tool, and keeps history" {
     try std.testing.expectEqual(@as(usize, 1), turn.tool_calls);
     try std.testing.expectEqual(@as(usize, 4), embedded.history().len);
     try std.testing.expectEqual(@as(u64, 10), turn.usage.input);
+}
+
+test "embedded Claude requests meet the model minimum client version" {
+    const Fake = struct {
+        requests: usize = 0,
+
+        fn post(raw: ?*anyopaque, gpa: std.mem.Allocator, _: Io, request: Request, line_context: ?*anyopaque, on_line: StreamLineFn) !Response {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.requests += 1;
+            try std.testing.expectEqual(Provider.claude, request.provider);
+            try std.testing.expectEqualStrings("https://api.anthropic.com/v1/messages", request.url);
+            const user_agent = for (request.headers) |header| {
+                if (std.ascii.eqlIgnoreCase(header.name, "User-Agent")) break header.value;
+            } else return error.MissingUserAgent;
+            const prefix = "claude-cli/";
+            try std.testing.expect(std.mem.startsWith(u8, user_agent, prefix));
+            const version = try std.SemanticVersion.parse(user_agent[prefix.len..]);
+            if (version.order(.{ .major = 2, .minor = 1, .patch = 251 }) == .lt) {
+                return .{ .status = 400, .body = try gpa.dupe(u8, "{\"error\":{\"message\":\"This model requires Claude Code 2.1.251 or later.\"}}") };
+            }
+            try on_line(line_context, "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}");
+            try on_line(line_context, "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"connected\"}}");
+            try on_line(line_context, "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}");
+            try on_line(line_context, "data: {\"type\":\"message_stop\"}");
+            return .{ .status = 200, .body = try gpa.dupe(u8, "") };
+        }
+    };
+    var fake: Fake = .{};
+    var embedded = try Agent.init(std.testing.allocator, .{
+        .io = std.testing.io,
+        .provider = .claude,
+        .model = "claude-sonnet-5",
+        .cwd = "/workspace",
+        .credential = .{ .access = "token", .refresh = "", .expires = 0 },
+        .transport = .{ .context = &fake, .post_stream = Fake.post },
+    });
+    defer embedded.deinit();
+    const turn = try embedded.prompt("hello", .{});
+    try std.testing.expectEqualStrings("connected", turn.text);
+    try std.testing.expectEqual(@as(usize, 1), fake.requests);
+    try std.testing.expectEqual(@as(?u16, 200), embedded.last_http_status);
 }
 
 test "host tool text stays UTF-8 and bounded before provider serialization" {

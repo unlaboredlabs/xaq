@@ -3098,7 +3098,7 @@ fn requestStream(gpa: std.mem.Allocator, io: Io, provider: auth.Provider, creden
             .{ .name = "anthropic-version", .value = "2023-06-01" },
             .{ .name = "anthropic-beta", .value = request.claudeBetaHeader(fast) },
             .{ .name = "anthropic-dangerous-direct-browser-access", .value = "true" },
-            .{ .name = "User-Agent", .value = "claude-cli/2.1.75" },
+            .{ .name = "User-Agent", .value = request.claude_user_agent },
             .{ .name = "x-app", .value = "cli" },
         }, body, decoder, decodeLine),
         .grok => transport.postStream(gpa, io, "https://api.x.ai/v1/responses", "application/json", &.{

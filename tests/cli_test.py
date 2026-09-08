@@ -24,6 +24,17 @@ body = json.loads(pathlib.Path(request_path).read_text())
 with open(os.environ["XAQ_TEST_REQUESTS"], "a") as requests:
     requests.write("request\n")
 mode = os.environ["XAQ_TEST_MODE"]
+if mode == "claude_client_version":
+    headers = [json.loads(line.split("=", 1)[1].strip())
+               for line in config.splitlines() if line.startswith("header = ")]
+    user_agent = next(header.split(": ", 1)[1] for header in headers
+                      if header.lower().startswith("user-agent: "))
+    version = tuple(map(int, user_agent.removeprefix("claude-cli/").split(".")))
+    if version < (2, 1, 251):
+        sys.stdout.write('HTTP/1.1 400 Bad Request\n\n'
+                         '{"error":{"message":"Claude Code 2.1.251 or newer is required"}}\n')
+        sys.exit(0)
+    mode = "completed"
 if mode == "rate_limit":
     sys.stdout.write('HTTP/1.1 429 Too Many Requests\nRetry-After: 30\n\n{"message":"retry"}\n')
     sys.exit(0)
@@ -164,6 +175,15 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(result["stop_reason"], "stream_interrupted")
                 self.assertEqual(result["tool_calls"], 0)
                 self.assertFalse(self.marker.exists())
+
+    def test_claude_requests_meet_model_client_version_requirement(self):
+        process = self.start("claude", "claude_client_version")
+        stdout, stderr = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 0, stderr)
+        result = json.loads(stdout)
+        self.assertEqual(result["text"], "answer")
+        self.assertEqual(result["stop_reason"], "completed")
+        self.assertEqual(self.request_count(), 1)
 
     def test_binary_tool_output_remains_provider_text(self):
         for provider in PROVIDERS:
