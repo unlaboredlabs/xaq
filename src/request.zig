@@ -5,6 +5,10 @@ const models = @import("models.zig");
 const tools = @import("tools.zig");
 const types = @import("types.zig");
 
+/// Current Claude models require at least this client version. Share it
+/// across the CLI and embedded transports, including compaction requests.
+pub const claude_user_agent = "claude-cli/2.1.251";
+
 /// The providers spell fast mode differently. ChatGPT takes the Responses
 /// `service_tier` field, and Codex's "fast" tier is the wire value
 /// "priority" (sending "fast" is rejected). Anthropic takes a top-level
