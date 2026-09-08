@@ -6,6 +6,7 @@ const spin = @import("spin.zig");
 const settings = @import("settings.zig");
 const term = @import("term.zig");
 const transport = @import("transport.zig");
+const tui = @import("tui.zig");
 
 pub const Provider = enum {
     chatgpt,
@@ -97,10 +98,12 @@ const anthropic_oauth_headers = [_]transport.Header{
 const xai_client = "b1a00492-073a-47ea-816f-4c329264a828";
 
 pub fn login(gpa: std.mem.Allocator, io: Io, home: []const u8, provider: Provider, input: *Io.Reader, output: *Io.Writer) !void {
+    try tui.setMouseReporting(false);
+    defer tui.setMouseReporting(true) catch {};
     const new_credential = switch (provider) {
         .chatgpt => try loginChatGpt(gpa, io, input, output),
         .claude => try loginClaude(gpa, io, input, output),
-        .grok => try loginGrok(gpa, io, output),
+        .grok => try loginGrok(gpa, io, input, output),
     };
     try put(gpa, io, home, provider, new_credential);
     try output.print("{s} connected.\n", .{provider.label()});
@@ -339,13 +342,11 @@ fn loginChatGpt(gpa: std.mem.Allocator, io: Io, input: *Io.Reader, output: *Io.W
     };
     const query = try transport.formEncode(gpa, &fields);
     const url = try std.fmt.allocPrint(gpa, "https://auth.openai.com/oauth/authorize?{s}", .{query});
-    openBrowser(gpa, io, url);
-    try output.print(
-        "Open this URL if your browser did not open:\n{s}\nThe localhost page may fail to load. Copy its full URL from the address bar.\n",
-        .{url},
-    );
+    try showLoginLink(output, url);
+    try output.writeAll("The localhost page may fail to load. Copy its full URL from the address bar.\n");
     try output.flush();
-    const submitted = (try input_mod.readSecret(gpa, input, output, "Callback URL or code: ")) orelse return error.EndOfStream;
+    openBrowser(gpa, io, url);
+    const submitted = (try input_mod.readSecretWithCopy(gpa, io, input, output, "Callback URL or code: ", url)) orelse return error.EndOfStream;
     defer gpa.free(submitted);
     const returned_state = try authorizationState(gpa, submitted);
     if (returned_state) |actual| {
@@ -409,12 +410,24 @@ fn randomToken(gpa: std.mem.Allocator, io: Io, comptime byte_count: usize) ![]u8
     return token;
 }
 
-/// Best-effort convenience: launch the platform opener and ignore any
-/// failure; the URL is always printed for manual use.
+fn showLoginLink(output: *Io.Writer, url: []const u8) !void {
+    try output.print("Open this URL to sign in:\n{s}\n", .{url});
+    if (input_mod.interactive) try output.writeAll("Ctrl-Y copies the full sign-in link.\n");
+}
+
+const browser_guard =
+    \\if [ -n "${SSH_CONNECTION+x}${SSH_CLIENT+x}${SSH_TTY+x}" ]; then exit 0; fi
+    \\if [ "$1" = linux ] && [ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then exit 0; fi
+    \\shift
+    \\exec "$@"
+;
+
+/// Best-effort convenience for local sessions. Print and flush the link
+/// before calling this so browser failures never hide the manual path.
 fn openBrowser(gpa: std.mem.Allocator, io: Io, url: []const u8) void {
     const opener = if (@import("builtin").os.tag == .macos) "open" else "xdg-open";
     const result = std.process.run(gpa, io, .{
-        .argv = &.{ opener, url },
+        .argv = &.{ "/bin/sh", "-c", browser_guard, "xaq-browser", @tagName(@import("builtin").os.tag), opener, url },
         .stdout_limit = .limited(4096),
         .stderr_limit = .limited(4096),
         .timeout = .{ .duration = .{ .raw = .fromSeconds(10), .clock = .awake } },
@@ -427,13 +440,11 @@ fn loginClaude(gpa: std.mem.Allocator, io: Io, input: *Io.Reader, output: *Io.Wr
     const pair = try pkce(gpa, io);
     const url = try claudeAuthorizationUrl(gpa, pair.challenge, pair.verifier);
     defer gpa.free(url);
-    openBrowser(gpa, io, url);
-    try output.print(
-        "Open this URL if your browser did not open:\n{s}\nCopy the authorization code from the callback page.\n",
-        .{url},
-    );
+    try showLoginLink(output, url);
+    try output.writeAll("Copy the authorization code from the callback page.\n");
     try output.flush();
-    const submitted = (try input_mod.readSecret(gpa, input, output, "Callback URL or code: ")) orelse return error.EndOfStream;
+    openBrowser(gpa, io, url);
+    const submitted = (try input_mod.readSecretWithCopy(gpa, io, input, output, "Callback URL or code: ", url)) orelse return error.EndOfStream;
     defer gpa.free(submitted);
     // The callback state echoes the PKCE verifier; when the paste
     // includes one, a mismatch means a stale or foreign login attempt.
@@ -511,7 +522,7 @@ fn authorizationState(gpa: std.mem.Allocator, value: []const u8) !?[]const u8 {
     return null;
 }
 
-fn loginGrok(gpa: std.mem.Allocator, io: Io, output: *Io.Writer) !Credential {
+fn loginGrok(gpa: std.mem.Allocator, io: Io, input: *Io.Reader, output: *Io.Writer) !Credential {
     try checkLoginCancellation();
     const body = try transport.formEncode(gpa, &.{
         .{ "client_id", xai_client }, .{ "scope", "openid profile email offline_access grok-cli:access api:access" }, .{ "referrer", "xaq" },
@@ -524,12 +535,19 @@ fn loginGrok(gpa: std.mem.Allocator, io: Io, output: *Io.Writer) !Credential {
     defer parsed.deinit();
     const device = try string(parsed.value, "device_code");
     const user = try string(parsed.value, "user_code");
-    const uri = try string(parsed.value, "verification_uri");
+    const uri = try deviceLoginUri(parsed.value);
+    // Browser and copy-prompt time consume the device code's validity too.
     const expires = try deviceLoginDeadline(parsed.value, Io.Clock.boot.now(io));
     var interval = try number(parsed.value, "interval", 5);
     if (interval <= 0) return error.InvalidTokenResponse;
+    try showLoginLink(output, uri);
+    try output.print("Code: {s}\n", .{user});
+    try output.flush();
     openBrowser(gpa, io, uri);
-    try output.print("Open {s} and enter: {s}\n", .{ uri, user });
+    if (input_mod.interactive) {
+        const submitted = (try input_mod.readSecretWithCopy(gpa, io, input, output, "Press Enter to wait for approval: ", uri)) orelse return error.EndOfStream;
+        gpa.free(submitted);
+    }
     // The spinner is a no-op without styling (NO_COLOR, dumb terminals,
     // pipes); print a static line so the minutes-long poll is not silent.
     if (!term.enabled) try output.writeAll("waiting for approval...\n");
@@ -559,6 +577,23 @@ fn loginGrok(gpa: std.mem.Allocator, io: Io, output: *Io.Writer) !Credential {
         spin.stop();
         try requireStatus(gpa, poll, output, null);
     }
+}
+
+fn deviceLoginUri(response: std.json.Value) ![]const u8 {
+    if (string(response, "verification_uri_complete") catch null) |complete| {
+        if (validLoginUri(complete)) return complete;
+    }
+    const uri = try string(response, "verification_uri");
+    if (!validLoginUri(uri)) return error.InvalidTokenResponse;
+    return uri;
+}
+
+fn validLoginUri(value: []const u8) bool {
+    for (value) |byte| if (byte <= ' ' or byte == 0x7f) return false;
+    const uri = std.Uri.parse(value) catch return false;
+    const host = uri.host orelse return false;
+    return !host.isEmpty() and
+        (std.ascii.eqlIgnoreCase(uri.scheme, "https") or std.ascii.eqlIgnoreCase(uri.scheme, "http"));
 }
 
 fn checkLoginCancellation() !void {
@@ -639,6 +674,66 @@ test "provider parsing" {
     try std.testing.expectEqual(Provider.chatgpt, Provider.parse("chatgpt").?);
     try std.testing.expectEqual(@as(?Provider, null), Provider.parse("openai"));
     try std.testing.expectEqualStrings("ChatGPT", Provider.chatgpt.label());
+}
+
+test "device login prefers complete links and falls back without inventing a query" {
+    const cases = [_]struct { response: []const u8, expected: []const u8 }{
+        .{ .response = "{\"verification_uri\":\"https://auth.x.ai/activate\",\"verification_uri_complete\":\"https://auth.x.ai/activate?user_code=ABCD-EFGH\"}", .expected = "https://auth.x.ai/activate?user_code=ABCD-EFGH" },
+        .{ .response = "{\"verification_uri\":\"https://auth.x.ai/activate\",\"user_code\":\"ABCD-EFGH\"}", .expected = "https://auth.x.ai/activate" },
+        .{ .response = "{\"verification_uri\":\"https://auth.x.ai/activate\",\"verification_uri_complete\":null}", .expected = "https://auth.x.ai/activate" },
+        .{ .response = "{\"verification_uri\":\"https://auth.x.ai/activate\",\"verification_uri_complete\":\"javascript:alert(1)\"}", .expected = "https://auth.x.ai/activate" },
+        .{ .response = "{\"verification_uri\":\"https://auth.x.ai/activate\",\"verification_uri_complete\":\"https://\"}", .expected = "https://auth.x.ai/activate" },
+        .{ .response = "{\"verification_uri\":\"https://auth.x.ai/activate\",\"verification_uri_complete\":\"https://auth.x.ai/activate\\n\"}", .expected = "https://auth.x.ai/activate" },
+    };
+    for (cases) |case| {
+        var parsed = try parseJson(std.testing.allocator, case.response);
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings(case.expected, try deviceLoginUri(parsed.value));
+    }
+    var invalid = try parseJson(std.testing.allocator, "{\"verification_uri\":\"file:///tmp/activate\"}");
+    defer invalid.deinit();
+    try std.testing.expectError(error.InvalidTokenResponse, deviceLoginUri(invalid.value));
+}
+
+test "browser auto opening requires a local graphical session" {
+    const cases = [_]struct {
+        platform: []const u8 = "linux",
+        display: ?[]const u8 = null,
+        wayland: ?[]const u8 = null,
+        ssh: ?[]const u8 = null,
+        opens: bool = false,
+    }{
+        .{},
+        .{ .display = "", .wayland = "" },
+        .{ .display = ":0", .opens = true },
+        .{ .wayland = "wayland-0", .opens = true },
+        .{ .display = ":0", .ssh = "SSH_CONNECTION" },
+        .{ .display = ":0", .ssh = "SSH_CLIENT" },
+        .{ .wayland = "wayland-0", .ssh = "SSH_TTY" },
+        .{ .platform = "macos", .opens = true },
+        .{ .platform = "macos", .ssh = "SSH_CONNECTION" },
+    };
+    for (cases) |case| {
+        var environ: std.process.Environ.Map = .init(std.testing.allocator);
+        defer environ.deinit();
+        if (case.display) |value| try environ.put("DISPLAY", value);
+        if (case.wayland) |value| try environ.put("WAYLAND_DISPLAY", value);
+        if (case.ssh) |name| try environ.put(name, "");
+        const result = try std.process.run(std.testing.allocator, std.testing.io, .{
+            .argv = &.{ "/bin/sh", "-c", browser_guard, "browser-test", case.platform, "/bin/sh", "-c", "printf browser-started" },
+            .environ_map = &environ,
+            .stdout_limit = .limited(64),
+            .stderr_limit = .limited(64),
+            .timeout = .{ .duration = .{ .raw = .fromSeconds(1), .clock = .awake } },
+        });
+        defer std.testing.allocator.free(result.stdout);
+        defer std.testing.allocator.free(result.stderr);
+        switch (result.term) {
+            .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+            else => return error.TestUnexpectedResult,
+        }
+        try std.testing.expectEqualStrings(if (case.opens) "browser-started" else "", result.stdout);
+    }
 }
 
 test "guided login cancellation is checked before polling" {

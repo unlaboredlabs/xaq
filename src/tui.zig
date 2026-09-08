@@ -436,6 +436,16 @@ pub fn setPasteMode(enabled: bool) !void {
     try sink.flush();
 }
 
+/// Login waits do not consume mouse reports. Let the terminal select text
+/// directly until authentication returns to the regular editor.
+pub fn setMouseReporting(enabled: bool) !void {
+    if (!active) return;
+    render_mutex.lockUncancelable(io_state);
+    defer render_mutex.unlock(io_state);
+    try sink.writeAll(if (enabled) "\x1b[?1000h\x1b[?1002h\x1b[?1006h" else "\x1b[?1006l\x1b[?1002l\x1b[?1000l");
+    try sink.flush();
+}
+
 /// Show a short-lived message where the editor text normally appears.
 /// The foreground editor owns expiry and dismissal once input begins.
 pub fn showStartupHint(text: []const u8) void {
