@@ -7,6 +7,7 @@ pub const Effort = enum {
     high,
     xhigh,
     max,
+    ultra,
 
     pub fn parse(value: []const u8) ?Effort {
         inline for (@typeInfo(Effort).@"enum".fields) |item| {
@@ -26,13 +27,16 @@ pub const Profile = struct {
 
 const standard_efforts = [_]Effort{ .low, .medium, .high, .xhigh };
 const full_efforts = [_]Effort{ .low, .medium, .high, .xhigh, .max };
+const astra_efforts = [_]Effort{ .low, .medium, .high, .xhigh, .max, .ultra };
 const no_efforts = [_]Effort{};
 
 /// Subscription-facing limits, not API-key product limits. The ChatGPT
-/// values come from the Codex model catalog fetched on 2026-08-19; its
-/// 272K window intentionally differs from the 1.05M OpenAI API window.
+/// values come from the Codex model catalog fetched on 2026-08-19, with
+/// Astra verified on 2026-09-08. Its default 272K window intentionally
+/// differs from the 1.05M OpenAI API window.
 pub const profiles = [_]Profile{
     .{ .provider = .chatgpt, .id = "gpt-5.6-sol", .context_tokens = 272_000, .efforts = &full_efforts, .fast = true },
+    .{ .provider = .chatgpt, .id = "gpt-6-astra", .context_tokens = 272_000, .efforts = &astra_efforts, .fast = true },
     .{ .provider = .chatgpt, .id = "gpt-5.6-terra", .context_tokens = 272_000, .efforts = &full_efforts, .fast = true },
     .{ .provider = .chatgpt, .id = "gpt-5.6-luna", .context_tokens = 272_000, .efforts = &full_efforts, .fast = true },
     .{ .provider = .chatgpt, .id = "gpt-5.5", .context_tokens = 272_000, .efforts = &standard_efforts, .fast = true },
@@ -49,6 +53,7 @@ pub const profiles = [_]Profile{
 
 const chatgpt_choices = [_][]const u8{
     "gpt-5.6-sol",
+    "gpt-6-astra",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
     "gpt-5.5",
@@ -129,10 +134,51 @@ pub fn supportsFast(provider: auth.Provider, id: []const u8) bool {
 }
 
 test "catalog model IDs resolve their provider" {
+    try std.testing.expectEqual(auth.Provider.chatgpt, findAny("gpt-6-astra").?.provider);
     try std.testing.expectEqual(auth.Provider.chatgpt, findAny("gpt-5.4-mini").?.provider);
     try std.testing.expectEqual(auth.Provider.claude, findAny("claude-opus-5").?.provider);
     try std.testing.expectEqual(auth.Provider.grok, findAny("grok-4.6").?.provider);
     try std.testing.expectEqual(@as(?*const Profile, null), findAny("gpt-6-unknown"));
+}
+
+test "catalog choices cover every profile exactly once" {
+    var choice_count: usize = 0;
+    inline for (@typeInfo(auth.Provider).@"enum".fields) |field| {
+        const provider: auth.Provider = @enumFromInt(field.value);
+        const available = choices(provider);
+        try std.testing.expect(available.len > 0);
+        choice_count += available.len;
+        for (available) |id| {
+            const profile = findAny(id) orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(provider, profile.provider);
+        }
+    }
+    try std.testing.expectEqual(profiles.len, choice_count);
+    for (profiles, 0..) |profile, index| {
+        var occurrences: usize = 0;
+        for (choices(profile.provider)) |id| {
+            if (std.mem.eql(u8, profile.id, id)) occurrences += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 1), occurrences);
+        for (profiles[index + 1 ..]) |other| {
+            try std.testing.expect(!std.mem.eql(u8, profile.id, other.id));
+        }
+    }
+}
+
+test "Astra supports subscription efforts and fast without changing the default" {
+    try std.testing.expectEqualStrings("gpt-5.6-sol", defaultModel(.chatgpt));
+    try std.testing.expectEqual(@as(u32, 272_000), contextWindow(.chatgpt, "gpt-6-astra"));
+    try std.testing.expect(supportsFast(.chatgpt, "gpt-6-astra"));
+    const expected = [_]Effort{ .low, .medium, .high, .xhigh, .max, .ultra };
+    try std.testing.expectEqualSlices(Effort, &expected, efforts(.chatgpt, "gpt-6-astra"));
+    for (expected) |effort| {
+        try std.testing.expect(supportsEffort(.chatgpt, "gpt-6-astra", effort));
+        try std.testing.expectEqual(effort, Effort.parse(@tagName(effort)).?);
+    }
+    try std.testing.expect(!supportsEffort(.chatgpt, "gpt-5.6-sol", .ultra));
+    try std.testing.expect(!supportsEffort(.claude, "claude-opus-5", .ultra));
+    try std.testing.expect(!supportsEffort(.grok, "grok-4.6", .ultra));
 }
 
 test "subscription profiles preserve product-specific context windows" {

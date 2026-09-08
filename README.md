@@ -134,11 +134,15 @@ The object includes `text`, `stop_reason`, `provider`, `model`, `thread_id`, tok
 Override model behavior when needed:
 
 ```sh
-xaq --model gpt-5.5 --effort high
+xaq --model gpt-6-astra --effort high
 xaq --fast 'solve the failing test'
 ```
 
-The defaults are `gpt-5.6-sol`, `claude-opus-5`, and `grok-4.6`. Run `/model` for the curated choices across all three providers; picking another provider's model switches the session to that subscription, offering login first if needed. A recognized `--model` ID implies its provider, so `xaq --model claude-opus-5` needs no `--provider` flag. Exact model IDs also work, though `xaq` uses conservative context limits when it does not recognize one, and unrecognized IDs stay with the current provider. Fast mode is available only on models whose subscription API supports it and consumes plan usage at a higher rate: ChatGPT offers it on GPT-5.6, 5.5, and 5.4 as the `priority` service tier, and Anthropic on Claude Opus 5 and Opus 4.8 through the fast-mode beta. `/fast` is hidden from completion and `/help` on other models, and the session notes once if a provider serves a fast request at standard speed.
+The defaults are `gpt-5.6-sol`, `claude-opus-5`, and `grok-4.6`. Run `/model` for the curated choices across all three providers; picking another provider's model switches the session to that subscription, offering login first if needed. A recognized `--model` ID implies its provider, so `xaq --model claude-opus-5` needs no `--provider` flag. Exact model IDs also work, though `xaq` uses conservative context limits when it does not recognize one, and unrecognized IDs stay with the current provider.
+
+GPT-6 Astra is available as `gpt-6-astra`, with `low`, `medium`, `high`, `xhigh`, `max`, and `ultra` reasoning effort. Its context limit uses the ChatGPT subscription catalog's default 272K window. Select it with `/model gpt-6-astra` or `--model gpt-6-astra`.
+
+Fast mode is available only on models whose subscription API supports it and consumes plan usage at a higher rate: ChatGPT offers it on GPT-6 Astra, GPT-5.6, 5.5, and 5.4 as the `priority` service tier, and Anthropic on Claude Opus 5 and Opus 4.8 through the fast-mode beta. `/fast` is hidden from completion and `/help` on other models, and the session notes once if a provider serves a fast request at standard speed.
 
 Switching providers mid-conversation keeps the transcript but not the previous provider's private state. Providers return reasoning in a form only their own API can replay (ChatGPT encrypts it), so after a switch `xaq` resends history as plain text and tool calls. The first reply on the new provider may briefly re-explore, cached-token discounts restart, and the drop is one-way: switching back does not restore it. `xaq` prints a note at switch time when this applies. Image attachments must also satisfy the new provider's format rules; Grok accepts PNG and JPEG only.
 

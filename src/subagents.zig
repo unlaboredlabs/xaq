@@ -338,7 +338,7 @@ pub const Manager = struct {
         const selected_effort = effort_override orelse if (inherits_model) launch.effort else null;
         if (effort_override) |value| {
             const effort = models.Effort.parse(value) orelse
-                return rejection(gpa, "invalid_effort", "effort must be low, medium, high, xhigh, or max", launch, self.config);
+                return rejection(gpa, "invalid_effort", "effort must be low, medium, high, xhigh, max, or ultra", launch, self.config);
             if (!models.supportsEffort(provider, selected_model, effort)) {
                 const message = try std.fmt.allocPrint(gpa, "effort {s} is not supported by model {s}", .{ value, selected_model });
                 defer gpa.free(message);
@@ -1082,7 +1082,7 @@ test "agent launch validates runtime choices before spawning" {
     const launch: Launch = .{ .provider = "claude", .model = "claude-fable-5", .effort = "high", .fast = false };
 
     var cross_args = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
-        \\{"prompt":"inspect auth","description":"Inspect auth","model":"gpt-5.6-sol"}
+        \\{"prompt":"inspect auth","description":"Inspect auth","model":"gpt-6-astra"}
     , .{});
     defer cross_args.deinit();
     const cross_result = try manager.execute(std.testing.allocator, "Agent", cross_args.value, launch);
@@ -1129,6 +1129,36 @@ test "agent launch validates runtime choices before spawning" {
     try std.testing.expectEqualStrings("max", try fieldString(valid_json.value, "effort"));
     try std.testing.expectEqualStrings("workspace_write", try fieldString(valid_json.value, "access"));
     try std.testing.expectEqual(@as(usize, 1), manager.records.items.len);
+}
+
+test "ChatGPT workers can select Astra with ultra effort" {
+    var manager = try Manager.init(std.testing.allocator, std.testing.io, "/tmp", .{ .background_by_default = false });
+    defer manager.deinit();
+    std.testing.allocator.free(manager.executable);
+    manager.executable = try std.testing.allocator.dupeZ(u8, "/bin/echo");
+    const launch: Launch = .{ .provider = "chatgpt", .model = "gpt-5.6-sol", .effort = "high", .fast = false };
+
+    var unsupported = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"prompt":"inspect auth","description":"Inspect auth","effort":"ultra"}
+    , .{});
+    defer unsupported.deinit();
+    const rejected = try manager.execute(std.testing.allocator, "Agent", unsupported.value, launch);
+    defer std.testing.allocator.free(rejected);
+    var rejection_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, rejected, .{});
+    defer rejection_json.deinit();
+    try std.testing.expectEqualStrings("unsupported_effort", try fieldString(rejection_json.value, "code"));
+    try std.testing.expectEqual(@as(usize, 0), manager.records.items.len);
+
+    var args = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"prompt":"inspect auth","description":"Inspect auth","model":"gpt-6-astra","effort":"ultra"}
+    , .{});
+    defer args.deinit();
+    const result = try manager.execute(std.testing.allocator, "Agent", args.value, launch);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqual(@as(usize, 1), manager.records.items.len);
+    try std.testing.expectEqual(Status.completed, manager.records.items[0].status);
+    try std.testing.expect(std.mem.indexOf(u8, result, "--model gpt-6-astra") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "--effort ultra") != null);
 }
 
 test "manager config disables launches and changes the background default" {

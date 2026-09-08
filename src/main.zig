@@ -463,7 +463,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
             i += 1;
             if (i >= args.len) fatal(io, "--effort needs a value", .{});
             effort = agent.Effort.parse(args[i]) orelse
-                fatal(io, "effort must be low, medium, high, xhigh, or max (got '{s}')", .{args[i]});
+                fatal(io, "effort must be low, medium, high, xhigh, max, or ultra (got '{s}')", .{args[i]});
         } else if (std.mem.eql(u8, args[i], "--output-format")) {
             i += 1;
             if (i >= args.len) fatal(io, "--output-format needs a value", .{});
