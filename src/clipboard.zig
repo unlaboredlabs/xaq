@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
+const childproc = @import("child.zig");
 
 pub const max_copy_bytes = 64 * 1024;
 const native_timeout_ms = 750;
@@ -74,33 +75,44 @@ fn runCommand(io: Io, text: []const u8, argv: []const []const u8, timeout: Io.Du
         if (!accepted) std.posix.kill(-pid, .KILL) catch {};
         if (child.id != null) child.kill(io);
     }
-    var timed_out = std.atomic.Value(bool).init(false);
-    var timer = Io.async(io, killAfter, .{ io, pid, timeout, &timed_out });
-    defer timer.cancel(io) catch {};
-
-    // The watchdog covers both blocked stdin writes and waiting for exit.
-    child.stdin.?.writeStreamingAll(io, text) catch |err| switch (err) {
-        error.Canceled => return err,
-        else => return false,
-    };
+    // One deadline covers blocked stdin writes and waiting for exit. It is
+    // polled here rather than on a watchdog task: a saturated Io pool runs
+    // `Io.async` inline, which would stall the copy for the whole timeout.
+    const deadline = Io.Clock.now(.awake, io).addDuration(timeout);
+    var timed_out = false;
+    const stdin = child.stdin.?.handle;
+    var remaining = text;
+    while (remaining.len != 0) {
+        const events = childproc.poll(stdin, std.posix.POLL.OUT, childproc.millisUntil(io, deadline, std.math.maxInt(i32))) catch return false;
+        if (events == 0) {
+            timed_out = true;
+            break;
+        }
+        // The helper closed its stdin early; let its exit status decide.
+        if (events & std.posix.POLL.OUT == 0) break;
+        const written = childproc.writeSome(stdin, remaining) catch |err| switch (err) {
+            error.BrokenPipe => break,
+            else => return false,
+        };
+        remaining = remaining[written..];
+    }
     child.stdin.?.close(io);
     child.stdin = null;
-    const term = child.wait(io) catch |err| switch (err) {
-        error.Canceled => return err,
-        else => return false,
+    if (timed_out) std.posix.kill(-pid, .KILL) catch {};
+    const term = while (true) {
+        const reaped = childproc.reap(&child) catch return false;
+        if (reaped) |term| break term;
+        if (!timed_out and Io.Clock.now(.awake, io).durationTo(deadline).nanoseconds <= 0) {
+            timed_out = true;
+            std.posix.kill(-pid, .KILL) catch {};
+        }
+        try io.sleep(.fromMilliseconds(10), .awake);
     };
-    timer.cancel(io) catch {};
-    accepted = !timed_out.load(.seq_cst) and switch (term) {
+    accepted = !timed_out and remaining.len == 0 and switch (term) {
         .exited => |code| code == 0,
         else => false,
     };
     return accepted;
-}
-
-fn killAfter(io: Io, pid: std.posix.pid_t, timeout: Io.Duration, timed_out: *std.atomic.Value(bool)) Io.Cancelable!void {
-    try io.sleep(timeout, .awake);
-    timed_out.store(true, .seq_cst);
-    std.posix.kill(-pid, .KILL) catch {};
 }
 
 test "native clipboard helpers receive exact text and failures fall through" {

@@ -753,6 +753,7 @@ test "fullscreen requires terminal presentation support" {
 test {
     _ = @import("agent.zig");
     _ = @import("cancel.zig");
+    _ = @import("child.zig");
     _ = @import("context.zig");
     _ = @import("image.zig");
     _ = @import("input.zig");
