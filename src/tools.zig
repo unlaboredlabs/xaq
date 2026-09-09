@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 const auth = @import("auth.zig");
 const cancel = @import("cancel.zig");
+const childproc = @import("child.zig");
 const models = @import("models.zig");
 const subagents = @import("subagents.zig");
 const transport = @import("transport.zig");
@@ -637,6 +638,59 @@ fn bash(gpa: std.mem.Allocator, io: Io, args: std.json.Value, token: *cancel.Tok
     return runBash(gpa, io, command, seconds, token, cwd);
 }
 
+const poll_interval_ms = 50;
+const term_grace: Io.Duration = .fromSeconds(2);
+const straggler_grace: Io.Duration = .fromMilliseconds(500);
+
+/// Ends a command that overran its timeout or was cancelled: TERM first, KILL
+/// after a grace period, and finally abandoning the output pipe when a
+/// process outside the group keeps it open. Polled from the caller's thread,
+/// so it never depends on the Io pool having a spare worker: `Io.async` runs
+/// its task inline when the pool is saturated, which used to stall the tool
+/// for the whole timeout before any output was read.
+const Watchdog = struct {
+    io: Io,
+    pid: std.posix.pid_t,
+    token: *cancel.Token,
+    deadline: Io.Timestamp,
+    timed_out: bool = false,
+    term_at: ?Io.Timestamp = null,
+    kill_at: ?Io.Timestamp = null,
+
+    fn init(io: Io, pid: std.posix.pid_t, token: *cancel.Token, timeout: Io.Duration) Watchdog {
+        return .{ .io = io, .pid = pid, .token = token, .deadline = Io.Clock.now(.awake, io).addDuration(timeout) };
+    }
+
+    /// True once the caller should stop waiting on the command's output.
+    fn check(self: *Watchdog) bool {
+        const now = Io.Clock.now(.awake, self.io);
+        if (self.term_at == null) {
+            if (now.durationTo(self.deadline).nanoseconds <= 0) {
+                self.timed_out = true;
+                std.posix.kill(-self.pid, .TERM) catch {};
+                self.term_at = now;
+            } else if (self.token.isRequested()) {
+                // The cancellation already sent TERM to the group.
+                self.term_at = now;
+            }
+        }
+        if (self.term_at) |at| {
+            if (self.kill_at == null and at.durationTo(now).nanoseconds >= term_grace.nanoseconds) {
+                std.posix.kill(-self.pid, .KILL) catch {};
+                self.kill_at = now;
+            }
+        }
+        if (self.kill_at) |at| return at.durationTo(now).nanoseconds >= straggler_grace.nanoseconds;
+        return false;
+    }
+
+    /// Poll timeout that wakes for the deadline and stays responsive to Ctrl-C.
+    fn pollMillis(self: *const Watchdog) i32 {
+        if (self.term_at != null) return poll_interval_ms;
+        return @max(1, childproc.millisUntil(self.io, self.deadline, poll_interval_ms));
+    }
+};
+
 fn runBash(gpa: std.mem.Allocator, io: Io, command: []const u8, seconds: u64, token: *cancel.Token, cwd: ?[]const u8) ![]u8 {
     if (token.isRequested()) return error.Cancelled;
     const script = try std.fmt.allocPrint(gpa, "exec 2>&1\n{s}", .{command});
@@ -649,33 +703,43 @@ fn runBash(gpa: std.mem.Allocator, io: Io, command: []const u8, seconds: u64, to
         .pgid = 0,
     });
     defer if (child.id != null) child.kill(io);
-    token.setChild(child.id.?);
+    const pid = child.id.?;
+    token.setChild(pid);
     defer token.clearChild();
-
-    var timed_out = std.atomic.Value(bool).init(false);
-    var timer = Io.async(io, killAfter, .{ io, child.id.?, seconds, &timed_out });
-    defer timer.cancel(io) catch {};
+    var watchdog: Watchdog = .init(io, pid, token, .fromSeconds(@intCast(seconds)));
 
     var capture = Capture.init(gpa, io);
     defer capture.deinit();
     // On error paths the spill file would never be reported; remove it
     // rather than leaking 0600 temp files with partial output.
     errdefer capture.discardSpill();
-    var read_buffer: [8192]u8 = undefined;
-    var file_reader: Io.File.Reader = .init(child.stdout.?, io, &read_buffer);
+    const stdout = child.stdout.?.handle;
     var chunk: [8192]u8 = undefined;
+    var abandoned = false;
     while (true) {
-        const count = try file_reader.interface.readSliceShort(&chunk);
-        if (count == 0) break;
-        try capture.write(chunk[0..count]);
+        const events = try childproc.poll(stdout, std.posix.POLL.IN, watchdog.pollMillis());
+        if (events != 0) {
+            const count = try std.posix.read(stdout, &chunk);
+            if (count == 0) break;
+            try capture.write(chunk[0..count]);
+        }
+        if (watchdog.check()) {
+            abandoned = true;
+            break;
+        }
     }
     child.stdout.?.close(io);
     child.stdout = null;
-    const term = try child.wait(io);
-    // Unregister promptly: after wait the pid may be recycled, and the
+    // A command can close stdout and keep running, so the exit wait shares
+    // the same deadline instead of blocking in `Child.wait`.
+    const term: childproc.Term = while (true) {
+        if (try childproc.reap(&child)) |term| break term;
+        _ = watchdog.check();
+        try io.sleep(.fromMilliseconds(watchdog.pollMillis()), .awake);
+    };
+    // Unregister promptly: after reaping the pid may be recycled, and the
     // SIGINT handler must not TERM an unrelated process group.
     token.clearChild();
-    timer.cancel(io) catch {};
 
     var out: Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
@@ -683,29 +747,18 @@ fn runBash(gpa: std.mem.Allocator, io: Io, command: []const u8, seconds: u64, to
         try out.writer.print("[output truncated: full output saved at {s}; showing last {d} bytes]\n", .{ path, capture.tailLen() });
     }
     try capture.writeTail(&out.writer);
-    if (timed_out.load(.seq_cst)) {
+    if (watchdog.timed_out) {
         try out.writer.print("\n[timeout after {d}s]", .{seconds});
     } else if (token.isRequested()) {
         try out.writer.writeAll("\n[interrupted]");
     }
+    if (abandoned) try out.writer.writeAll("\n[stdout left open by a background process]");
     switch (term) {
         .exited => |code| if (code != 0) try out.writer.print("\n[exit {d}]", .{code}),
         .signal => |sig| try out.writer.print("\n[signal {d}]", .{@intFromEnum(sig)}),
         else => try out.writer.writeAll("\n[process terminated]"),
     }
     return out.toOwnedSlice();
-}
-
-fn killAfter(io: Io, pid: std.posix.pid_t, seconds: u64, timed_out: *std.atomic.Value(bool)) Io.Cancelable!void {
-    try io.sleep(.fromSeconds(@intCast(seconds)), .awake);
-    timed_out.store(true, .seq_cst);
-    std.posix.kill(-pid, .TERM) catch return;
-    // Once TERM is sent the KILL follow-up must not be skippable: a
-    // descendant that ignores TERM but lets the leader exit would
-    // otherwise survive when this task is cancelled during the grace
-    // sleep. Swallow cancellation for the final escalation.
-    io.sleep(.fromSeconds(2), .awake) catch {};
-    std.posix.kill(-pid, .KILL) catch {};
 }
 
 const Capture = struct {
@@ -988,6 +1041,69 @@ test "bash does not start a command after cancellation" {
     var token: cancel.Token = .{};
     token.request();
     try std.testing.expectError(error.Cancelled, runBash(std.testing.failing_allocator, std.testing.io, "exit 0", 5, &token, null));
+}
+
+fn holdWorker(io: Io, release: *std.atomic.Value(bool)) void {
+    while (!release.load(.seq_cst)) io.sleep(.fromMilliseconds(5), .awake) catch return;
+}
+
+test "bash timeout does not wait on a spare Io worker" {
+    // One busy worker against async_limit 1 makes `Io.async` run inline; the
+    // old watchdog then slept for the whole timeout before reading output.
+    var threaded: Io.Threaded = .init(std.testing.allocator, .{ .async_limit = .limited(1) });
+    defer threaded.deinit();
+    const io = threaded.io();
+    var release = std.atomic.Value(bool).init(false);
+    var holder = try io.concurrent(holdWorker, .{ io, &release });
+    defer {
+        release.store(true, .seq_cst);
+        holder.await(io);
+    }
+    var token: cancel.Token = .{};
+    const started = Io.Clock.now(.awake, io);
+    const result = try runBash(std.testing.allocator, io, "echo started; sleep 5", 1, &token, null);
+    defer std.testing.allocator.free(result);
+    try std.testing.expect(started.durationTo(Io.Clock.now(.awake, io)).nanoseconds < 2 * std.time.ns_per_s);
+    try std.testing.expectEqualStrings("started\n\n[timeout after 1s]\n[signal 15]", result);
+}
+
+test "bash timeout covers a command that closes stdout and keeps running" {
+    var token: cancel.Token = .{};
+    const started = Io.Clock.now(.awake, std.testing.io);
+    const result = try runBash(std.testing.allocator, std.testing.io, "exec >/dev/null 2>&1; sleep 5", 1, &token, null);
+    defer std.testing.allocator.free(result);
+    try std.testing.expect(started.durationTo(Io.Clock.now(.awake, std.testing.io)).nanoseconds < 2 * std.time.ns_per_s);
+    try std.testing.expectEqualStrings("\n[timeout after 1s]\n[signal 15]", result);
+}
+
+test "bash stops promptly when cancelled while the command runs" {
+    var threaded: Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var token: cancel.Token = .{};
+    const Request = struct {
+        fn run(io_: Io, value: *cancel.Token) void {
+            io_.sleep(.fromMilliseconds(100), .awake) catch return;
+            value.request();
+        }
+    };
+    var future = try io.concurrent(Request.run, .{ io, &token });
+    defer future.await(io);
+    const started = Io.Clock.now(.awake, io);
+    const result = try runBash(std.testing.allocator, io, "echo started; sleep 5", 10, &token, null);
+    defer std.testing.allocator.free(result);
+    try std.testing.expect(started.durationTo(Io.Clock.now(.awake, io)).nanoseconds < 2 * std.time.ns_per_s);
+    try std.testing.expectEqualStrings("started\n\n[interrupted]\n[signal 15]", result);
+}
+
+test "bash abandons stdout held open outside the process group" {
+    var token: cancel.Token = .{};
+    const started = Io.Clock.now(.awake, std.testing.io);
+    const result = try runBash(std.testing.allocator, std.testing.io, "command -v setsid >/dev/null || exit 99; setsid sleep 30 </dev/null & echo started", 1, &token, null);
+    defer std.testing.allocator.free(result);
+    if (std.mem.endsWith(u8, result, "[exit 99]")) return error.SkipZigTest;
+    try std.testing.expect(started.durationTo(Io.Clock.now(.awake, std.testing.io)).nanoseconds < 5 * std.time.ns_per_s);
+    try std.testing.expectEqualStrings("started\n\n[timeout after 1s]\n[stdout left open by a background process]", result);
 }
 
 test "cancelled tool dispatch stops before file or process access" {
