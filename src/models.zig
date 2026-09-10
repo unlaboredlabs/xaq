@@ -70,11 +70,14 @@ const claude_choices = [_][]const u8{
 };
 const grok_choices = [_][]const u8{"grok-4.6"};
 
+/// Built-in subscriptions only. Custom endpoints keep their catalog in
+/// settings; providers.Catalog dispatches between the two.
 pub fn defaultModel(provider: auth.Provider) []const u8 {
     return switch (provider) {
         .chatgpt => chatgpt_choices[0],
         .claude => claude_choices[0],
         .grok => grok_choices[0],
+        .custom => "",
     };
 }
 
@@ -83,6 +86,7 @@ pub fn choices(provider: auth.Provider) []const []const u8 {
         .chatgpt => &chatgpt_choices,
         .claude => &claude_choices,
         .grok => &grok_choices,
+        .custom => &.{},
     };
 }
 
@@ -107,7 +111,7 @@ pub fn findAny(id: []const u8) ?*const Profile {
 pub fn contextWindow(provider: auth.Provider, id: []const u8) u32 {
     if (find(provider, id)) |profile| return profile.context_tokens;
     return switch (provider) {
-        .chatgpt, .grok => 128_000,
+        .chatgpt, .grok, .custom => 128_000,
         .claude => 200_000,
     };
 }
@@ -143,8 +147,9 @@ test "catalog model IDs resolve their provider" {
 
 test "catalog choices cover every profile exactly once" {
     var choice_count: usize = 0;
-    inline for (@typeInfo(auth.Provider).@"enum".fields) |field| {
-        const provider: auth.Provider = @enumFromInt(field.value);
+    try std.testing.expectEqual(@as(usize, 0), choices(.custom).len);
+    try std.testing.expectEqualStrings("", defaultModel(.custom));
+    for (auth.Provider.builtin) |provider| {
         const available = choices(provider);
         try std.testing.expect(available.len > 0);
         choice_count += available.len;

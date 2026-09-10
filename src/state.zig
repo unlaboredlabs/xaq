@@ -7,6 +7,7 @@ const std = @import("std");
 const Io = std.Io;
 const auth = @import("auth.zig");
 const models = @import("models.zig");
+const providers = @import("providers.zig");
 const settings = @import("settings.zig");
 
 /// One remembered tuple. Effort and fast are only meaningful together with
@@ -18,24 +19,37 @@ pub const Selection = struct {
 };
 
 pub const State = struct {
-    provider: ?auth.Provider = null,
+    /// Provider name: a built-in tag or a custom provider's settings name.
+    provider: ?[]const u8 = null,
     chatgpt: ?Selection = null,
     claude: ?Selection = null,
     grok: ?Selection = null,
+    /// Custom providers keyed by settings name.
+    custom: ?std.json.ArrayHashMap(Selection) = null,
 
-    pub fn selection(self: *const State, provider: auth.Provider) ?Selection {
-        return switch (provider) {
+    pub fn rememberedRef(self: *const State) ?providers.Ref {
+        return providers.Ref.parse(self.provider orelse return null);
+    }
+
+    pub fn selection(self: *const State, ref: providers.Ref) ?Selection {
+        return switch (ref.provider) {
             .chatgpt => self.chatgpt,
             .claude => self.claude,
             .grok => self.grok,
+            .custom => if (self.custom) |map| map.map.get(ref.name()) else null,
         };
     }
 
-    pub fn setSelection(self: *State, provider: auth.Provider, value: Selection) void {
-        switch (provider) {
+    /// `allocator` only matters for custom providers, whose map may grow.
+    pub fn setSelection(self: *State, allocator: std.mem.Allocator, ref: providers.Ref, value: Selection) !void {
+        switch (ref.provider) {
             .chatgpt => self.chatgpt = value,
             .claude => self.claude = value,
             .grok => self.grok = value,
+            .custom => {
+                if (self.custom == null) self.custom = .{};
+                try self.custom.?.map.put(allocator, ref.name(), value);
+            },
         }
     }
 };
@@ -67,6 +81,25 @@ pub fn load(gpa: std.mem.Allocator, io: Io, home: []const u8) !Loaded {
     value.chatgpt = sanitize(.chatgpt, value.chatgpt);
     value.claude = sanitize(.claude, value.claude);
     value.grok = sanitize(.grok, value.grok);
+    if (value.provider) |name| {
+        if (providers.Ref.parse(name) == null) value.provider = null;
+    }
+    if (value.custom) |*map| {
+        // Custom capabilities live in settings, which this loader does not
+        // read; main re-checks effort and fast against the resolved catalog.
+        var index: usize = 0;
+        while (index < map.map.count()) {
+            const name = map.map.keys()[index];
+            const entry = sanitizeShape(map.map.values()[index]);
+            if (entry == null or !settings.validProviderName(name)) {
+                map.map.orderedRemoveAt(index);
+                continue;
+            }
+            map.map.values()[index] = entry.?;
+            index += 1;
+        }
+        if (map.map.count() == 0) value.custom = null;
+    }
     return .{ .arena = arena, .value = value };
 }
 
@@ -74,12 +107,17 @@ pub fn load(gpa: std.mem.Allocator, io: Io, home: []const u8) !Loaded {
 /// has not heard of them), but an effort or fast flag the model is known
 /// not to support is dropped rather than sent.
 fn sanitize(provider: auth.Provider, remembered: ?Selection) ?Selection {
-    var value = remembered orelse return null;
-    if (value.model.len == 0 or value.model.len > 128 or std.mem.findAny(u8, value.model, "\r\n") != null) return null;
+    var value = sanitizeShape(remembered) orelse return null;
     if (value.effort) |effort| {
         if (!models.supportsEffort(provider, value.model, effort)) value.effort = null;
     }
     if (value.fast and !models.supportsFast(provider, value.model)) value.fast = false;
+    return value;
+}
+
+fn sanitizeShape(remembered: ?Selection) ?Selection {
+    const value = remembered orelse return null;
+    if (value.model.len == 0 or value.model.len > 128 or std.mem.findAny(u8, value.model, "\r\n") != null) return null;
     return value;
 }
 
@@ -91,7 +129,7 @@ pub fn save(gpa: std.mem.Allocator, io: Io, home: []const u8, value: State) !voi
 
 /// Remember one provider without losing another session's latest choices.
 /// The lock covers the complete read/modify/write, including the reload.
-pub fn remember(gpa: std.mem.Allocator, io: Io, home: []const u8, provider: auth.Provider, value: Selection) !void {
+pub fn remember(gpa: std.mem.Allocator, io: Io, home: []const u8, ref: providers.Ref, value: Selection) !void {
     const path = try pathFor(gpa, home);
     defer gpa.free(path);
     var lock = settings.lockJsonFile(gpa, io, path) catch |err| switch (err) {
@@ -101,8 +139,8 @@ pub fn remember(gpa: std.mem.Allocator, io: Io, home: []const u8, provider: auth
     defer lock.close(io);
     var latest = try load(gpa, io, home);
     defer latest.deinit();
-    latest.value.provider = provider;
-    latest.value.setSelection(provider, value);
+    latest.value.provider = ref.name();
+    try latest.value.setSelection(latest.arena.allocator(), ref, value);
     try save(gpa, io, home, latest.value);
 }
 
@@ -121,22 +159,22 @@ test "state round trips per-provider selections" {
     defer temporary.cleanup();
     const home = try testHome(std.testing.allocator, &temporary.sub_path);
     defer std.testing.allocator.free(home);
-    var value: State = .{ .provider = .claude };
-    value.setSelection(.claude, .{ .model = "claude-fable-5", .effort = .high, .fast = false });
-    value.setSelection(.chatgpt, .{ .model = "gpt-5.6-sol", .effort = .max, .fast = true });
+    var value: State = .{ .provider = "claude" };
+    try value.setSelection(std.testing.allocator, .builtin(.claude), .{ .model = "claude-fable-5", .effort = .high, .fast = false });
+    try value.setSelection(std.testing.allocator, .builtin(.chatgpt), .{ .model = "gpt-5.6-sol", .effort = .max, .fast = true });
     try save(std.testing.allocator, std.testing.io, home, value);
     var loaded = try load(std.testing.allocator, std.testing.io, home);
     defer loaded.deinit();
-    try std.testing.expectEqual(auth.Provider.claude, loaded.value.provider.?);
-    const claude = loaded.value.selection(.claude).?;
+    try std.testing.expectEqualStrings("claude", loaded.value.provider.?);
+    const claude = loaded.value.selection(.builtin(.claude)).?;
     try std.testing.expectEqualStrings("claude-fable-5", claude.model);
     try std.testing.expectEqual(models.Effort.high, claude.effort.?);
     try std.testing.expect(!claude.fast);
-    const chatgpt = loaded.value.selection(.chatgpt).?;
+    const chatgpt = loaded.value.selection(.builtin(.chatgpt)).?;
     try std.testing.expectEqualStrings("gpt-5.6-sol", chatgpt.model);
     try std.testing.expectEqual(models.Effort.max, chatgpt.effort.?);
     try std.testing.expect(chatgpt.fast);
-    try std.testing.expectEqual(null, loaded.value.selection(.grok));
+    try std.testing.expectEqual(null, loaded.value.selection(.builtin(.grok)));
 }
 
 test "state load drops capabilities the model does not support" {
@@ -144,21 +182,21 @@ test "state load drops capabilities the model does not support" {
     defer temporary.cleanup();
     const home = try testHome(std.testing.allocator, &temporary.sub_path);
     defer std.testing.allocator.free(home);
-    var value: State = .{ .provider = .grok };
-    value.setSelection(.claude, .{ .model = "claude-haiku-4-5", .effort = .high, .fast = true });
-    value.setSelection(.grok, .{ .model = "grok-4.6", .effort = .max, .fast = true });
+    var value: State = .{ .provider = "grok" };
+    try value.setSelection(std.testing.allocator, .builtin(.claude), .{ .model = "claude-haiku-4-5", .effort = .high, .fast = true });
+    try value.setSelection(std.testing.allocator, .builtin(.grok), .{ .model = "grok-4.6", .effort = .max, .fast = true });
     // Unknown snapshot IDs keep their remembered capabilities.
-    value.setSelection(.chatgpt, .{ .model = "gpt-5.6-sol-2026-08-01", .effort = .max, .fast = false });
+    try value.setSelection(std.testing.allocator, .builtin(.chatgpt), .{ .model = "gpt-5.6-sol-2026-08-01", .effort = .max, .fast = false });
     try save(std.testing.allocator, std.testing.io, home, value);
     var loaded = try load(std.testing.allocator, std.testing.io, home);
     defer loaded.deinit();
-    const claude = loaded.value.selection(.claude).?;
+    const claude = loaded.value.selection(.builtin(.claude)).?;
     try std.testing.expectEqual(null, claude.effort);
     try std.testing.expect(!claude.fast);
-    const grok = loaded.value.selection(.grok).?;
+    const grok = loaded.value.selection(.builtin(.grok)).?;
     try std.testing.expectEqual(null, grok.effort);
     try std.testing.expect(!grok.fast);
-    const chatgpt = loaded.value.selection(.chatgpt).?;
+    const chatgpt = loaded.value.selection(.builtin(.chatgpt)).?;
     try std.testing.expectEqual(models.Effort.max, chatgpt.effort.?);
 }
 
@@ -168,13 +206,13 @@ test "state load discards malformed model IDs" {
     const home = try testHome(std.testing.allocator, &temporary.sub_path);
     defer std.testing.allocator.free(home);
     var value: State = .{};
-    value.setSelection(.chatgpt, .{ .model = "gpt\n5" });
-    value.setSelection(.claude, .{ .model = "" });
+    try value.setSelection(std.testing.allocator, .builtin(.chatgpt), .{ .model = "gpt\n5" });
+    try value.setSelection(std.testing.allocator, .builtin(.claude), .{ .model = "" });
     try save(std.testing.allocator, std.testing.io, home, value);
     var loaded = try load(std.testing.allocator, std.testing.io, home);
     defer loaded.deinit();
-    try std.testing.expectEqual(null, loaded.value.selection(.chatgpt));
-    try std.testing.expectEqual(null, loaded.value.selection(.claude));
+    try std.testing.expectEqual(null, loaded.value.selection(.builtin(.chatgpt)));
+    try std.testing.expectEqual(null, loaded.value.selection(.builtin(.claude)));
 }
 
 test "missing or corrupt state degrades to defaults" {
@@ -193,7 +231,7 @@ test "missing or corrupt state degrades to defaults" {
     var corrupt = try load(std.testing.allocator, std.testing.io, home);
     defer corrupt.deinit();
     try std.testing.expectEqual(null, corrupt.value.provider);
-    try std.testing.expectEqual(null, corrupt.value.selection(.chatgpt));
+    try std.testing.expectEqual(null, corrupt.value.selection(.builtin(.chatgpt)));
 }
 
 test "remember serializes provider edits and preserves other providers" {
@@ -202,18 +240,47 @@ test "remember serializes provider edits and preserves other providers" {
     defer temporary.cleanup();
     const home = try testHome(gpa, &temporary.sub_path);
     defer gpa.free(home);
-    try remember(gpa, std.testing.io, home, .chatgpt, .{ .model = "gpt-5.6-sol", .effort = .max, .fast = true });
+    try remember(gpa, std.testing.io, home, .builtin(.chatgpt), .{ .model = "gpt-5.6-sol", .effort = .max, .fast = true });
     const path = try pathFor(gpa, home);
     defer gpa.free(path);
     {
         var held = try settings.lockJsonFile(gpa, std.testing.io, path);
         defer held.close(std.testing.io);
-        try std.testing.expectError(error.StateInUse, remember(gpa, std.testing.io, home, .claude, .{ .model = "claude-sonnet-5" }));
+        try std.testing.expectError(error.StateInUse, remember(gpa, std.testing.io, home, .builtin(.claude), .{ .model = "claude-sonnet-5" }));
     }
-    try remember(gpa, std.testing.io, home, .claude, .{ .model = "claude-sonnet-5", .effort = .high });
+    try remember(gpa, std.testing.io, home, .builtin(.claude), .{ .model = "claude-sonnet-5", .effort = .high });
     var loaded = try load(gpa, std.testing.io, home);
     defer loaded.deinit();
-    try std.testing.expectEqual(auth.Provider.claude, loaded.value.provider.?);
-    try std.testing.expectEqualStrings("gpt-5.6-sol", loaded.value.selection(.chatgpt).?.model);
-    try std.testing.expectEqualStrings("claude-sonnet-5", loaded.value.selection(.claude).?.model);
+    try std.testing.expectEqualStrings("claude", loaded.value.provider.?);
+    try std.testing.expectEqualStrings("gpt-5.6-sol", loaded.value.selection(.builtin(.chatgpt)).?.model);
+    try std.testing.expectEqualStrings("claude-sonnet-5", loaded.value.selection(.builtin(.claude)).?.model);
+}
+
+test "state remembers custom providers by name and drops malformed entries" {
+    const gpa = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const home = try testHome(gpa, &temporary.sub_path);
+    defer gpa.free(home);
+    try remember(gpa, std.testing.io, home, .builtin(.claude), .{ .model = "claude-sonnet-5" });
+    try remember(gpa, std.testing.io, home, providers.Ref.parse("ollama").?, .{ .model = "qwen3-coder", .effort = .high });
+    var loaded = try load(gpa, std.testing.io, home);
+    defer loaded.deinit();
+    try std.testing.expectEqualStrings("ollama", loaded.value.provider.?);
+    try std.testing.expectEqual(auth.Provider.custom, loaded.value.rememberedRef().?.provider);
+    try std.testing.expectEqualStrings("ollama", loaded.value.rememberedRef().?.name());
+    const custom = loaded.value.selection(providers.Ref.parse("ollama").?).?;
+    try std.testing.expectEqualStrings("qwen3-coder", custom.model);
+    try std.testing.expectEqual(models.Effort.high, custom.effort.?);
+    try std.testing.expectEqualStrings("claude-sonnet-5", loaded.value.selection(.builtin(.claude)).?.model);
+    try std.testing.expectEqual(null, loaded.value.selection(providers.Ref.parse("other").?));
+
+    const path = try pathFor(gpa, home);
+    defer gpa.free(path);
+    try Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = path, .data = "{\"provider\":\"Bad Name\",\"custom\":{\"ok\":{\"model\":\"m\"},\"BAD\":{\"model\":\"m\"},\"empty\":{\"model\":\"\"}}}" });
+    var repaired = try load(gpa, std.testing.io, home);
+    defer repaired.deinit();
+    try std.testing.expectEqual(null, repaired.value.provider);
+    try std.testing.expectEqual(@as(usize, 1), repaired.value.custom.?.map.count());
+    try std.testing.expectEqualStrings("m", repaired.value.selection(providers.Ref.parse("ok").?).?.model);
 }

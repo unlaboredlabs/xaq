@@ -59,6 +59,57 @@ During login, select the printed link with your terminal or press Ctrl-Y to copy
 
 Credentials live in `~/.config/xaq/auth.json`, written atomically with mode `0600`. Remove one with `xaq logout PROVIDER`. Anthropic may count third-party harness use as extra usage, so check your usage settings before relying on the included plan allowance.
 
+## Custom providers
+
+Besides the three subscriptions, `xaq` can talk to any endpoint that speaks one of three wire formats: OpenAI Chat Completions (Ollama, llama.cpp, LM Studio, vLLM, OpenRouter, Groq, and most other OpenAI-compatible servers), the OpenAI Responses API, or Anthropic Messages (Anthropic-compatible proxies). Custom providers use API keys rather than browser login and are defined under `providers` in `~/.config/xaq/settings.json`:
+
+```json
+{
+  "providers": {
+    "ollama": {
+      "api": "chat_completions",
+      "base_url": "http://localhost:11434/v1",
+      "models": ["qwen3-coder:30b", "llama4"],
+      "context_tokens": 64000
+    },
+    "openrouter": {
+      "api": "chat_completions",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "headers": { "HTTP-Referer": "https://xaq.sh" },
+      "models": ["anthropic/claude-opus-5", "openai/gpt-5.5"],
+      "efforts": ["low", "medium", "high"]
+    }
+  }
+}
+```
+
+Each entry needs `api` and `base_url`; `xaq` appends `/chat/completions`, `/responses`, or `/messages`. The key comes from `api_key_env` (recommended, so the file stays shareable) or a literal `api_key`; omit both for a local server without authentication. Chat Completions and Responses endpoints send `Authorization: Bearer`, Messages endpoints send `x-api-key`; set `auth` to `bearer` or `x-api-key` to override. `headers` adds or replaces request headers. `models` lists the IDs offered by `/model` and to subagents, and the first one is the provider's default; other IDs still work with `--model`. `context_tokens` (default 128000) and `efforts` (default none) apply to every model of the provider. Fast mode is a subscription tier and is never available on custom providers. Streaming responses are required.
+
+Set one up without editing JSON:
+
+```sh
+xaq provider add ollama                # guided setup on a terminal
+xaq provider add openrouter --api chat_completions --base-url https://openrouter.ai/api/v1 \
+    --api-key-env OPENROUTER_API_KEY --model anthropic/claude-opus-5 --effort low
+printf '%s\n' "$KEY" | xaq provider add proxy --api messages --base-url https://proxy.internal/v1 \
+    --api-key-stdin --model claude-compatible
+xaq provider list
+xaq provider remove proxy
+```
+
+Keys never travel on the command line. Guided setup asks for the name, wire format, base URL, key source, model list, context window, and efforts, shows a summary, and only then writes the file. Every write takes the settings lock, re-reads the latest file, validates the result, and replaces it atomically, so concurrent sessions and hand edits are not lost. Inside a session, `/provider` lists, adds, removes, or switches to a custom provider.
+
+Use a custom provider like any other:
+
+```sh
+xaq --provider ollama
+xaq --model anthropic/claude-opus-5     # a listed model ID implies its provider
+xaq --provider openrouter --model openai/gpt-5.5-preview
+```
+
+`/model` shows custom models alongside the subscription catalogs, and subagents inherit the provider. Provider names are lowercase identifiers up to 32 characters; `chatgpt`, `claude`, `grok`, and `custom` are reserved. Threads record the provider name, so older builds cannot resume threads that used a custom provider. Custom providers compact context with the session model and effort.
+
 ## Use
 
 Start an interactive session:
@@ -89,7 +140,8 @@ Type `/` to browse local commands:
 | Command | What it does |
 | --- | --- |
 | `/login [PROVIDER]` | connect a ChatGPT, Claude, or Grok subscription |
-| `/model [ID]` | choose a model from any connected provider |
+| `/provider [add\|list\|remove NAME]` | configure custom API endpoints |
+| `/model [ID]` | choose a model from any connected or custom provider |
 | `/effort [LEVEL]` | set reasoning effort |
 | `/fast [on\|off\|status]` | control the provider's premium speed tier (listed only when the current model has one) |
 | `/verbose [on\|off]` | show tool-result previews |
@@ -191,7 +243,7 @@ const dep = b.dependency("xaq", .{
 exe.root_module.addImport("xaq", dep.module("xaq"));
 ```
 
-Create one `xaq.Agent` per conversation. The host can provide credentials, transport, tools, permissions, events, images, and initial history. Built-in filesystem and shell tools are off by default when embedded. The public contract is in [`src/embed.zig`](src/embed.zig) and currently has `api_version = 2`.
+Create one `xaq.Agent` per conversation. The host can provide credentials, transport, tools, permissions, events, images, and initial history. Built-in filesystem and shell tools are off by default when embedded. The public contract is in [`src/embed.zig`](src/embed.zig) and currently has `api_version = 3`. A host can also target a custom endpoint by passing `provider = .custom` with a `CustomProvider` definition; the credential's `access` field then carries the endpoint's API key.
 
 ## Logging
 

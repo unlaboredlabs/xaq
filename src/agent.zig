@@ -9,6 +9,7 @@ const input_mod = @import("input.zig");
 const log = @import("log.zig");
 const markdown = @import("markdown.zig");
 const models = @import("models.zig");
+const providers = @import("providers.zig");
 const request = @import("request.zig");
 const settings_mod = @import("settings.zig");
 const spin = @import("spin.zig");
@@ -32,7 +33,8 @@ const Image = types.Image;
 pub const Effort = models.Effort;
 
 pub const RunStarted = struct {
-    provider: auth.Provider,
+    /// Provider name: a built-in tag or a custom provider's settings name.
+    provider: []const u8,
     model: []const u8,
     thread_id: ?[]const u8,
 };
@@ -54,7 +56,7 @@ pub const StopReason = enum {
 
 pub const RunCompleted = struct {
     text: []const u8,
-    provider: auth.Provider,
+    provider: []const u8,
     model: []const u8,
     thread_id: ?[]const u8,
     usage: Usage,
@@ -83,6 +85,8 @@ pub const Options = struct {
     home: []const u8,
     cwd: []const u8,
     provider: auth.Provider,
+    /// Settings name when `provider` is `.custom`.
+    custom: ?[]const u8 = null,
     model: []const u8,
     effort: ?Effort = null,
     fast: bool = false,
@@ -115,6 +119,8 @@ const Session = struct {
     home: []const u8,
     cwd: []const u8,
     provider: auth.Provider,
+    /// Owned settings name when `provider` is `.custom`.
+    custom_name: ?[]u8 = null,
     model: []u8,
     effort: ?Effort,
     fast: bool,
@@ -156,9 +162,29 @@ const Session = struct {
         return self.arena.allocator();
     }
 
+    fn ref(self: *const Session) providers.Ref {
+        return .{ .provider = self.provider, .custom = self.custom_name };
+    }
+
+    /// Capabilities of the active provider. Custom definitions live in the
+    /// current settings, so callers use the result immediately rather than
+    /// holding it across a settings save.
+    fn catalog(self: *const Session) providers.Catalog {
+        return providers.Catalog.resolve(self.ref(), &self.settings.value);
+    }
+
+    fn providerName(self: *const Session) []const u8 {
+        return self.ref().name();
+    }
+
+    fn providerLabel(self: *const Session) []const u8 {
+        return self.ref().label();
+    }
+
     fn commandAvailable(self: *const Session, command: Command) bool {
         return switch (command) {
-            .fast => models.supportsFast(self.provider, self.model),
+            .fast => self.catalog().supportsFast(self.model),
+            .provider => self.subagent_control == null,
             else => true,
         };
     }
@@ -192,21 +218,22 @@ const Session = struct {
         if (self.thread) |*thread| thread.deinit();
         self.arena.deinit();
         self.gpa.free(self.model);
+        if (self.custom_name) |name| self.gpa.free(name);
         self.gpa.free(self.instructions);
         self.settings.deinit();
     }
 
     fn setModel(self: *Session, value: []const u8) !void {
-        _ = try self.switchProvider(self.provider, value);
+        _ = try self.switchProvider(self.ref(), value);
     }
 
     fn setEffort(self: *Session, value: ?Effort) !void {
-        if (self.thread) |*thread| try thread.appendSelection(self.provider, self.model, if (value) |effort| @tagName(effort) else null, self.fast);
+        if (self.thread) |*thread| try thread.appendSelection(self.providerName(), self.model, if (value) |effort| @tagName(effort) else null, self.fast);
         self.effort = value;
     }
 
     fn setFast(self: *Session, enabled: bool) !void {
-        if (self.thread) |*thread| try thread.appendSelection(self.provider, self.model, if (self.effort) |effort| @tagName(effort) else null, enabled);
+        if (self.thread) |*thread| try thread.appendSelection(self.providerName(), self.model, if (self.effort) |effort| @tagName(effort) else null, enabled);
         self.fast = enabled;
     }
 
@@ -216,22 +243,27 @@ const Session = struct {
     /// produced them, so they are dropped and history falls back to its
     /// plain text and tool-call form. That loss is one-way; the returned
     /// summary lets the caller say so at switch time.
-    fn switchProvider(self: *Session, provider: auth.Provider, model: []const u8) !ProviderSwitch {
-        return self.setSelection(provider, model, self.effort, self.fast);
+    fn switchProvider(self: *Session, target: providers.Ref, model: []const u8) !ProviderSwitch {
+        return self.setSelection(target, model, self.effort, self.fast);
     }
 
-    fn setSelection(self: *Session, provider: auth.Provider, model: []const u8, requested_effort: ?Effort, requested_fast: bool) !ProviderSwitch {
+    fn setSelection(self: *Session, target: providers.Ref, model: []const u8, requested_effort: ?Effort, requested_fast: bool) !ProviderSwitch {
         const effort_before = self.effort;
         const fast_before = self.fast;
         const next = try self.gpa.dupe(u8, model);
         errdefer self.gpa.free(next);
-        const effort = if (requested_effort) |value| if (models.supportsEffort(provider, model, value)) value else null else null;
-        const fast = requested_fast and models.supportsFast(provider, model);
+        const next_name: ?[]u8 = if (target.custom) |name| try self.gpa.dupe(u8, name) else null;
+        errdefer if (next_name) |name| self.gpa.free(name);
+        const target_catalog = providers.Catalog.resolve(target, &self.settings.value);
+        const effort = if (requested_effort) |value| if (target_catalog.supportsEffort(model, value)) value else null else null;
+        const fast = requested_fast and target_catalog.supportsFast(model);
         // Persist one complete selection before changing the live session.
         // Replay drops private response items at the same provider boundary.
-        if (self.thread) |*thread| try thread.appendSelection(provider, model, if (effort) |value| @tagName(value) else null, fast);
-        const dropped = provider != self.provider and stripRawItems(self.entries.items);
-        self.provider = provider;
+        if (self.thread) |*thread| try thread.appendSelection(target.name(), model, if (effort) |value| @tagName(value) else null, fast);
+        const dropped = !target.eql(self.ref()) and stripRawItems(self.entries.items);
+        self.provider = target.provider;
+        if (self.custom_name) |name| self.gpa.free(name);
+        self.custom_name = next_name;
         self.gpa.free(self.model);
         self.model = next;
         self.effort = effort;
@@ -285,7 +317,7 @@ const Session = struct {
 
     fn startThread(self: *Session) !void {
         if (!self.save_thread) return;
-        const next = try threads.create(self.gpa, self.io, self.home, self.cwd, self.provider, self.model, if (self.effort) |value| @tagName(value) else null, self.fast);
+        const next = try threads.create(self.gpa, self.io, self.home, self.cwd, self.providerName(), self.model, if (self.effort) |value| @tagName(value) else null, self.fast);
         if (self.thread) |*thread| thread.deinit();
         self.thread = next;
     }
@@ -330,11 +362,11 @@ const Session = struct {
         // Refresh the original before create applies the retention limit, so
         // forking a deliberately resumed old thread cannot prune its source.
         try persistSnapshot(self);
-        var fork = try threads.create(self.gpa, self.io, self.home, self.cwd, self.provider, self.model, if (self.effort) |value| @tagName(value) else null, self.fast);
+        var fork = try threads.create(self.gpa, self.io, self.home, self.cwd, self.providerName(), self.model, if (self.effort) |value| @tagName(value) else null, self.fast);
         var installed = false;
         errdefer if (!installed) fork.discard();
         try fork.rewrite(
-            self.provider,
+            self.providerName(),
             self.model,
             if (self.effort) |value| @tagName(value) else null,
             self.fast,
@@ -358,6 +390,8 @@ const Session = struct {
         errdefer loaded.thread.deinit();
         const loaded_model = try self.gpa.dupe(u8, loaded.model);
         errdefer self.gpa.free(loaded_model);
+        const loaded_custom: ?[]u8 = if (loaded.custom) |name| try self.gpa.dupe(u8, name) else null;
+        errdefer if (loaded_custom) |name| self.gpa.free(name);
 
         // Repair interrupted tool calls before replacing the current session.
         // Both the loaded history and its saved record must be ready to use.
@@ -383,11 +417,14 @@ const Session = struct {
         self.entries = loaded.entries;
         self.thread = loaded.thread;
         self.provider = loaded.provider;
+        if (self.custom_name) |name| self.gpa.free(name);
+        self.custom_name = loaded_custom;
         self.model = loaded_model;
         self.effort = if (loaded.effort) |value| Effort.parse(value) else null;
-        self.fast = loaded.fast and models.supportsFast(loaded.provider, loaded.model);
+        const resumed = self.catalog();
+        self.fast = loaded.fast and resumed.supportsFast(loaded.model);
         if (self.effort) |effort| {
-            if (!models.supportsEffort(self.provider, self.model, effort)) self.effort = null;
+            if (!resumed.supportsEffort(self.model, effort)) self.effort = null;
         }
         self.refreshSuggestions();
         self.recount();
@@ -396,15 +433,14 @@ const Session = struct {
 
 pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
     provider_error_len = 0;
-    if (options.effort) |effort| {
-        if (!models.supportsEffort(options.provider, options.model, effort)) return error.InvalidEffortForModel;
-    }
-    if (options.fast and options.resume_id == null and !models.supportsFast(options.provider, options.model)) return error.InvalidFastForModel;
+    if (options.provider == .custom and options.custom == null) return error.UnknownProvider;
     var session: Session = init: {
         var user_settings = try settings_mod.load(gpa, io, options.home);
         errdefer user_settings.deinit();
         const model = try gpa.dupe(u8, options.model);
         errdefer gpa.free(model);
+        const custom_name: ?[]u8 = if (options.custom) |name| try gpa.dupe(u8, name) else null;
+        errdefer if (custom_name) |name| gpa.free(name);
         const instructions = try context.load(gpa, io, options.home, options.cwd);
         errdefer gpa.free(instructions);
         break :init .{
@@ -413,6 +449,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
             .home = options.home,
             .cwd = options.cwd,
             .provider = options.provider,
+            .custom_name = custom_name,
             .model = model,
             .effort = options.effort,
             .fast = options.fast,
@@ -434,6 +471,16 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
         };
     };
     defer session.deinit();
+    {
+        // Capability checks need the settings-backed catalog, so they run
+        // once the session exists rather than on the raw options.
+        const startup = session.catalog();
+        if (!startup.configured()) return error.UnknownProvider;
+        if (options.effort) |effort| {
+            if (!startup.supportsEffort(options.model, effort)) return error.InvalidEffortForModel;
+        }
+        if (options.fast and options.resume_id == null and !startup.supportsFast(options.model)) return error.InvalidFastForModel;
+    }
     input_mod.copy_on_select = session.settings.value.copy_on_select;
     session.refreshSuggestions();
     var signal_scope = cancel.Scope.install();
@@ -453,7 +500,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
     if (options.resume_id) |id| {
         try session.resumeThread(if (id.len == 0) null else id);
         if (options.fast) {
-            if (!models.supportsFast(session.provider, session.model)) return error.InvalidFastForModel;
+            if (!session.catalog().supportsFast(session.model)) return error.InvalidFastForModel;
             try session.setFast(true);
         }
         // Orientation matters most interactively; one-shot output stays clean.
@@ -462,7 +509,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
         try session.startThread();
     }
     try session.emit(.{ .run_start = .{
-        .provider = session.provider,
+        .provider = session.providerName(),
         .model = session.model,
         .thread_id = if (session.thread) |thread| thread.id else null,
     } });
@@ -545,10 +592,10 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
                 tui.noteState(.idle);
                 syncTui(&session);
                 try setTitle(&session, false);
-                try options.output.print("{s} is not connected. Let's connect it now.\n", .{session.provider.label()});
+                try options.output.print("{s} is not connected. Let's connect it now.\n", .{session.providerLabel()});
                 try options.output.flush();
                 if (busy) |queue| try queue.stop();
-                if (try connectLogin(&session, reader, session.provider)) {
+                if (session.provider != .custom and try connectLogin(&session, reader, session.provider)) {
                     if (busy) |queue| try queue.start();
                     exchange_start = Io.Clock.now(.awake, io);
                     exchange_base = session.usage;
@@ -650,7 +697,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
             const reader = options.input orelse {
                 try session.emit(.{ .completed = .{
                     .text = answer.text,
-                    .provider = session.provider,
+                    .provider = session.providerName(),
                     .model = session.model,
                     .thread_id = if (session.thread) |thread| thread.id else null,
                     .usage = run_usage,
@@ -752,7 +799,8 @@ pub fn run(gpa: std.mem.Allocator, io: Io, options: Options) !void {
                     .write_enabled = true,
                     .subagent_manager = if (session.subagent_manager) |*manager| manager else null,
                     .subagent_launch = .{
-                        .provider = @tagName(session.provider),
+                        .provider = session.providerName(),
+                        .catalog = session.catalog(),
                         .model = session.model,
                         .effort = if (session.effort) |value| @tagName(value) else null,
                         .fast = session.fast,
@@ -1053,7 +1101,7 @@ fn rewindIndex(entries: []const Entry, count: usize) error{CompactedHistoryBound
     return null;
 }
 
-const Command = enum { help, login, model, effort, fast, verbose, firecrawl, agents, settings, status, compact, clear, new, resume_thread, rewind, fork_thread, exit };
+const Command = enum { help, login, provider, model, effort, fast, verbose, firecrawl, agents, settings, status, compact, clear, new, resume_thread, rewind, fork_thread, exit };
 
 const CommandSpec = struct {
     command: Command,
@@ -1066,6 +1114,7 @@ const CommandSpec = struct {
 const command_specs = [_]CommandSpec{
     .{ .command = .help, .name = "help", .help = "list commands" },
     .{ .command = .login, .name = "login", .args = " [PROVIDER]", .help = "connect a subscription" },
+    .{ .command = .provider, .name = "provider", .args = " [add|list|remove]", .help = "configure custom API endpoints" },
     .{ .command = .model, .name = "model", .args = " [ID]", .help = "pick any provider's model, effort, and speed" },
     .{ .command = .effort, .name = "effort", .args = " [LEVEL]", .help = "pick or set reasoning effort" },
     .{ .command = .fast, .name = "fast", .args = " [MODE]", .help = "toggle normal or fast mode" },
@@ -1083,18 +1132,15 @@ const command_specs = [_]CommandSpec{
     .{ .command = .exit, .name = "exit", .alias = "quit", .help = "leave xaq" },
 };
 
-fn modelChoices(provider: auth.Provider) []const []const u8 {
-    return models.choices(provider);
-}
-
 /// Names the current provider's fast-capable models so the user can
 /// switch instead of guessing; providers without a fast tier say so.
 fn printFastUnavailable(session: *Session) !void {
     const output = session.output;
     try output.print("fast mode is not available for {s}", .{session.model});
     var listed: usize = 0;
-    for (models.choices(session.provider)) |id| {
-        if (!models.supportsFast(session.provider, id)) continue;
+    const catalog = session.catalog();
+    for (catalog.choices()) |id| {
+        if (!catalog.supportsFast(id)) continue;
         try output.writeAll(if (listed == 0) " (try " else ", ");
         try output.writeAll(id);
         listed += 1;
@@ -1102,7 +1148,7 @@ fn printFastUnavailable(session: *Session) !void {
     if (listed > 0) {
         try output.writeAll(")\n");
     } else {
-        try output.print(" (no {s} model offers it)\n", .{@tagName(session.provider)});
+        try output.print(" (no {s} model offers it)\n", .{session.providerName()});
     }
 }
 
@@ -1177,22 +1223,15 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
         } else {
             try output.writeAll("usage: /login [chatgpt|claude|grok|status]\n");
         },
+        .provider => try providerCommand(session, reader, args),
         .model => if (args.len == 0) {
             if (input_mod.interactive) {
                 try pickModel(session, reader);
             } else {
-                try output.print("model {s} (provider default {s})\n", .{ session.model, defaultModel(session.provider) });
+                try output.print("model {s} (provider default {s})\n", .{ session.model, session.catalog().defaultModel() });
             }
         } else if (crossProviderTarget(session, args)) |target| {
-            if (try ensureProviderLogin(session, reader, target)) {
-                const from = session.provider;
-                const changes = try session.switchProvider(target, args);
-                persistSelection(session);
-                try output.print("model set to {s} \u{b7} provider {s}\n", .{ session.model, @tagName(session.provider) });
-                try printProviderSwitchNotes(session, from, changes);
-            } else {
-                try output.print("model {s} (unchanged)\n", .{session.model});
-            }
+            try switchSession(session, reader, target, args);
         } else {
             const was_fast = session.fast;
             const had_effort = session.effort != null;
@@ -1214,7 +1253,7 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
                 try output.flush();
                 return true;
             };
-            if (value) |effort| if (!models.supportsEffort(session.provider, session.model, effort)) {
+            if (value) |effort| if (!session.catalog().supportsEffort(session.model, effort)) {
                 try output.print("{s} does not support {s} effort (try /effort)\n", .{ session.model, @tagName(effort) });
                 try output.flush();
                 return true;
@@ -1231,7 +1270,7 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
             else if (std.mem.eql(u8, args, "off"))
                 false
             else if (std.mem.eql(u8, args, "status")) {
-                if (models.supportsFast(session.provider, session.model)) {
+                if (session.catalog().supportsFast(session.model)) {
                     try output.print("fast mode {s}\n", .{if (session.fast) "on" else "off"});
                 } else {
                     try printFastUnavailable(session);
@@ -1243,7 +1282,7 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
                 try output.flush();
                 return true;
             };
-            if (enabled and !models.supportsFast(session.provider, session.model)) {
+            if (enabled and !session.catalog().supportsFast(session.model)) {
                 try printFastUnavailable(session);
                 try output.flush();
                 return true;
@@ -1314,11 +1353,12 @@ fn runCommand(session: *Session, reader: *Io.Reader, body: []const u8) !bool {
             }
         },
         .status => {
-            const context_tokens = models.contextWindow(session.provider, session.model);
-            const fast_state = if (!models.supportsFast(session.provider, session.model)) "unavailable" else if (session.fast) "on" else "off";
+            const status_catalog = session.catalog();
+            const context_tokens = status_catalog.contextWindow(session.model);
+            const fast_state = if (!status_catalog.supportsFast(session.model)) "unavailable" else if (session.fast) "on" else "off";
             try output.print(
                 "  thread    {s}\n  provider  {s}\n  model     {s}\n  effort    {s}\n  fast      {s}\n  web       {s}\n  cwd       {s}\n  turns     {d}\n  context   ~{d} / {d} tokens\n",
-                .{ if (session.thread) |thread| thread.id else "ephemeral", @tagName(session.provider), session.model, if (session.effort) |value| @tagName(value) else "provider-default", fast_state, if (session.settings.value.firecrawl_api_key != null) "Firecrawl" else "off", session.cwd, session.turn, estimatedContextTokens(session), context_tokens },
+                .{ if (session.thread) |thread| thread.id else "ephemeral", session.providerName(), session.model, if (session.effort) |value| @tagName(value) else "provider-default", fast_state, if (session.settings.value.firecrawl_api_key != null) "Firecrawl" else "off", session.cwd, session.turn, estimatedContextTokens(session), context_tokens },
             );
             try output.print("  auto-copy {s}\n", .{if (session.settings.value.copy_on_select) "on" else "off"});
             try output.writeAll("  tokens    ");
@@ -1494,8 +1534,15 @@ fn connectLogin(session: *Session, reader: *Io.Reader, provider: auth.Provider) 
 }
 
 /// True when the provider can serve requests. Interactive sessions get the
-/// guided login; one-shots are pointed at `xaq login`.
-fn ensureProviderLogin(session: *Session, reader: *Io.Reader, provider: auth.Provider) !bool {
+/// guided login; one-shots are pointed at `xaq login`. Custom endpoints
+/// need no login, only a settings entry.
+fn ensureProviderLogin(session: *Session, reader: *Io.Reader, target: providers.Ref) !bool {
+    if (target.provider == .custom) {
+        if (session.settings.value.customProvider(target.name()) != null) return true;
+        try session.output.print("custom provider {s} is not configured; run /provider add\n", .{target.name()});
+        return false;
+    }
+    const provider = target.provider;
     if (try auth.isLoggedIn(session.gpa, session.io, session.home, provider)) return true;
     if (!input_mod.interactive) {
         try session.output.print("{s} is not connected; run: xaq login {s}\n", .{ provider.label(), @tagName(provider) });
@@ -1506,6 +1553,29 @@ fn ensureProviderLogin(session: *Session, reader: *Io.Reader, provider: auth.Pro
     return connectLogin(session, reader, provider);
 }
 
+/// Move the session to `target`/`model` after any login, then explain what
+/// the switch dropped. The previous label is copied because the switch
+/// frees the session's custom name.
+fn switchSession(session: *Session, reader: *Io.Reader, target: providers.Ref, model: []const u8) !void {
+    const output = session.output;
+    if (!try ensureProviderLogin(session, reader, target)) {
+        try output.print("model {s} (unchanged)\n", .{session.model});
+        return;
+    }
+    var from_buffer: [settings_mod.max_provider_name]u8 = undefined;
+    const from_label = copyLabel(&from_buffer, session.providerLabel());
+    const changes = try session.switchProvider(target, model);
+    persistSelection(session);
+    try output.print("model set to {s} \u{b7} provider {s}\n", .{ session.model, session.providerName() });
+    try printProviderSwitchNotes(session, from_label, changes);
+}
+
+fn copyLabel(buffer: []u8, label: []const u8) []const u8 {
+    const len = @min(buffer.len, label.len);
+    @memcpy(buffer[0..len], label[0..len]);
+    return buffer[0..len];
+}
+
 /// What a provider switch changed beyond the model itself.
 const ProviderSwitch = struct {
     reasoning_dropped: bool,
@@ -1513,11 +1583,20 @@ const ProviderSwitch = struct {
     fast_dropped: bool,
 };
 
-/// A catalog ID from another provider makes /model a provider switch.
-/// Unknown IDs (snapshot names) stay with the current provider.
-fn crossProviderTarget(session: *const Session, id: []const u8) ?auth.Provider {
-    const profile = models.findAny(id) orelse return null;
-    return if (profile.provider == session.provider) null else profile.provider;
+/// A catalog ID from another provider makes /model a provider switch:
+/// built-in catalogs first, then custom providers that list the ID.
+/// Unknown IDs (snapshot names) stay with the current provider. The
+/// returned custom name borrows the settings map key.
+fn crossProviderTarget(session: *const Session, id: []const u8) ?providers.Ref {
+    if (models.findAny(id)) |profile| {
+        return if (profile.provider == session.provider) null else providers.Ref.builtin(profile.provider);
+    }
+    if (session.catalog().lists(id)) return null;
+    for (session.settings.value.customProviderNames()) |name| {
+        const definition = session.settings.value.customProvider(name) orelse continue;
+        if (definition.listsModel(id)) return .{ .provider = .custom, .custom = name };
+    }
+    return null;
 }
 
 /// Drop provider-native response items so the history replays anywhere.
@@ -1547,10 +1626,10 @@ fn historyImagesUnsupported(provider: auth.Provider, entries: []const Entry) boo
 /// One dim note per real consequence of a provider switch, printed once at
 /// switch time instead of surprising the user with a slower or forgetful
 /// first reply.
-fn printProviderSwitchNotes(session: *Session, from: auth.Provider, changes: ProviderSwitch) !void {
+fn printProviderSwitchNotes(session: *Session, from_label: []const u8, changes: ProviderSwitch) !void {
     const output = session.output;
     if (changes.reasoning_dropped) {
-        try output.print("{s}note: the transcript carries over, but {s}'s private reasoning state cannot; the first {s} reply may briefly re-explore, and cached-token discounts restart{s}\n", .{ term.dim(), from.label(), session.provider.label(), term.reset() });
+        try output.print("{s}note: the transcript carries over, but {s}'s private reasoning state cannot; the first {s} reply may briefly re-explore, and cached-token discounts restart{s}\n", .{ term.dim(), from_label, session.providerLabel(), term.reset() });
     }
     if (changes.effort_dropped) {
         try output.print("{s}note: effort reset to provider-default; {s} does not support the previous setting{s}\n", .{ term.dim(), session.model, term.reset() });
@@ -1575,83 +1654,97 @@ fn consumeLoginCancellation() void {
 /// keeps and what it cannot).
 fn pickModel(session: *Session, reader: *Io.Reader) !void {
     const output = session.output;
-    // Worst case: an off-catalog current model plus the full catalog.
-    const max_items = models.profiles.len + 1;
-    var values: [max_items][]const u8 = undefined;
-    var providers: [max_items]auth.Provider = undefined;
-    var labels: [max_items][]const u8 = undefined;
-    var owned: [max_items]?[]u8 = @splat(null);
-    var count: usize = 0;
-    defer for (owned[0..count]) |label| {
-        if (label) |text| session.gpa.free(text);
-    };
-    values[count] = session.model;
-    providers[count] = session.provider;
-    owned[count] = try std.fmt.allocPrint(session.gpa, "{s} (current)", .{session.model});
-    labels[count] = owned[count].?;
-    count += 1;
-    const default_id = defaultModel(session.provider);
-    for (modelChoices(session.provider)) |choice| {
+    const Choice = struct { model: []const u8, ref: providers.Ref, label: []const u8, owned: bool };
+    var choices: std.ArrayList(Choice) = .empty;
+    defer {
+        for (choices.items) |choice| if (choice.owned) session.gpa.free(choice.label);
+        choices.deinit(session.gpa);
+    }
+    var labels: std.ArrayList([]const u8) = .empty;
+    defer labels.deinit(session.gpa);
+    const current = session.catalog();
+    try choices.append(session.gpa, .{
+        .model = session.model,
+        .ref = session.ref(),
+        .label = try std.fmt.allocPrint(session.gpa, "{s} (current)", .{session.model}),
+        .owned = true,
+    });
+    const default_id = current.defaultModel();
+    for (current.choices()) |choice| {
         if (std.mem.eql(u8, choice, session.model)) continue;
-        values[count] = choice;
-        providers[count] = session.provider;
         if (std.mem.eql(u8, choice, default_id)) {
-            owned[count] = try std.fmt.allocPrint(session.gpa, "{s} (default)", .{choice});
-            labels[count] = owned[count].?;
+            try choices.append(session.gpa, .{ .model = choice, .ref = session.ref(), .label = try std.fmt.allocPrint(session.gpa, "{s} (default)", .{choice}), .owned = true });
         } else {
-            labels[count] = choice;
+            try choices.append(session.gpa, .{ .model = choice, .ref = session.ref(), .label = choice, .owned = false });
         }
-        count += 1;
     }
     for (login_providers) |provider| {
         if (provider == session.provider) continue;
         const connected = try auth.isLoggedIn(session.gpa, session.io, session.home, provider);
         for (models.choices(provider)) |choice| {
-            values[count] = choice;
-            providers[count] = provider;
-            owned[count] = try std.fmt.allocPrint(session.gpa, "{s} \u{b7} {s}{s}", .{ choice, @tagName(provider), if (connected) "" else " (not connected)" });
-            labels[count] = owned[count].?;
-            count += 1;
+            try choices.append(session.gpa, .{
+                .model = choice,
+                .ref = providers.Ref.builtin(provider),
+                .label = try std.fmt.allocPrint(session.gpa, "{s} \u{b7} {s}{s}", .{ choice, @tagName(provider), if (connected) "" else " (not connected)" }),
+                .owned = true,
+            });
         }
     }
+    for (session.settings.value.customProviderNames()) |name| {
+        const ref: providers.Ref = .{ .provider = .custom, .custom = name };
+        if (ref.eql(session.ref())) continue;
+        const definition = session.settings.value.customProvider(name) orelse continue;
+        for (definition.models) |choice| {
+            try choices.append(session.gpa, .{
+                .model = choice,
+                .ref = ref,
+                .label = try std.fmt.allocPrint(session.gpa, "{s} \u{b7} {s}", .{ choice, name }),
+                .owned = true,
+            });
+        }
+    }
+    for (choices.items) |choice| try labels.append(session.gpa, choice.label);
     try output.print("{s}pick a model \u{b7} another provider's model switches the session \u{b7} enter confirms \u{b7} esc/q cancels{s}\r\n", .{ term.dim(), term.reset() });
     try output.flush();
-    if (try input_mod.pick(reader, output, labels[0..count], 0)) |index| {
-        const selected_model = values[index];
-        const selected_provider = providers[index];
-        if (selected_provider != session.provider and !try ensureProviderLogin(session, reader, selected_provider)) {
+    if (try input_mod.pick(reader, output, labels.items, 0)) |index| {
+        const selected = choices.items[index];
+        const switching = !selected.ref.eql(session.ref());
+        if (switching and !try ensureProviderLogin(session, reader, selected.ref)) {
             try output.print("model {s} (unchanged)\n", .{session.model});
             return;
         }
-        const preferences = (try pickModelPreferences(session, reader, selected_provider, selected_model)) orelse {
+        const selected_catalog = providers.Catalog.resolve(selected.ref, &session.settings.value);
+        const preferences = (try pickModelPreferences(session, reader, selected_catalog, selected.model)) orelse {
             try output.print("model {s} (unchanged)\n", .{session.model});
             return;
         };
-        const from = session.provider;
-        var changes = try session.setSelection(selected_provider, selected_model, preferences.effort, preferences.fast);
+        var from_buffer: [settings_mod.max_provider_name]u8 = undefined;
+        const from_label = copyLabel(&from_buffer, session.providerLabel());
+        var changes = try session.setSelection(selected.ref, selected.model, preferences.effort, preferences.fast);
         persistSelection(session);
-        log.logf("agent", "event=model provider={s} model={s}", .{ @tagName(session.provider), session.model });
-        if (from != session.provider) {
-            try output.print("model {s} \u{b7} provider {s}", .{ session.model, @tagName(session.provider) });
+        log.logf("agent", "event=model provider={s} model={s}", .{ session.providerName(), session.model });
+        if (switching) {
+            try output.print("model {s} \u{b7} provider {s}", .{ session.model, session.providerName() });
         } else {
             try output.print("model {s}", .{session.model});
         }
-        if (models.supportsFast(session.provider, session.model)) {
+        const chosen = session.catalog();
+        if (chosen.supportsFast(session.model)) {
             try output.print(" \u{b7} effort {s} \u{b7} {s}\n", .{
                 if (session.effort) |effort| @tagName(effort) else "provider-default",
                 if (session.fast) "fast" else "normal",
             });
-        } else if (models.efforts(session.provider, session.model).len > 0) {
+        } else if (chosen.efforts(session.model).len > 0) {
             try output.print(" \u{b7} effort {s}\n", .{if (session.effort) |effort| @tagName(effort) else "provider-default"});
         } else {
             try output.writeByte('\n');
         }
-        if (from != session.provider) {
+        if (switching) {
             // Effort and fast were just confirmed for the new model, so
             // only the notes about lost state still apply.
             changes.effort_dropped = false;
             changes.fast_dropped = false;
-            try printProviderSwitchNotes(session, from, changes);
+            try printProviderSwitchNotes(session, from_label, changes);
         }
     } else {
         try output.print("model {s} (unchanged)\n", .{session.model});
@@ -1666,14 +1759,14 @@ const ModelPreferences = struct {
 /// Follow model selection with the controls that model supports. Nothing is
 /// applied until every visible stage has been confirmed. `provider` may
 /// differ from the session's when the selection switches providers.
-fn pickModelPreferences(session: *Session, reader: *Io.Reader, provider: auth.Provider, model: []const u8) !?ModelPreferences {
+fn pickModelPreferences(session: *Session, reader: *Io.Reader, catalog: providers.Catalog, model: []const u8) !?ModelPreferences {
     var selected: ModelPreferences = .{
         .effort = null,
         // Match fx's staged picker: supported models start on Fast, while
         // Normal remains one arrow key away.
-        .fast = models.supportsFast(provider, model),
+        .fast = catalog.supportsFast(model),
     };
-    const available_efforts = models.efforts(provider, model);
+    const available_efforts = catalog.efforts(model);
     if (available_efforts.len > 0) {
         var labels: [@typeInfo(Effort).@"enum".fields.len + 1][]const u8 = undefined;
         labels[0] = "provider-default";
@@ -1683,7 +1776,7 @@ fn pickModelPreferences(session: *Session, reader: *Io.Reader, provider: auth.Pr
         const index = (try input_mod.pick(reader, session.output, labels[0 .. available_efforts.len + 1], 0)) orelse return null;
         selected.effort = if (index == 0) null else available_efforts[index - 1];
     }
-    if (models.supportsFast(provider, model)) {
+    if (catalog.supportsFast(model)) {
         const labels = [_][]const u8{ "normal", "fast" };
         try session.output.print("{s}speed for {s} \u{b7} fast uses more credits \u{b7} enter confirms \u{b7} esc/q cancels{s}\r\n", .{ term.dim(), model, term.reset() });
         try session.output.flush();
@@ -1698,7 +1791,8 @@ fn pickEffort(session: *Session, reader: *Io.Reader) !void {
     labels[0] = "provider-default";
     var count: usize = 1;
     var initial: usize = 0;
-    for (models.efforts(session.provider, session.model)) |effort| {
+    const available = session.catalog().efforts(session.model);
+    for (available) |effort| {
         labels[count] = @tagName(effort);
         if (session.effort == effort) initial = count;
         count += 1;
@@ -1706,7 +1800,7 @@ fn pickEffort(session: *Session, reader: *Io.Reader) !void {
     try session.output.print("{s}pick reasoning effort \u{b7} enter confirms \u{b7} esc/q cancels{s}\r\n", .{ term.dim(), term.reset() });
     try session.output.flush();
     if (try input_mod.pick(reader, session.output, labels[0..count], initial)) |index| {
-        const value: ?Effort = if (index == 0) null else models.efforts(session.provider, session.model)[index - 1];
+        const value: ?Effort = if (index == 0) null else available[index - 1];
         try session.setEffort(value);
         persistSelection(session);
         try session.output.print("effort {s}\n", .{labels[index]});
@@ -1722,13 +1816,13 @@ fn configuredCompactModel(session: *const Session) []const u8 {
 fn effectiveCompactModel(session: *const Session) []const u8 {
     const configured = configuredCompactModel(session);
     if (std.mem.eql(u8, configured, "current")) return session.model;
-    if (models.find(session.provider, configured) != null) return configured;
+    if (session.catalog().lists(configured)) return configured;
     return session.model;
 }
 
 fn effectiveCompactEffort(session: *const Session) ?Effort {
     const effort = session.settings.value.compactEffort(session.provider) orelse return null;
-    return if (models.supportsEffort(session.provider, effectiveCompactModel(session), effort)) effort else null;
+    return if (session.catalog().supportsEffort(effectiveCompactModel(session), effort)) effort else null;
 }
 
 fn printSettings(session: *Session) !void {
@@ -1747,6 +1841,143 @@ fn printSettings(session: *Session) !void {
             if (session.settings.value.copy_on_select) "on" else "off",
         },
     );
+}
+
+/// Install freshly merged settings (from a provider add/remove) and refresh
+/// everything that mirrors them.
+fn replaceSettings(session: *Session, loaded: settings_mod.Loaded) void {
+    session.settings.deinit();
+    session.settings = loaded;
+    input_mod.copy_on_select = loaded.value.copy_on_select;
+    syncTui(session);
+}
+
+/// /provider: list custom endpoints, add one through the guided flow,
+/// remove one, or pick from the list interactively.
+fn providerCommand(session: *Session, reader: *Io.Reader, args: []const u8) !void {
+    const output = session.output;
+    if (session.subagent_control != null) {
+        try output.writeAll("provider configuration is unavailable inside a subagent\n");
+        return;
+    }
+    var words = std.mem.tokenizeScalar(u8, args, ' ');
+    const verb = words.next() orelse "";
+    const name = words.next();
+    if (verb.len == 0) {
+        if (input_mod.interactive) return pickProvider(session, reader);
+        return providers.writeList(output, &session.settings.value, session.custom_name);
+    }
+    if (std.mem.eql(u8, verb, "list")) return providers.writeList(output, &session.settings.value, session.custom_name);
+    if (std.mem.eql(u8, verb, "add")) return addProvider(session, reader, name);
+    if (std.mem.eql(u8, verb, "remove")) {
+        const target = name orelse {
+            try output.writeAll("usage: /provider remove NAME\n");
+            return;
+        };
+        return removeProvider(session, target);
+    }
+    try output.writeAll("usage: /provider [list|add [NAME]|remove NAME]\n");
+}
+
+fn addProvider(session: *Session, reader: *Io.Reader, preset: ?[]const u8) !void {
+    const output = session.output;
+    if (!input_mod.interactive) {
+        try output.writeAll("guided setup needs an interactive session; otherwise run: xaq provider add NAME --api ... --base-url ... --model ...\n");
+        return;
+    }
+    const added = (try providers.addInteractive(session.gpa, session.io, session.home, reader, output, preset)) orelse {
+        try output.writeAll("provider setup cancelled\n");
+        try output.flush();
+        return;
+    };
+    defer session.gpa.free(added.name);
+    replaceSettings(session, added.loaded);
+    try output.print("provider {s} saved to ~/.config/xaq/settings.json\n", .{added.name});
+    const target = providers.Ref.parse(added.name) orelse return;
+    const model = providers.Catalog.resolve(target, &session.settings.value).defaultModel();
+    if (model.len == 0 or target.eql(session.ref())) {
+        try output.flush();
+        return;
+    }
+    var label_buffer: [96]u8 = undefined;
+    const labels = [_][]const u8{
+        try std.fmt.bufPrint(&label_buffer, "switch this session to {s}", .{added.name}),
+        "stay on the current provider",
+    };
+    try output.print("{s}use it now? \u{b7} enter confirms \u{b7} esc/q keeps the current provider{s}\r\n", .{ term.dim(), term.reset() });
+    try output.flush();
+    if (try input_mod.pick(reader, output, &labels, 0)) |index| if (index == 0) {
+        try switchSession(session, reader, target, model);
+        return;
+    };
+    try output.print("{s}switch later with /model {s}{s}\n", .{ term.dim(), model, term.reset() });
+    try output.flush();
+}
+
+fn removeProvider(session: *Session, name: []const u8) !void {
+    const output = session.output;
+    const result = settings_mod.removeProvider(session.gpa, session.io, session.home, name) catch |err| {
+        try output.print("cannot update settings: {s}\n", .{if (err == error.SettingsInUse) "another session is saving settings; try again" else @errorName(err)});
+        try output.flush();
+        return;
+    };
+    replaceSettings(session, result.loaded);
+    if (!result.removed) {
+        try output.print("no custom provider named {s}\n", .{name});
+        return;
+    }
+    try output.print("provider {s} removed\n", .{name});
+    if (session.provider == .custom and std.mem.eql(u8, session.providerName(), name)) {
+        try output.print("{s}this session still points at {s}; pick another provider with /model before the next prompt{s}\n", .{ term.dim(), name, term.reset() });
+    }
+    try output.flush();
+}
+
+fn pickProvider(session: *Session, reader: *Io.Reader) !void {
+    const output = session.output;
+    const config = &session.settings.value;
+    const names = config.customProviderNames();
+    var labels: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (labels.items[@min(labels.items.len, 1)..]) |label| session.gpa.free(label);
+        labels.deinit(session.gpa);
+    }
+    try labels.append(session.gpa, "add a custom endpoint");
+    for (names) |name| {
+        const definition = config.customProvider(name) orelse continue;
+        const current = session.provider == .custom and std.mem.eql(u8, session.providerName(), name);
+        try labels.append(session.gpa, try std.fmt.allocPrint(session.gpa, "{s} \u{b7} {s} \u{b7} {s}{s}", .{ name, @tagName(definition.api), definition.base_url, if (current) " \u{b7} current session" else "" }));
+    }
+    try output.print("{s}custom providers \u{b7} enter selects \u{b7} esc/q closes{s}\r\n", .{ term.dim(), term.reset() });
+    try output.flush();
+    const index = (try input_mod.pick(reader, output, labels.items, 0)) orelse return;
+    if (index == 0) return addProvider(session, reader, null);
+    // Settings may be replaced below, so the name must not borrow them.
+    var name_buffer: [settings_mod.max_provider_name]u8 = undefined;
+    const name = copyLabel(&name_buffer, names[index - 1]);
+    var switch_buffer: [96]u8 = undefined;
+    var remove_buffer: [96]u8 = undefined;
+    const actions = [_][]const u8{
+        try std.fmt.bufPrint(&switch_buffer, "switch this session to {s}", .{name}),
+        try std.fmt.bufPrint(&remove_buffer, "remove {s}", .{name}),
+        "back",
+    };
+    try output.print("{s}{s} \u{b7} enter selects \u{b7} esc/q closes{s}\r\n", .{ term.dim(), name, term.reset() });
+    try output.flush();
+    switch ((try input_mod.pick(reader, output, &actions, 0)) orelse return) {
+        0 => {
+            const target: providers.Ref = .{ .provider = .custom, .custom = name };
+            const model = providers.Catalog.resolve(target, config).defaultModel();
+            if (model.len == 0) {
+                try output.print("{s} lists no models; use /model ID after switching with --provider\n", .{name});
+                try output.flush();
+                return;
+            }
+            try switchSession(session, reader, target, model);
+        },
+        1 => try removeProvider(session, name),
+        else => {},
+    }
 }
 
 fn applySettings(session: *Session, desired: settings_mod.Config) !void {
@@ -1868,7 +2099,7 @@ fn persistSelection(session: *Session) void {
 }
 
 fn writeSelection(session: *Session) !void {
-    try state_mod.remember(session.gpa, session.io, session.home, session.provider, .{
+    try state_mod.remember(session.gpa, session.io, session.home, session.ref(), .{
         .model = session.model,
         .effort = session.effort,
         .fast = session.fast,
@@ -1889,7 +2120,7 @@ fn pickSettings(session: *Session, reader: *Io.Reader) !void {
             try std.fmt.bufPrint(&storage[7], "agent panel        {s}", .{if (session.settings.value.subagent_panel) "on" else "off"}),
             try std.fmt.bufPrint(&storage[8], "copy on select     {s}", .{if (session.settings.value.copy_on_select) "on" else "off"}),
         };
-        try session.output.print("{s}settings for {s} \u{b7} enter edits \u{b7} esc/q closes{s}\r\n", .{ term.dim(), @tagName(session.provider), term.reset() });
+        try session.output.print("{s}settings for {s} \u{b7} enter edits \u{b7} esc/q closes{s}\r\n", .{ term.dim(), session.providerName(), term.reset() });
         try session.output.flush();
         const selected = (try input_mod.pick(reader, session.output, &items, 0)) orelse return;
         switch (selected) {
@@ -1921,11 +2152,16 @@ fn pickSettings(session: *Session, reader: *Io.Reader) !void {
                 }
             },
             2 => {
+                if (session.provider == .custom) {
+                    try session.output.writeAll("custom providers compact with the session model\n");
+                    try session.output.flush();
+                    continue;
+                }
                 var labels: [9][]const u8 = undefined;
                 labels[0] = "current";
                 var count: usize = 1;
                 var initial: usize = 0;
-                for (modelChoices(session.provider)) |model| {
+                for (session.catalog().choices()) |model| {
                     labels[count] = model;
                     if (std.mem.eql(u8, configuredCompactModel(session), model)) initial = count;
                     count += 1;
@@ -1939,11 +2175,16 @@ fn pickSettings(session: *Session, reader: *Io.Reader) !void {
                 }
             },
             3 => {
+                if (session.provider == .custom) {
+                    try session.output.writeAll("custom providers compact with the session effort\n");
+                    try session.output.flush();
+                    continue;
+                }
                 var labels: [@typeInfo(Effort).@"enum".fields.len + 1][]const u8 = undefined;
                 labels[0] = "provider-default";
                 var count: usize = 1;
                 var initial: usize = 0;
-                const supported = models.efforts(session.provider, effectiveCompactModel(session));
+                const supported = session.catalog().efforts(effectiveCompactModel(session));
                 for (supported) |effort| {
                     labels[count] = @tagName(effort);
                     if (session.settings.value.compactEffort(session.provider) == effort) initial = count;
@@ -2074,7 +2315,7 @@ fn printResumed(session: *Session) !void {
     const output = session.output;
     syncTui(session);
     if (tui.active) tui.clearTranscript();
-    try output.print("{s}resumed {s} \u{b7} {s}/{s} \u{b7} {d} entries{s}\n", .{ term.dim(), session.thread.?.id, @tagName(session.provider), session.model, session.entries.items.len, term.reset() });
+    try output.print("{s}resumed {s} \u{b7} {s}/{s} \u{b7} {d} entries{s}\n", .{ term.dim(), session.thread.?.id, session.providerName(), session.model, session.entries.items.len, term.reset() });
     try replayEntries(output, session.entries.items);
     try output.flush();
 }
@@ -2499,7 +2740,7 @@ fn printExchangeStats(output: *Io.Writer, elapsed_ms: u64, used: Usage, percent:
 }
 
 fn contextPercent(session: *const Session) usize {
-    const window = models.contextWindow(session.provider, session.model);
+    const window = session.catalog().contextWindow(session.model);
     if (window == 0) return 0;
     return @min(estimatedContextTokens(session) * 100 / window, 100);
 }
@@ -2550,7 +2791,7 @@ fn isCompactionSummary(entry: Entry) bool {
 fn compactIfNeeded(session: *Session, force: bool) !bool {
     const entry_tokens = types.approximateTokens(session.entries.items);
     const current_tokens = estimatedContextTokens(session);
-    const context_tokens: usize = models.contextWindow(session.provider, session.model);
+    const context_tokens: usize = session.catalog().contextWindow(session.model);
     const threshold_tokens = context_tokens * session.settings.value.compact_threshold_percent / 100;
     if (!force) {
         if (!session.settings.value.auto_compact) return false;
@@ -2629,7 +2870,7 @@ fn compactIfNeeded(session: *Session, force: bool) !bool {
 /// plain mode.
 fn syncTui(session: *Session) void {
     if (!tui.active) return;
-    const window = models.contextWindow(session.provider, session.model);
+    const window = session.catalog().contextWindow(session.model);
     const percent: u8 = @intCast(@min(estimatedContextTokens(session) * 100 / @max(window, 1), 100));
     const git_identity: ?tui.GitIdentity = if (session.git_status.present) .{
         .worktree = session.git_status.worktree(),
@@ -2637,7 +2878,7 @@ fn syncTui(session: *Session) void {
         .dirty = session.git_status.dirty,
     } else null;
     tui.noteIdentity(
-        @tagName(session.provider),
+        session.providerName(),
         session.model,
         if (session.effort) |value| @tagName(value) else null,
         session.fast,
@@ -2767,8 +3008,9 @@ fn estimatedContextTokens(session: *const Session) usize {
 fn compactWithModel(session: *Session, model: []const u8, entries: []const Entry) !?[]const u8 {
     var request_arena: std.heap.ArenaAllocator = .init(session.gpa);
     defer request_arena.deinit();
-    const fast = session.fast and models.supportsFast(session.provider, model);
-    const body = try request.buildCompact(request_arena.allocator(), session.provider, model, effectiveCompactEffort(session), fast, entries);
+    const catalog = session.catalog();
+    const fast = session.fast and catalog.supportsFast(model);
+    const body = try request.buildCompact(request_arena.allocator(), catalog.target(), model, effectiveCompactEffort(session), fast, entries);
     var sink: Io.Writer.Allocating = .init(session.gpa);
     defer sink.deinit();
     const answer = (try performBody(session, model, body, &sink.writer, "compact", fast)).answer;
@@ -2837,7 +3079,7 @@ fn persistSnapshot(session: *Session) !void {
 fn persistEntries(session: *Session, entries: []const Entry) !void {
     if (session.thread) |*thread| {
         try thread.rewrite(
-            session.provider,
+            session.providerName(),
             session.model,
             if (session.effort) |value| @tagName(value) else null,
             session.fast,
@@ -2847,15 +3089,15 @@ fn persistEntries(session: *Session, entries: []const Entry) !void {
     }
 }
 
-pub fn buildRequest(gpa: std.mem.Allocator, provider: auth.Provider, model: []const u8, effort: ?Effort, fast: bool, tool_options: tools.SchemaOptions, cwd: []const u8, instructions: []const u8, entries: []const Entry) ![]u8 {
-    return request.build(gpa, provider, model, effort, fast, tool_options, cwd, instructions, entries);
+pub fn buildRequest(gpa: std.mem.Allocator, target: providers.Target, model: []const u8, effort: ?Effort, fast: bool, tool_options: tools.SchemaOptions, cwd: []const u8, instructions: []const u8, entries: []const Entry) ![]u8 {
+    return request.build(gpa, target, model, effort, fast, tool_options, cwd, instructions, entries);
 }
 
 const compact_system = request.compact_system;
 const compact_prompt = request.compact_prompt;
 
-fn buildCompactRequest(gpa: std.mem.Allocator, provider: auth.Provider, model: []const u8, effort: ?Effort, fast: bool, entries: []const Entry) ![]u8 {
-    return request.buildCompact(gpa, provider, model, effort, fast, entries);
+fn buildCompactRequest(gpa: std.mem.Allocator, target: providers.Target, model: []const u8, effort: ?Effort, fast: bool, entries: []const Entry) ![]u8 {
+    return request.buildCompact(gpa, target, model, effort, fast, entries);
 }
 fn eventString(value: std.json.Value, key: []const u8) ?[]const u8 {
     const child = switch (value) {
@@ -2895,15 +3137,17 @@ fn performRound(session: *Session) !RoundResult {
     var request_arena: std.heap.ArenaAllocator = .init(session.gpa);
     defer request_arena.deinit();
     const subagents_enabled = session.subagent_manager != null and session.settings.value.subagents_enabled;
+    const round_catalog = session.catalog();
     const subagent_launch: ?subagents.Launch = if (subagents_enabled) .{
-        .provider = @tagName(session.provider),
+        .provider = session.providerName(),
+        .catalog = round_catalog,
         .model = session.model,
         .effort = if (session.effort) |value| @tagName(value) else null,
         .fast = session.fast,
     } else null;
     const body = try request.build(
         request_arena.allocator(),
-        session.provider,
+        round_catalog.target(),
         session.model,
         session.effort,
         session.fast,
@@ -2922,21 +3166,33 @@ fn performRound(session: *Session) !RoundResult {
 }
 
 fn performBody(session: *Session, model: []const u8, body: []const u8, output: *Io.Writer, kind: []const u8, fast: bool) !RoundResult {
-    log.logf("agent", "event=request kind={s} provider={s} model={s} fast={s} turn={d} entries={d} body_bytes={d}", .{ kind, @tagName(session.provider), model, if (fast) "on" else "off", session.turn, session.entries.items.len, body.len });
+    log.logf("agent", "event=request kind={s} provider={s} model={s} fast={s} turn={d} entries={d} body_bytes={d}", .{ kind, session.providerName(), model, if (fast) "on" else "off", session.turn, session.entries.items.len, body.len });
+    const catalog = session.catalog();
     var attempt: usize = 0;
     var refreshed = false;
     while (attempt < 3) : (attempt += 1) {
         var credential_arena: std.heap.ArenaAllocator = .init(session.gpa);
         defer credential_arena.deinit();
         var credential_diagnostic: auth.Diagnostic = .{};
-        const credential = auth.credentialWithDiagnostic(credential_arena.allocator(), session.io, session.home, session.provider, &credential_diagnostic) catch |err| {
-            if (err == error.ProviderRequestFailed) {
-                if (credential_diagnostic.message()) |message| try reportProviderDiagnostic(session, message);
+        const credential = if (session.provider == .custom)
+            customCredential(session, catalog) catch |err| {
+                var message_buffer: [256]u8 = undefined;
+                const message = switch (err) {
+                    error.UnknownProvider => try std.fmt.bufPrint(&message_buffer, "custom provider {s} is no longer configured; run /provider", .{session.providerName()}),
+                    error.MissingApiKeyEnv => try std.fmt.bufPrint(&message_buffer, "environment variable {s} is not set for provider {s}; export it or run /provider", .{ catalog.definition.?.api_key_env.?, session.providerName() }),
+                };
+                try reportProviderDiagnostic(session, message);
+                return error.ProviderRequestFailed;
             }
-            return err;
-        };
+        else
+            auth.credentialWithDiagnostic(credential_arena.allocator(), session.io, session.home, session.provider, &credential_diagnostic) catch |err| {
+                if (err == error.ProviderRequestFailed) {
+                    if (credential_diagnostic.message()) |message| try reportProviderDiagnostic(session, message);
+                }
+                return err;
+            };
         const compacting = std.mem.eql(u8, kind, "compact");
-        var decoder = Decoder.init(session.provider, session.gpa, session.allocator(), output, if (compacting) null else session.events);
+        var decoder = Decoder.init(catalog.api(), session.gpa, session.allocator(), output, if (compacting) null else session.events);
         defer decoder.deinit();
         // A continuously animated placeholder covers the wait; it runs on
         // its own Io task, so it keeps moving even while the provider is
@@ -2946,7 +3202,7 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
         decoder.stop_spinner = !compacting;
         try output.flush();
         spin.start(session.io, if (compacting) "compacting" else "thinking");
-        const response = requestStream(session.gpa, session.io, session.provider, credential, model, body, &decoder, fast) catch |err| {
+        const response = requestStream(session.gpa, session.io, catalog, credential, model, body, &decoder, fast) catch |err| {
             spin.stop();
             const partial = interruptedRound(&decoder, compacting, err) catch |terminal| {
                 // Close any active markdown style before control returns to
@@ -2990,7 +3246,7 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
             try noteServedSpeed(session, fast, &decoder.core);
             return result;
         }
-        if (response.status == 401 and !refreshed) {
+        if (response.status == 401 and !refreshed and session.provider != .custom) {
             var refresh_arena: std.heap.ArenaAllocator = .init(session.gpa);
             defer refresh_arena.deinit();
             var refresh_diagnostic: auth.Diagnostic = .{};
@@ -3041,7 +3297,7 @@ fn performBody(session: *Session, model: []const u8, body: []const u8, output: *
 /// requesting fast mode and print once per session, including compaction.
 fn noteServedSpeed(session: *Session, fast: bool, decoder: *const stream_decoder.Decoder) !void {
     if (!fast or decoder.speed != .standard) return;
-    log.logf("agent", "event=fast_downgraded provider={s} model={s} service_tier={f}", .{ @tagName(session.provider), session.model, std.json.fmt(decoder.reportedServiceTier(), .{ .escape_unicode = true }) });
+    log.logf("agent", "event=fast_downgraded provider={s} model={s} service_tier={f}", .{ session.providerName(), session.model, std.json.fmt(decoder.reportedServiceTier(), .{ .escape_unicode = true }) });
     if (session.fast_downgrade_noted or !session.interactive) return;
     session.fast_downgrade_noted = true;
     try session.output.print("\n{s}fast mode requested; {s} returned {s}={f} for this response. Fast remains requested.{s}\n", .{
@@ -3059,7 +3315,7 @@ test "fast tier notice reports explicit default once and preserves fast mode" {
     defer output.deinit();
     var session = try testSession("/unused", &output.writer);
     defer session.deinit();
-    var decoder = stream_decoder.Decoder.init(.chatgpt, std.testing.allocator, session.allocator(), .{});
+    var decoder = stream_decoder.Decoder.init(.responses, std.testing.allocator, session.allocator(), .{});
     defer decoder.deinit();
     session.interactive = true;
     for ([_][]const u8{ "priority", "fast", "ultrafast", "flex", "future-tier" }) |tier| {
@@ -3115,12 +3371,20 @@ fn retryableStatus(status: u16) bool {
     return status == 408 or status == 409 or status == 425 or status == 429 or status == 500 or status == 502 or status == 503 or status == 504;
 }
 
-fn requestStream(gpa: std.mem.Allocator, io: Io, provider: auth.Provider, credential: auth.Credential, model: []const u8, body: []const u8, decoder: *Decoder, fast: bool) !transport.Response {
+fn customCredential(session: *Session, catalog: providers.Catalog) !auth.Credential {
+    _ = session;
+    const definition = catalog.definition orelse return error.UnknownProvider;
+    return providers.credential(definition);
+}
+
+fn requestStream(gpa: std.mem.Allocator, io: Io, catalog: providers.Catalog, credential: auth.Credential, model: []const u8, body: []const u8, decoder: *Decoder, fast: bool) !transport.Response {
     const authorization = try std.fmt.allocPrint(gpa, "Bearer {s}", .{credential.access});
     defer gpa.free(authorization);
     const routing_hint = try request.chatgptRoutingHint(gpa, model, fast);
     defer gpa.free(routing_hint);
-    const response = try switch (provider) {
+    var custom_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer custom_arena.deinit();
+    const response = try switch (catalog.ref.provider) {
         .chatgpt => transport.postStream(gpa, io, "https://chatgpt.com/backend-api/codex/responses", "application/json", &.{
             .{ .name = "Authorization", .value = authorization },
             .{ .name = "chatgpt-account-id", .value = credential.account_id orelse return error.InvalidAccessToken },
@@ -3143,6 +3407,11 @@ fn requestStream(gpa: std.mem.Allocator, io: Io, provider: auth.Provider, creden
             .{ .name = "Accept", .value = "text/event-stream" },
             .{ .name = "User-Agent", .value = "xaq/0.1" },
         }, body, decoder, decodeLine),
+        .custom => blk: {
+            const definition = catalog.definition orelse return error.UnknownProvider;
+            const allocator = custom_arena.allocator();
+            break :blk transport.postStream(gpa, io, try providers.url(allocator, definition), "application/json", try providers.headers(allocator, definition, credential.access), body, decoder, decodeLine);
+        },
     };
     errdefer gpa.free(response.body);
     // curl can exit successfully after a clean but premature EOF. Require
@@ -3166,9 +3435,9 @@ const Decoder = struct {
     stop_spinner: bool = true,
     local_failure: bool = false,
 
-    fn init(provider: auth.Provider, parse_gpa: std.mem.Allocator, persist: std.mem.Allocator, output: *Io.Writer, events: ?EventSink) Decoder {
+    fn init(api: auth.Api, parse_gpa: std.mem.Allocator, persist: std.mem.Allocator, output: *Io.Writer, events: ?EventSink) Decoder {
         return .{
-            .core = stream_decoder.Decoder.init(provider, parse_gpa, persist, .{}),
+            .core = stream_decoder.Decoder.init(api, parse_gpa, persist, .{}),
             .rendered = markdown.Writer.init(output),
             .events = events,
         };
@@ -3283,8 +3552,8 @@ test "failed thread appends leave live history and selection unchanged" {
     try std.testing.expectError(error.ThreadMissing, session.setModel("gpt-5.4-mini"));
     try std.testing.expectError(error.ThreadMissing, session.setEffort(null));
     try std.testing.expectError(error.ThreadMissing, session.setFast(false));
-    try std.testing.expectError(error.ThreadMissing, session.switchProvider(.claude, "claude-sonnet-5"));
-    try std.testing.expectError(error.ThreadMissing, session.setSelection(.claude, "claude-sonnet-5", .low, false));
+    try std.testing.expectError(error.ThreadMissing, session.switchProvider(.builtin(.claude), "claude-sonnet-5"));
+    try std.testing.expectError(error.ThreadMissing, session.setSelection(.builtin(.claude), "claude-sonnet-5", .low, false));
     try std.testing.expectEqual(@as(usize, 2), session.entries.items.len);
     try std.testing.expectEqualStrings("keep this goal", session.entries.items[0].user.text);
     try std.testing.expectEqualStrings("private", session.entries.items[1].assistant.raw_items[0]);
@@ -3350,7 +3619,7 @@ test "failed resume repair preserves the current conversation and releases the l
     defer std.testing.allocator.free(original_id);
 
     const resume_id = blk: {
-        var interrupted = try threads.create(std.testing.allocator, std.testing.io, home, session.cwd, .claude, "claude-sonnet-5", null, false);
+        var interrupted = try threads.create(std.testing.allocator, std.testing.io, home, session.cwd, "claude", "claude-sonnet-5", null, false);
         defer interrupted.deinit();
         try interrupted.appendEntry(.{ .user = .{ .text = "interrupted goal" } });
         try interrupted.appendEntry(.{ .assistant = .{
@@ -3636,49 +3905,49 @@ test "provider defaults" {
 }
 
 test "compact requests omit coding tools and use the selected model" {
-    const body = try buildCompactRequest(std.testing.allocator, .claude, "claude-opus-5", .low, false, &.{.{ .user = .{ .text = "keep this decision" } }});
+    const body = try buildCompactRequest(std.testing.allocator, .builtin(.claude), "claude-opus-5", .low, false, &.{.{ .user = .{ .text = "keep this decision" } }});
     defer std.testing.allocator.free(body);
     try std.testing.expect(std.mem.indexOf(u8, body, "claude-opus-5") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, compact_prompt) != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"effort\":\"low\"") != null);
 
-    const chatgpt = try buildCompactRequest(std.testing.allocator, .chatgpt, "gpt-5.6-sol", .low, false, &.{.{ .user = .{ .text = "keep this decision" } }});
+    const chatgpt = try buildCompactRequest(std.testing.allocator, .builtin(.chatgpt), "gpt-5.6-sol", .low, false, &.{.{ .user = .{ .text = "keep this decision" } }});
     defer std.testing.allocator.free(chatgpt);
     try std.testing.expect(std.mem.indexOf(u8, chatgpt, "max_output_tokens") == null);
 }
 
 test "fast mode uses each provider's request contract" {
-    const chatgpt = try buildRequest(std.testing.allocator, .chatgpt, "gpt-5.6-sol", null, true, .{}, "/work", "", &.{});
+    const chatgpt = try buildRequest(std.testing.allocator, .builtin(.chatgpt), "gpt-5.6-sol", null, true, .{}, "/work", "", &.{});
     defer std.testing.allocator.free(chatgpt);
     try std.testing.expect(std.mem.indexOf(u8, chatgpt, "\"service_tier\":\"priority\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, chatgpt, "\"service_tier\":\"fast\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, chatgpt, "\"speed\"") == null);
 
-    const chatgpt_compact = try buildCompactRequest(std.testing.allocator, .chatgpt, "gpt-5.6-sol", null, true, &.{});
+    const chatgpt_compact = try buildCompactRequest(std.testing.allocator, .builtin(.chatgpt), "gpt-5.6-sol", null, true, &.{});
     defer std.testing.allocator.free(chatgpt_compact);
     try std.testing.expect(std.mem.indexOf(u8, chatgpt_compact, "\"service_tier\":\"priority\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, chatgpt_compact, "\"service_tier\":\"fast\"") == null);
 
-    const anthropic = try buildRequest(std.testing.allocator, .claude, "claude-opus-5", null, true, .{}, "/work", "", &.{});
+    const anthropic = try buildRequest(std.testing.allocator, .builtin(.claude), "claude-opus-5", null, true, .{}, "/work", "", &.{});
     defer std.testing.allocator.free(anthropic);
     try std.testing.expect(std.mem.indexOf(u8, anthropic, "\"speed\":\"fast\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, anthropic, "\"service_tier\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, request.claudeBetaHeader(true), "fast-mode-2026-02-01") != null);
     try std.testing.expect(std.mem.indexOf(u8, request.claudeBetaHeader(false), "fast-mode-2026-02-01") == null);
 
-    const standard = try buildRequest(std.testing.allocator, .chatgpt, "gpt-5.6-sol", null, false, .{}, "/work", "", &.{});
+    const standard = try buildRequest(std.testing.allocator, .builtin(.chatgpt), "gpt-5.6-sol", null, false, .{}, "/work", "", &.{});
     defer std.testing.allocator.free(standard);
     try std.testing.expect(std.mem.indexOf(u8, standard, "\"service_tier\"") == null);
 }
 
 test "web tools are included only after Firecrawl setup" {
-    const disabled = try buildRequest(std.testing.allocator, .chatgpt, "gpt-5.6-sol", null, false, .{}, "/work", "", &.{});
+    const disabled = try buildRequest(std.testing.allocator, .builtin(.chatgpt), "gpt-5.6-sol", null, false, .{}, "/work", "", &.{});
     defer std.testing.allocator.free(disabled);
     try std.testing.expect(std.mem.indexOf(u8, disabled, "web_fetch") == null);
     try std.testing.expect(std.mem.indexOf(u8, disabled, "web_search") == null);
 
-    const enabled = try buildRequest(std.testing.allocator, .chatgpt, "gpt-5.6-sol", null, false, .{ .web_enabled = true }, "/work", "", &.{});
+    const enabled = try buildRequest(std.testing.allocator, .builtin(.chatgpt), "gpt-5.6-sol", null, false, .{ .web_enabled = true }, "/work", "", &.{});
     defer std.testing.allocator.free(enabled);
     try std.testing.expect(std.mem.indexOf(u8, enabled, "web_fetch") != null);
     try std.testing.expect(std.mem.indexOf(u8, enabled, "web_search") != null);
@@ -3689,7 +3958,7 @@ test "decode Responses SSE" {
     defer arena.deinit();
     var buffer: [128]u8 = undefined;
     var writer: Io.Writer = .fixed(&buffer);
-    var decoder = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), &writer, null);
+    var decoder = Decoder.init(.responses, std.testing.allocator, arena.allocator(), &writer, null);
     defer decoder.deinit();
     try decoder.feed("data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}");
     try decoder.feed("data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}");
@@ -3708,7 +3977,7 @@ test "decode Anthropic SSE" {
     defer arena.deinit();
     var buffer: [128]u8 = undefined;
     var writer: Io.Writer = .fixed(&buffer);
-    var decoder = Decoder.init(.claude, std.testing.allocator, arena.allocator(), &writer, null);
+    var decoder = Decoder.init(.messages, std.testing.allocator, arena.allocator(), &writer, null);
     defer decoder.deinit();
     try decoder.feed("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}");
     try decoder.feed("data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"bash\",\"input\":{}}}");
@@ -3730,7 +3999,7 @@ test "stream decoder renders each Responses delta immediately" {
     defer arena.deinit();
     var buffer: [128]u8 = undefined;
     var writer: Io.Writer = .fixed(&buffer);
-    var decoder = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), &writer, null);
+    var decoder = Decoder.init(.responses, std.testing.allocator, arena.allocator(), &writer, null);
     defer decoder.deinit();
     try decoder.feed("data: {\"type\":\"response.output_text.delta\",\"delta\":\"one\"}");
     try std.testing.expectEqualStrings("one", writer.buffered());
@@ -3746,7 +4015,7 @@ test "interrupted stream keeps partial decoder output and stop reason" {
     defer arena.deinit();
     var buffer: [128]u8 = undefined;
     var writer: Io.Writer = .fixed(&buffer);
-    var decoder = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), &writer, null);
+    var decoder = Decoder.init(.responses, std.testing.allocator, arena.allocator(), &writer, null);
     defer decoder.deinit();
     try decoder.feed("data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}");
 
@@ -3759,18 +4028,18 @@ test "interrupted stream keeps partial decoder output and stop reason" {
 test "interrupted streams discard pending tools and private replay items" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    for ([_]auth.Provider{ .chatgpt, .claude }) |provider| {
+    for ([_]auth.Api{ .responses, .messages }) |api| {
         var buffer: [128]u8 = undefined;
         var writer: Io.Writer = .fixed(&buffer);
-        var decoder = Decoder.init(provider, std.testing.allocator, arena.allocator(), &writer, null);
+        var decoder = Decoder.init(api, std.testing.allocator, arena.allocator(), &writer, null);
         defer decoder.deinit();
-        try decoder.feed(if (provider == .claude)
+        try decoder.feed(if (api == .messages)
             "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"bash\",\"input\":{}}}"
         else
             "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"bash\",\"arguments\":\"{}\"}}");
         // Tool-only output cannot become an empty assistant history entry.
         try std.testing.expect((try interruptedRound(&decoder, false, error.IncompleteProviderResponse)) == null);
-        try decoder.feed(if (provider == .claude)
+        try decoder.feed(if (api == .messages)
             "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}"
         else
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}");
@@ -3792,7 +4061,7 @@ test "stream decoder identifies event sink failures as local" {
     defer arena.deinit();
     var buffer: [128]u8 = undefined;
     var writer: Io.Writer = .fixed(&buffer);
-    var decoder = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), &writer, .{ .emit = rejectTextDelta });
+    var decoder = Decoder.init(.responses, std.testing.allocator, arena.allocator(), &writer, .{ .emit = rejectTextDelta });
     defer decoder.deinit();
 
     try std.testing.expectError(

@@ -45,6 +45,44 @@ if mode == "astra":
 if mode == "rate_limit":
     sys.stdout.write('HTTP/1.1 429 Too Many Requests\nRetry-After: 30\n\n{"message":"retry"}\n')
     sys.exit(0)
+if mode in ("chat_completions", "chat_tool"):
+    assert sys.argv[sys.argv.index("--url") + 1] == "http://localhost:11434/v1/chat/completions"
+    headers = [json.loads(line.split("=", 1)[1].strip())
+               for line in config.splitlines() if line.startswith("header = ")]
+    assert "Authorization: Bearer local-test-key" in headers, headers
+    assert "X-Title: xaq-test" in headers, headers
+    assert not any(h.lower().startswith("x-api-key") for h in headers), headers
+    assert body["model"] == "qwen3-coder", body["model"]
+    assert body["stream"] is True and body["stream_options"] == {"include_usage": True}
+    assert body["messages"][0]["role"] == "system"
+    assert "provider=ollama" in body["messages"][0]["content"]
+    assert body["reasoning_effort"] == "high", body.get("reasoning_effort")
+    assert body["tools"][0]["type"] == "function" and "function" in body["tools"][0]
+    sys.stdout.write("HTTP/1.1 200 OK\nContent-Type: text/event-stream\n\n")
+    def chunk(delta, finish=None, usage=None):
+        value = {"choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+        if usage is not None:
+            value["usage"] = usage
+        print("data: " + json.dumps(value) + "\n")
+    tool_messages = [m for m in body["messages"] if m.get("role") == "tool"]
+    if mode == "chat_tool" and not tool_messages:
+        chunk({"tool_calls": [{"index": 0, "id": "call_1", "type": "function",
+                               "function": {"name": "bash", "arguments": ""}}]})
+        chunk({"tool_calls": [{"index": 0, "function": {"arguments": json.dumps({"command": "printf tool-ran"})}}]})
+        chunk({}, finish="tool_calls")
+        print("data: [DONE]\n")
+        sys.exit(0)
+    if mode == "chat_tool":
+        assert tool_messages[0]["tool_call_id"] == "call_1", tool_messages
+        assert "tool-ran" in tool_messages[0]["content"], tool_messages
+        assistant = [m for m in body["messages"] if m.get("role") == "assistant"][-1]
+        assert assistant["tool_calls"][0]["function"]["name"] == "bash", assistant
+    chunk({"role": "assistant", "content": ""})
+    chunk({"content": "answer"})
+    chunk({}, finish="stop", usage={"prompt_tokens": 11, "completion_tokens": 2,
+                                   "prompt_tokens_details": {"cached_tokens": 4}})
+    print("data: [DONE]\n")
+    sys.exit(0)
 sys.stdout.write("HTTP/1.1 200 OK\nContent-Type: text/event-stream\n\n")
 def event(value):
     print("data: " + json.dumps(value) + "\n")
@@ -149,6 +187,27 @@ class CliTests(unittest.TestCase):
         self.addCleanup(cleanup)
         return process
 
+    def write_custom_provider(self, **overrides):
+        definition = {
+            "api": "chat_completions",
+            "base_url": "http://localhost:11434/v1/",
+            "api_key_env": "XAQ_TEST_OLLAMA_KEY",
+            "headers": {"X-Title": "xaq-test"},
+            "models": ["qwen3-coder", "llama4"],
+            "context_tokens": 64000,
+            "efforts": ["low", "high"],
+        }
+        definition.update(overrides)
+        settings = self.home / ".config" / "xaq" / "settings.json"
+        settings.write_text(json.dumps({"providers": {"ollama": definition}}))
+
+    def run_custom(self, mode, *extra_args, provider_args=("--provider", "ollama")):
+        environment = self.environment | {"XAQ_TEST_PROVIDER": "ollama", "XAQ_TEST_MODE": mode,
+                                          "XAQ_TEST_OLLAMA_KEY": "local-test-key"}
+        args = [BINARY, *provider_args, *extra_args, "--output-format", "json", "--no-save", "-p", "test response"]
+        return subprocess.run(args, cwd=self.work, env=environment, stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=30)
+
     def request_count(self):
         return len(self.requests.read_text().splitlines()) if self.requests.exists() else 0
 
@@ -160,6 +219,71 @@ class CliTests(unittest.TestCase):
             time.sleep(0.01)
         # Let the HTTP response reach the backoff loop before interrupting it.
         time.sleep(0.1)
+
+    def test_custom_chat_completions_provider_round_trips(self):
+        self.write_custom_provider()
+        result = self.run_custom("chat_completions", "--effort", "high")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["text"], "answer")
+        self.assertEqual(payload["provider"], "ollama")
+        self.assertEqual(payload["model"], "qwen3-coder")
+        self.assertEqual(payload["stop_reason"], "completed")
+        self.assertEqual(payload["usage"], {"input_tokens": 11, "cached_input_tokens": 4, "output_tokens": 2})
+
+    def test_custom_provider_tool_calls_round_trip_as_tool_messages(self):
+        self.write_custom_provider()
+        result = self.run_custom("chat_tool", "--effort", "high")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["text"], "answer")
+        self.assertEqual(payload["tool_calls"], 1)
+        self.assertEqual(payload["num_turns"], 2)
+        self.assertEqual(self.request_count(), 2)
+
+    def test_custom_model_id_selects_its_provider_and_missing_env_fails_cleanly(self):
+        self.write_custom_provider()
+        result = self.run_custom("chat_completions", "--effort", "high", provider_args=("--model", "qwen3-coder"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["provider"], "ollama")
+
+        environment = self.environment | {"XAQ_TEST_PROVIDER": "ollama", "XAQ_TEST_MODE": "chat_completions"}
+        missing = subprocess.run([BINARY, "--provider", "ollama", "--output-format", "json", "--no-save", "-p", "x"],
+                                 cwd=self.work, env=environment, stdin=subprocess.DEVNULL,
+                                 capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("XAQ_TEST_OLLAMA_KEY is not set", missing.stderr)
+        self.assertEqual(self.request_count(), 1)
+
+        unknown = subprocess.run([BINARY, "--provider", "nowhere", "-p", "x"], cwd=self.work, env=environment,
+                                 stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(unknown.returncode, 0)
+        self.assertIn("not configured", unknown.stderr)
+
+    def test_provider_subcommand_writes_settings_without_exposing_keys(self):
+        environment = self.environment
+        add = subprocess.run([BINARY, "provider", "add", "router", "--api", "chat_completions", "--base-url",
+                              "https://openrouter.ai/api/v1", "--api-key-stdin", "--model", "a/b", "--effort", "low"],
+                             cwd=self.work, env=environment, input="sk-from-stdin\n", capture_output=True,
+                             text=True, timeout=30)
+        self.assertEqual(add.returncode, 0, add.stderr)
+        settings = json.loads((self.home / ".config" / "xaq" / "settings.json").read_text())
+        self.assertEqual(settings["providers"]["router"]["api_key"], "sk-from-stdin")
+        self.assertEqual(settings["providers"]["router"]["models"], ["a/b"])
+        listed = subprocess.run([BINARY, "provider", "list"], cwd=self.work, env=environment, stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertIn("router", listed.stdout)
+        self.assertNotIn("sk-from-stdin", listed.stdout)
+        rejected = subprocess.run([BINARY, "provider", "add", "claude", "--api", "messages", "--base-url", "https://x",
+                                   "--model", "m"], cwd=self.work, env=environment, stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True, timeout=30)
+        self.assertEqual(rejected.returncode, 2)
+        removed = subprocess.run([BINARY, "provider", "remove", "router"], cwd=self.work, env=environment,
+                                 stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        settings = json.loads((self.home / ".config" / "xaq" / "settings.json").read_text())
+        self.assertIsNone(settings.get("providers"))
 
     def test_completed_responses(self):
         for provider in PROVIDERS:

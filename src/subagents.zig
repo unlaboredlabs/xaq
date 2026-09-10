@@ -4,6 +4,7 @@ const Io = std.Io;
 const auth = @import("auth.zig");
 const cancel = @import("cancel.zig");
 const models = @import("models.zig");
+const providers = @import("providers.zig");
 
 pub const default_max_concurrent = 4;
 const max_records = 32;
@@ -13,7 +14,11 @@ const stop_grace_ms = 1000;
 pub const Status = enum { queued, running, completed, failed, stopped };
 
 pub const Launch = struct {
+    /// Provider name as passed to a worker's --provider flag.
     provider: []const u8,
+    /// Capabilities of that provider, used to validate model and effort
+    /// overrides. Borrowed from the session for the duration of one call.
+    catalog: providers.Catalog,
     model: []const u8,
     effort: ?[]const u8,
     fast: bool,
@@ -321,10 +326,8 @@ pub const Manager = struct {
         const background = optionalBool(args, "run_in_background") orelse self.config.background_by_default;
         const model_override = optionalString(args, "model");
         const selected_model = model_override orelse launch.model;
-        const provider = auth.Provider.parse(launch.provider) orelse
-            return rejection(gpa, "invalid_runtime", "the active provider is invalid", launch, self.config);
         const inherits_model = model_override == null or std.mem.eql(u8, selected_model, launch.model);
-        if (!inherits_model and models.find(provider, selected_model) == null) {
+        if (!inherits_model and !launch.catalog.lists(selected_model)) {
             const profile = models.findAny(selected_model);
             const code = if (profile == null) "unknown_model" else "cross_provider_model";
             const message = if (profile) |known|
@@ -339,7 +342,7 @@ pub const Manager = struct {
         if (effort_override) |value| {
             const effort = models.Effort.parse(value) orelse
                 return rejection(gpa, "invalid_effort", "effort must be low, medium, high, xhigh, max, or ultra", launch, self.config);
-            if (!models.supportsEffort(provider, selected_model, effort)) {
+            if (!launch.catalog.supportsEffort(selected_model, effort)) {
                 const message = try std.fmt.allocPrint(gpa, "effort {s} is not supported by model {s}", .{ value, selected_model });
                 defer gpa.free(message);
                 return rejection(gpa, "unsupported_effort", message, launch, self.config);
@@ -353,6 +356,7 @@ pub const Manager = struct {
 
         const record = try self.createRecord(gpa, prompt, description, .{
             .provider = launch.provider,
+            .catalog = launch.catalog,
             .model = selected_model,
             .effort = selected_effort,
             .fast = inherits_model and launch.fast,
@@ -798,12 +802,8 @@ fn rejection(gpa: std.mem.Allocator, code: []const u8, message: []const u8, laun
     try js.write(config.max_concurrent);
     try js.objectField("valid_models");
     try js.beginArray();
-    if (auth.Provider.parse(launch.provider)) |provider| {
-        for (models.choices(provider)) |model| try js.write(model);
-        if (models.find(provider, launch.model) == null) try js.write(launch.model);
-    } else {
-        try js.write(launch.model);
-    }
+    for (launch.catalog.choices()) |model| try js.write(model);
+    if (!launch.catalog.lists(launch.model)) try js.write(launch.model);
     try js.endArray();
     try js.endObject();
     return out.toOwnedSlice();
@@ -998,7 +998,7 @@ test "panel snapshot tracks unseen agents and drops consumed ones" {
         \\{"prompt":"inspect auth","description":"Inspect auth"}
     , .{});
     defer parsed.deinit();
-    const launch: Launch = .{ .provider = "chatgpt", .model = "test-model", .effort = "medium", .fast = false };
+    const launch: Launch = .{ .provider = "chatgpt", .catalog = .builtin(.chatgpt), .model = "test-model", .effort = "medium", .fast = false };
     const started = try manager.execute(std.testing.allocator, "Agent", parsed.value, launch);
     defer std.testing.allocator.free(started);
 
@@ -1032,7 +1032,7 @@ test "worker status files feed record activity" {
         \\{"prompt":"inspect auth","description":"Inspect auth"}
     , .{});
     defer parsed.deinit();
-    const launch: Launch = .{ .provider = "chatgpt", .model = "test-model", .effort = null, .fast = false };
+    const launch: Launch = .{ .provider = "chatgpt", .catalog = .builtin(.chatgpt), .model = "test-model", .effort = null, .fast = false };
     const started = try manager.execute(std.testing.allocator, "Agent", parsed.value, launch);
     defer std.testing.allocator.free(started);
     const record = manager.records.items[0];
@@ -1079,7 +1079,7 @@ test "agent launch validates runtime choices before spawning" {
     defer manager.deinit();
     std.testing.allocator.free(manager.executable);
     manager.executable = try std.testing.allocator.dupeZ(u8, "/bin/echo");
-    const launch: Launch = .{ .provider = "claude", .model = "claude-fable-5", .effort = "high", .fast = false };
+    const launch: Launch = .{ .provider = "claude", .catalog = .builtin(.claude), .model = "claude-fable-5", .effort = "high", .fast = false };
 
     var cross_args = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
         \\{"prompt":"inspect auth","description":"Inspect auth","model":"gpt-6-astra"}
@@ -1136,7 +1136,7 @@ test "ChatGPT workers can select Astra with ultra effort" {
     defer manager.deinit();
     std.testing.allocator.free(manager.executable);
     manager.executable = try std.testing.allocator.dupeZ(u8, "/bin/echo");
-    const launch: Launch = .{ .provider = "chatgpt", .model = "gpt-5.6-sol", .effort = "high", .fast = false };
+    const launch: Launch = .{ .provider = "chatgpt", .catalog = .builtin(.chatgpt), .model = "gpt-5.6-sol", .effort = "high", .fast = false };
 
     var unsupported = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
         \\{"prompt":"inspect auth","description":"Inspect auth","effort":"ultra"}
@@ -1171,7 +1171,7 @@ test "manager config disables launches and changes the background default" {
         \\{"prompt":"inspect auth","description":"Inspect auth"}
     , .{});
     defer parsed.deinit();
-    const launch: Launch = .{ .provider = "chatgpt", .model = "test-model", .effort = null, .fast = false };
+    const launch: Launch = .{ .provider = "chatgpt", .catalog = .builtin(.chatgpt), .model = "test-model", .effort = null, .fast = false };
     const disabled = try manager.execute(std.testing.allocator, "Agent", parsed.value, launch);
     defer std.testing.allocator.free(disabled);
     var disabled_json = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, disabled, .{});
@@ -1198,6 +1198,7 @@ test "foreground and background agents return worker results" {
     defer parsed.deinit();
     const result = try manager.execute(std.testing.allocator, "Agent", parsed.value, .{
         .provider = "chatgpt",
+        .catalog = .builtin(.chatgpt),
         .model = "test-model",
         .effort = null,
         .fast = false,
@@ -1214,6 +1215,7 @@ test "foreground and background agents return worker results" {
     defer background_args.deinit();
     const started = try manager.execute(std.testing.allocator, "Agent", background_args.value, .{
         .provider = "chatgpt",
+        .catalog = .builtin(.chatgpt),
         .model = "test-model",
         .effort = null,
         .fast = false,
@@ -1230,6 +1232,7 @@ test "foreground and background agents return worker results" {
     defer result_args.deinit();
     const background_result = try manager.execute(std.testing.allocator, "get_subagent_result", result_args.value, .{
         .provider = "chatgpt",
+        .catalog = .builtin(.chatgpt),
         .model = "test-model",
         .effort = null,
         .fast = false,
@@ -1242,6 +1245,7 @@ test "foreground and background agents return worker results" {
     for (0..default_max_concurrent + 1) |index| {
         const launched = try manager.execute(std.testing.allocator, "Agent", background_args.value, .{
             .provider = "chatgpt",
+            .catalog = .builtin(.chatgpt),
             .model = "test-model",
             .effort = null,
             .fast = false,
@@ -1262,6 +1266,7 @@ test "foreground and background agents return worker results" {
     defer queued_args.deinit();
     const queued_result = try manager.execute(std.testing.allocator, "get_subagent_result", queued_args.value, .{
         .provider = "chatgpt",
+        .catalog = .builtin(.chatgpt),
         .model = "test-model",
         .effort = null,
         .fast = false,
@@ -1286,7 +1291,7 @@ test "a worker wrapper killed before its completion file releases the queue" {
         \\{"prompt":"finish","description":"Killed wrapper"}
     , .{});
     defer args.deinit();
-    const launch: Launch = .{ .provider = "chatgpt", .model = "test-model", .effort = null, .fast = false };
+    const launch: Launch = .{ .provider = "chatgpt", .catalog = .builtin(.chatgpt), .model = "test-model", .effort = null, .fast = false };
     for (0..2) |_| {
         const launched = try manager.execute(std.testing.allocator, "Agent", args.value, launch);
         std.testing.allocator.free(launched);
@@ -1319,7 +1324,7 @@ test "foreground workers obey the same concurrency limit as background workers" 
         \\{"prompt":"finish","description":"Background worker"}
     , .{});
     defer background.deinit();
-    const launch: Launch = .{ .provider = "chatgpt", .model = "test-model", .effort = null, .fast = false };
+    const launch: Launch = .{ .provider = "chatgpt", .catalog = .builtin(.chatgpt), .model = "test-model", .effort = null, .fast = false };
     const started = try manager.execute(std.testing.allocator, "Agent", background.value, launch);
     defer std.testing.allocator.free(started);
     for (0..100) |_| {
@@ -1358,6 +1363,7 @@ test "response allocation failure keeps ownership of a launched worker" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = probe.alloc_index });
     try std.testing.expectError(error.WriteFailed, manager.execute(failing.allocator(), "Agent", args.value, .{
         .provider = "chatgpt",
+        .catalog = .builtin(.chatgpt),
         .model = "test-model",
         .effort = null,
         .fast = false,
@@ -1376,7 +1382,7 @@ test "failed result delivery leaves completed workers available" {
         \\{"prompt":"finish","description":"Retry delivery"}
     , .{});
     defer args.deinit();
-    const launch: Launch = .{ .provider = "chatgpt", .model = "test-model", .effort = null, .fast = false };
+    const launch: Launch = .{ .provider = "chatgpt", .catalog = .builtin(.chatgpt), .model = "test-model", .effort = null, .fast = false };
     for (0..2) |_| {
         const started = try manager.execute(std.testing.allocator, "Agent", args.value, launch);
         std.testing.allocator.free(started);
@@ -1441,7 +1447,7 @@ test "disabling subagents stops queued workers and result waits return" {
         \\{"prompt":"finish","description":"Queued worker"}
     , .{});
     defer args.deinit();
-    const launch: Launch = .{ .provider = "chatgpt", .model = "test-model", .effort = null, .fast = false };
+    const launch: Launch = .{ .provider = "chatgpt", .catalog = .builtin(.chatgpt), .model = "test-model", .effort = null, .fast = false };
     for (0..2) |_| {
         const started = try manager.execute(std.testing.allocator, "Agent", args.value, launch);
         std.testing.allocator.free(started);
@@ -1500,6 +1506,7 @@ test "stopping a worker interrupts and reaps its separate tool group" {
     defer args.deinit();
     const launched = try manager.execute(std.testing.allocator, "Agent", args.value, .{
         .provider = "chatgpt",
+        .catalog = .builtin(.chatgpt),
         .model = "test-model",
         .effort = null,
         .fast = false,
@@ -1555,6 +1562,7 @@ test "stopping all workers shares one bounded grace period" {
     for (0..3) |_| {
         const started = try manager.execute(std.testing.allocator, "Agent", args.value, .{
             .provider = "chatgpt",
+            .catalog = .builtin(.chatgpt),
             .model = "test-model",
             .effort = null,
             .fast = false,
