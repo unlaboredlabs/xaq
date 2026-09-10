@@ -7,6 +7,8 @@ const image_input = @import("image.zig");
 const input_mod = @import("input.zig");
 const log = @import("log.zig");
 const models = @import("models.zig");
+const providers = @import("providers.zig");
+const settings_mod = @import("settings.zig");
 const state_mod = @import("state.zig");
 const term = @import("term.zig");
 const threads = @import("threads.zig");
@@ -34,6 +36,7 @@ const usage =
     \\
     \\  xaq login <chatgpt|claude|grok>
     \\  xaq logout <chatgpt|claude|grok>
+    \\  xaq provider list | show NAME | add NAME [OPTIONS] | remove NAME
     \\  xaq update
     \\  xaq [--provider NAME] [--model ID] [--image FILE] [--effort LEVEL] [--fast] [--plain] [--no-save] [--output-format FORMAT] [PROMPT]
     \\  xaq --continue | --resume THREAD
@@ -52,7 +55,8 @@ const usage =
     \\or /fast (initially provider=chatgpt with its default model); flags
     \\override for one invocation without changing what is remembered.
     \\A recognized --model ID implies its provider, so --provider is only
-    \\needed for model IDs xaq does not know.
+    \\needed for model IDs xaq does not know. --provider also accepts the
+    \\name of a custom endpoint from `xaq provider list`.
     \\
 ;
 
@@ -76,15 +80,30 @@ fn applyRememberedSelection(remembered: ?state_mod.Selection, model: ?[]const u8
     };
 }
 
-/// A remembered provider whose login has since been removed must not turn
-/// every new session into a startup error; prefer a still-connected one.
-/// Credential-store read failures fall through to the remembered choice.
-fn connectedProvider(gpa: std.mem.Allocator, io: Io, home: []const u8, last: auth.Provider) auth.Provider {
-    if (auth.isLoggedIn(gpa, io, home, last) catch true) return last;
-    for (std.enums.values(auth.Provider)) |candidate| {
-        if (auth.isLoggedIn(gpa, io, home, candidate) catch false) return candidate;
+/// A remembered provider whose login (or settings entry) has since been
+/// removed must not turn every new session into a startup error; prefer a
+/// still-connected one. Credential-store read failures fall through to the
+/// remembered choice.
+fn connectedProvider(gpa: std.mem.Allocator, io: Io, home: []const u8, config: *const settings_mod.Config, last: providers.Ref) providers.Ref {
+    if (last.provider == .custom) {
+        if (config.customProvider(last.name()) != null) return last;
+    } else if (auth.isLoggedIn(gpa, io, home, last.provider) catch true) {
+        return last;
     }
-    return last;
+    for (auth.Provider.builtin) |candidate| {
+        if (auth.isLoggedIn(gpa, io, home, candidate) catch false) return .builtin(candidate);
+    }
+    return if (last.provider == .custom) .builtin(.chatgpt) else last;
+}
+
+/// The custom provider whose model list contains `id`, so a bare --model
+/// can select a custom endpoint the way catalog IDs select subscriptions.
+fn customProviderListing(config: *const settings_mod.Config, id: []const u8) ?providers.Ref {
+    for (config.customProviderNames()) |name| {
+        const definition = config.customProvider(name) orelse continue;
+        if (definition.listsModel(id)) return .{ .provider = .custom, .custom = name };
+    }
+    return null;
 }
 
 /// Options whose next argument is a value, for the help/version pre-scan.
@@ -190,7 +209,7 @@ const JsonOutput = struct {
         switch (event_value) {
             .run_start => |started| {
                 try self.output.writeAll("{\"type\":\"start\",\"provider\":");
-                try writeJsonString(self.output, @tagName(started.provider));
+                try writeJsonString(self.output, started.provider);
                 try self.output.writeAll(",\"model\":");
                 try writeJsonString(self.output, started.model);
                 try self.output.writeAll(",\"thread_id\":");
@@ -230,7 +249,7 @@ const JsonOutput = struct {
                 try self.output.writeAll(",\"stop_reason\":");
                 try writeJsonString(self.output, @tagName(completed.stop_reason));
                 try self.output.writeAll(",\"provider\":");
-                try writeJsonString(self.output, @tagName(completed.provider));
+                try writeJsonString(self.output, completed.provider);
                 try self.output.writeAll(",\"model\":");
                 try writeJsonString(self.output, completed.model);
                 try self.output.writeAll(",\"thread_id\":");
@@ -310,6 +329,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
     const early_action = findEarlyAction(minimal.args);
     if (early_action == .invalid_arguments) return error.InvalidArguments;
     const environment = try scanStartupEnvironment(minimal.environ);
+    providers.environ = minimal.environ;
 
     var threaded: Io.Threaded = .init(gpa, .{
         .argv0 = .init(minimal.args),
@@ -386,6 +406,17 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
         }
         return;
     }
+    if (args.len > 1 and std.mem.eql(u8, args[1], "provider")) {
+        const stdout_tty = Io.File.stdout().isTty(io) catch false;
+        const stdin_tty = Io.File.stdin().isTty(io) catch false;
+        term.detect(stdout_tty, environment.no_color, environment.term);
+        input_mod.interactive = stdout_tty and stdin_tty;
+        const code = try providers.cli(gpa, io, home, args[2..], input, output, errout);
+        output.flush() catch {};
+        errout.flush() catch {};
+        if (code != 0) std.process.exit(code);
+        return;
+    }
     if (args.len > 1 and std.mem.eql(u8, args[1], "threads")) {
         if (args.len != 2) fatal(io, "threads takes no arguments", .{});
         var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -427,7 +458,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
         return;
     }
 
-    var provider_arg: ?auth.Provider = null;
+    var provider_arg: ?providers.Ref = null;
     var model: ?[]const u8 = null;
     var effort: ?agent.Effort = null;
     var fast = false;
@@ -448,8 +479,8 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
         if (std.mem.eql(u8, args[i], "--provider")) {
             i += 1;
             if (i >= args.len) fatal(io, "--provider needs a value", .{});
-            provider_arg = auth.Provider.parse(args[i]) orelse
-                fatal(io, "unknown provider '{s}' (chatgpt, claude, or grok)", .{args[i]});
+            provider_arg = providers.Ref.parse(args[i]) orelse
+                fatal(io, "unknown provider '{s}' (chatgpt, claude, grok, or a name from `xaq provider list`)", .{args[i]});
         } else if (std.mem.eql(u8, args[i], "--model")) {
             i += 1;
             if (i >= args.len) fatal(io, "--model needs a value", .{});
@@ -521,16 +552,31 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
     // restores its own model/effort/fast, so memory stays out of resumes.
     var remembered = try state_mod.load(gpa, io, home);
     defer remembered.deinit();
-    var provider: auth.Provider = provider_arg orelse .chatgpt;
+    // Custom endpoints live in settings, which also validates --provider
+    // names and supplies capability limits for remembered selections.
+    var user_settings = settings_mod.load(gpa, io, home) catch |err| switch (err) {
+        error.InvalidSettings => fatal(io, "~/.config/xaq/settings.json is invalid; fix or remove the offending entry", .{}),
+        else => return err,
+    };
+    defer user_settings.deinit();
+    const config = &user_settings.value;
+    var provider: providers.Ref = provider_arg orelse .builtin(.chatgpt);
+    const effort_explicit = effort != null;
+    const fast_explicit = fast;
     if (resume_id == null) {
         if (provider_arg == null) {
             // A catalog --model ID names its provider; treat the pair as
-            // one choice. Unknown IDs keep the remembered provider so
-            // snapshot names remain usable.
-            if (if (model) |id| models.findAny(id) else null) |profile| {
-                provider = profile.provider;
-            } else if (remembered.value.provider) |last| {
-                provider = connectedProvider(gpa, io, home, last);
+            // one choice. Custom providers that list the ID count too.
+            // Unknown IDs keep the remembered provider so snapshot names
+            // remain usable.
+            const listed: ?providers.Ref = if (model) |id|
+                (if (models.findAny(id)) |profile| providers.Ref.builtin(profile.provider) else customProviderListing(config, id))
+            else
+                null;
+            if (listed) |ref| {
+                provider = ref;
+            } else if (remembered.value.rememberedRef()) |last| {
+                provider = connectedProvider(gpa, io, home, config, last);
             }
         }
         const resolved = applyRememberedSelection(remembered.value.selection(provider), model, effort, fast);
@@ -538,6 +584,20 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
         effort = resolved.effort;
         fast = resolved.fast;
     }
+    if (provider.provider == .custom and config.customProvider(provider.name()) == null) {
+        fatal(io, "custom provider '{s}' is not configured; see: xaq provider list", .{provider.name()});
+    }
+    const catalog = providers.Catalog.resolve(provider, config);
+    const default_model = catalog.defaultModel();
+    if (model == null and default_model.len == 0) {
+        fatal(io, "custom provider '{s}' lists no models; pass --model ID", .{provider.name()});
+    }
+    // Remembered custom selections are sanitized here rather than at load
+    // time, because their limits come from settings.
+    if (!effort_explicit) if (effort) |value| if (!catalog.supportsEffort(model orelse default_model, value)) {
+        effort = null;
+    };
+    if (!fast_explicit and fast and !catalog.supportsFast(model orelse default_model)) fast = false;
 
     const stdin_tty = Io.File.stdin().isTty(io) catch false;
     var stdin_prompt: ?[]u8 = null;
@@ -589,7 +649,7 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
         else => return err,
     };
     defer image_input.freeImages(gpa, images);
-    image_input.validateProvider(provider, images) catch fatal(io, "Grok accepts PNG and JPEG images only", .{});
+    image_input.validateProvider(provider.provider, images) catch fatal(io, "Grok accepts PNG and JPEG images only", .{});
     // Styling follows stdout alone so one-shot runs on a terminal are
     // dimmed consistently; the raw-mode editor still needs both ends.
     const stdout_tty = Io.File.stdout().isTty(io) catch false;
@@ -619,8 +679,8 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
             try agent_output.print("{s}/help for commands · ctrl-v or drop images · wheel or pgup/pgdn history · ctrl-d exits{s}\n", .{ term.dim(), term.reset() });
         } else {
             try agent_output.print("{s}xaq · {s}/{s} · {s}{s}\n{s}/help for commands · ctrl-v or drop images · ctrl-d exits{s}\n", .{
-                term.bold(),  @tagName(provider), model orelse agent.defaultModel(provider),
-                cwd,          term.reset(),       term.dim(),
+                term.bold(),  provider.name(), model orelse default_model,
+                cwd,          term.reset(),    term.dim(),
                 term.reset(),
             });
         }
@@ -642,8 +702,9 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
     agent.run(gpa, io, .{
         .home = home,
         .cwd = cwd,
-        .provider = provider,
-        .model = model orelse agent.defaultModel(provider),
+        .provider = provider.provider,
+        .custom = provider.custom,
+        .model = model orelse default_model,
         .effort = effort,
         .fast = fast,
         .first_prompt = prompt,
@@ -669,8 +730,12 @@ pub fn main(minimal: std.process.Init.Minimal) !void {
         switch (err) {
             error.NotLoggedIn => {
                 var message_buffer: [128]u8 = undefined;
-                const message = try std.fmt.bufPrint(&message_buffer, "not logged in; run: xaq login {s}", .{@tagName(provider)});
+                const message = try std.fmt.bufPrint(&message_buffer, "not logged in; run: xaq login {s}", .{provider.name()});
                 try writeRunError(output_format, &json_output, output, message);
+                std.process.exit(1);
+            },
+            error.UnknownProvider => {
+                try writeRunError(output_format, &json_output, output, "custom provider is not configured; see: xaq provider list");
                 std.process.exit(1);
             },
             error.NoThreads => {
@@ -759,6 +824,7 @@ test {
     _ = @import("input.zig");
     _ = @import("log.zig");
     _ = @import("models.zig");
+    _ = @import("providers.zig");
     _ = @import("settings.zig");
     _ = @import("spin.zig");
     _ = @import("state.zig");
@@ -868,11 +934,11 @@ test "json output is one final result object" {
     var output: Io.Writer = .fixed(&storage);
     var json_output: JsonOutput = .{ .output = &output, .format = .json };
 
-    try json_output.writeEvent(.{ .run_start = .{ .provider = .chatgpt, .model = "gpt-test", .thread_id = null } });
+    try json_output.writeEvent(.{ .run_start = .{ .provider = "chatgpt", .model = "gpt-test", .thread_id = null } });
     try json_output.writeEvent(.{ .text_delta = "ignored delta" });
     try json_output.writeEvent(.{ .completed = .{
         .text = "done\ncleanly",
-        .provider = .chatgpt,
+        .provider = "chatgpt",
         .model = "gpt-test",
         .thread_id = null,
         .usage = .{ .input = 12, .cached = 3, .output = 4 },
@@ -894,7 +960,7 @@ test "json output identifies an interrupted response" {
 
     try json_output.writeEvent(.{ .completed = .{
         .text = "partial",
-        .provider = .claude,
+        .provider = "claude",
         .model = "claude-test",
         .thread_id = "thread",
         .usage = .{ .input = 3, .output = 1 },
@@ -915,7 +981,7 @@ test "streaming json emits typed lines and an authoritative end" {
     var json_output: JsonOutput = .{ .output = &output, .format = .streaming_json };
     const call: agent.ToolCall = .{ .id = "call_1", .name = "bash", .arguments = "{\"command\":\"pwd\"}" };
 
-    try json_output.writeEvent(.{ .run_start = .{ .provider = .grok, .model = "grok-test", .thread_id = "thread" } });
+    try json_output.writeEvent(.{ .run_start = .{ .provider = "grok", .model = "grok-test", .thread_id = "thread" } });
     try json_output.writeEvent(.{ .round_start = .{ .number = 1 } });
     try json_output.writeEvent(.{ .text_delta = "checking" });
     try json_output.writeEvent(.{ .tool_start = call });
@@ -923,7 +989,7 @@ test "streaming json emits typed lines and an authoritative end" {
     try json_output.writeEvent(.{ .usage = .{ .input = 5, .cached = 2, .output = 1 } });
     try json_output.writeEvent(.{ .completed = .{
         .text = "finished",
-        .provider = .grok,
+        .provider = "grok",
         .model = "grok-test",
         .thread_id = "thread",
         .usage = .{ .input = 5, .cached = 2, .output = 1 },

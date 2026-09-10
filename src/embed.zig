@@ -12,14 +12,19 @@ const auth = @import("auth.zig");
 const cancel_mod = @import("cancel.zig");
 const image_input = @import("image.zig");
 const models = @import("models.zig");
+const providers = @import("providers.zig");
 const request_builder = @import("request.zig");
+const settings_mod = @import("settings.zig");
 const stream = @import("stream.zig");
 const tool_runtime = @import("tools.zig");
 const transport_runtime = @import("transport.zig");
 const types = @import("types.zig");
 
-pub const api_version = 2;
+pub const api_version = 3;
 pub const Provider = auth.Provider;
+pub const Api = auth.Api;
+/// Definition of a user-supplied endpoint; see `Options.custom`.
+pub const CustomProvider = settings_mod.CustomProvider;
 pub const Credential = auth.Credential;
 pub const Effort = models.Effort;
 pub const ToolCall = types.ToolCall;
@@ -37,6 +42,7 @@ pub const StreamLineFn = transport_runtime.StreamFn;
 
 pub const Request = struct {
     provider: Provider,
+    api: Api,
     url: []const u8,
     content_type: []const u8,
     headers: []const Header,
@@ -132,6 +138,11 @@ pub const EventSink = struct {
 pub const Options = struct {
     io: Io,
     provider: Provider = .chatgpt,
+    /// Required when `provider` is `.custom`. The host owns the definition
+    /// and `custom_name`, which must outlive the agent. The credential's
+    /// `access` field carries the endpoint's API key (empty for none).
+    custom: ?*const CustomProvider = null,
+    custom_name: []const u8 = "custom",
     model: ?[]const u8 = null,
     effort: ?Effort = null,
     fast: bool = false,
@@ -206,6 +217,7 @@ pub const Agent = struct {
     gpa: std.mem.Allocator,
     io: Io,
     provider: Provider,
+    catalog: providers.Catalog,
     model: []u8,
     effort: ?Effort,
     fast: bool,
@@ -236,15 +248,23 @@ pub const Agent = struct {
         if (options.credential == null and options.credential_source == null) return error.CredentialRequired;
         if (options.tools.len > 0 and options.tool_host == null) return error.ToolHostRequired;
         if (options.max_tool_rounds == 0) return error.InvalidToolRoundLimit;
-        const model = options.model orelse models.defaultModel(options.provider);
-        if (options.effort) |effort| if (!models.supportsEffort(options.provider, model, effort)) return error.InvalidEffortForModel;
-        if (options.fast and !models.supportsFast(options.provider, model)) return error.InvalidFastForModel;
+        if (options.provider == .custom and options.custom == null) return error.CustomProviderRequired;
+        if (options.provider != .custom and options.custom != null) return error.CustomProviderRequired;
+        const catalog: providers.Catalog = .{
+            .ref = .{ .provider = options.provider, .custom = if (options.provider == .custom) options.custom_name else null },
+            .definition = options.custom,
+        };
+        const model = options.model orelse catalog.defaultModel();
+        if (model.len == 0) return error.ModelRequired;
+        if (options.effort) |effort| if (!catalog.supportsEffort(model, effort)) return error.InvalidEffortForModel;
+        if (options.fast and !catalog.supportsFast(model)) return error.InvalidFastForModel;
         try validateToolDefinitions(gpa, options.tools, options.local_tools);
 
         var result: Agent = .{
             .gpa = gpa,
             .io = options.io,
             .provider = options.provider,
+            .catalog = catalog,
             .model = try gpa.dupe(u8, model),
             .effort = options.effort,
             .fast = options.fast,
@@ -331,8 +351,8 @@ pub const Agent = struct {
 
     pub fn setModel(self: *Agent, model: []const u8) !void {
         if (self.active.load(.acquire)) return error.PromptActive;
-        if (self.effort) |effort| if (!models.supportsEffort(self.provider, model, effort)) return error.InvalidEffortForModel;
-        if (self.fast and !models.supportsFast(self.provider, model)) return error.InvalidFastForModel;
+        if (self.effort) |effort| if (!self.catalog.supportsEffort(model, effort)) return error.InvalidEffortForModel;
+        if (self.fast and !self.catalog.supportsFast(model)) return error.InvalidFastForModel;
         const replacement = try self.gpa.dupe(u8, model);
         self.gpa.free(self.model);
         self.model = replacement;
@@ -340,13 +360,13 @@ pub const Agent = struct {
 
     pub fn setEffort(self: *Agent, effort: ?Effort) !void {
         if (self.active.load(.acquire)) return error.PromptActive;
-        if (effort) |value| if (!models.supportsEffort(self.provider, self.model, value)) return error.InvalidEffortForModel;
+        if (effort) |value| if (!self.catalog.supportsEffort(self.model, value)) return error.InvalidEffortForModel;
         self.effort = effort;
     }
 
     pub fn setFast(self: *Agent, fast: bool) !void {
         if (self.active.load(.acquire)) return error.PromptActive;
-        if (fast and !models.supportsFast(self.provider, self.model)) return error.InvalidFastForModel;
+        if (fast and !self.catalog.supportsFast(self.model)) return error.InvalidFastForModel;
         self.fast = fast;
     }
 
@@ -469,7 +489,7 @@ pub const Agent = struct {
         defer request_arena.deinit();
         const body = try request_builder.build(
             request_arena.allocator(),
-            self.provider,
+            self.catalog.target(),
             self.model,
             self.effort,
             self.fast,
@@ -492,7 +512,7 @@ pub const Agent = struct {
             if (self.cancellation.isRequested()) return error.Cancelled;
             var delta_sink: DeltaSink = .{ .agent = self, .output = output };
             var decoder = stream.Decoder.init(
-                self.provider,
+                self.catalog.api(),
                 self.gpa,
                 persist,
                 .{ .context = &delta_sink, .on_delta = emitDelta },
@@ -531,6 +551,7 @@ pub const Agent = struct {
         return switch (self.provider) {
             .chatgpt => common.post_stream(common.context, arena, self.io, .{
                 .provider = self.provider,
+                .api = .responses,
                 .url = "https://chatgpt.com/backend-api/codex/responses",
                 .content_type = "application/json",
                 .headers = &.{
@@ -547,6 +568,7 @@ pub const Agent = struct {
             }, decoder, decodeLine),
             .claude => common.post_stream(common.context, arena, self.io, .{
                 .provider = self.provider,
+                .api = .messages,
                 .url = "https://api.anthropic.com/v1/messages",
                 .content_type = "application/json",
                 .headers = &.{
@@ -562,6 +584,7 @@ pub const Agent = struct {
             }, decoder, decodeLine),
             .grok => common.post_stream(common.context, arena, self.io, .{
                 .provider = self.provider,
+                .api = .responses,
                 .url = "https://api.x.ai/v1/responses",
                 .content_type = "application/json",
                 .headers = &.{
@@ -572,6 +595,18 @@ pub const Agent = struct {
                 .body = body,
                 .cancellation = &self.cancellation,
             }, decoder, decodeLine),
+            .custom => blk: {
+                const definition = self.catalog.definition.?;
+                break :blk common.post_stream(common.context, arena, self.io, .{
+                    .provider = .custom,
+                    .api = definition.api,
+                    .url = try providers.url(arena, definition),
+                    .content_type = "application/json",
+                    .headers = try providers.headers(arena, definition, credential.access),
+                    .body = body,
+                    .cancellation = &self.cancellation,
+                }, decoder, decodeLine);
+            },
         };
     }
 
@@ -881,8 +916,8 @@ test "host tool text stays UTF-8 and bounded before provider serialization" {
         } else {
             try std.testing.expectEqualStrings("before\u{fffd}after", result);
         }
-        for (std.enums.values(Provider)) |provider| {
-            const body = try request_builder.build(arena.allocator(), provider, models.defaultModel(provider), null, false, .{ .include_builtin = false }, "/work", "", &.{.{ .results = &.{.{ .id = "call_1", .text = result }} }});
+        for (Provider.builtin) |provider| {
+            const body = try request_builder.build(arena.allocator(), .builtin(provider), models.defaultModel(provider), null, false, .{ .include_builtin = false }, "/work", "", &.{.{ .results = &.{.{ .id = "call_1", .text = result }} }});
             const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{});
             const items = parsed.object.get(if (provider == .claude) "messages" else "input").?.array.items;
             const item = items[items.len - 1];
@@ -1267,4 +1302,69 @@ test "host callbacks cancel before the next request or tool side effect" {
         try std.testing.expectEqual(@as(usize, 0), embedded.history().len);
         try std.testing.expectEqual(Usage{}, embedded.usage());
     }
+}
+
+test "embedded agents reach custom Chat Completions endpoints with host credentials" {
+    const Fake = struct {
+        fn post(_: ?*anyopaque, gpa: std.mem.Allocator, _: Io, request: Request, line_context: ?*anyopaque, on_line: StreamLineFn) !Response {
+            try std.testing.expectEqual(Provider.custom, request.provider);
+            try std.testing.expectEqual(Api.chat_completions, request.api);
+            try std.testing.expectEqualStrings("http://localhost:11434/v1/chat/completions", request.url);
+            var saw_key = false;
+            var saw_title = false;
+            for (request.headers) |header| {
+                if (std.mem.eql(u8, header.name, "Authorization")) saw_key = std.mem.eql(u8, header.value, "Bearer local-key");
+                if (std.mem.eql(u8, header.name, "X-Title")) saw_title = std.mem.eql(u8, header.value, "embed");
+            }
+            try std.testing.expect(saw_key and saw_title);
+            try std.testing.expect(std.mem.indexOf(u8, request.body, "\"model\":\"qwen3-coder\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, request.body, "\"reasoning_effort\":\"high\"") != null);
+            try on_line(line_context, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}");
+            try on_line(line_context, "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1}}");
+            try on_line(line_context, "data: [DONE]");
+            return .{ .status = 200, .body = try gpa.dupe(u8, "") };
+        }
+    };
+    var threaded: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer threaded.deinit();
+    var extra: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+    defer extra.deinit(std.testing.allocator);
+    try extra.put(std.testing.allocator, "X-Title", "embed");
+    const definition: CustomProvider = .{
+        .api = .chat_completions,
+        .base_url = "http://localhost:11434/v1",
+        .headers = .{ .map = extra },
+        .models = &.{"qwen3-coder"},
+        .efforts = &.{.high},
+    };
+    try std.testing.expectError(error.CustomProviderRequired, Agent.init(std.testing.allocator, .{
+        .io = threaded.io(),
+        .cwd = "/workspace",
+        .provider = .custom,
+        .credential = .{ .access = "local-key", .refresh = "", .expires = 0 },
+    }));
+    try std.testing.expectError(error.InvalidFastForModel, Agent.init(std.testing.allocator, .{
+        .io = threaded.io(),
+        .cwd = "/workspace",
+        .provider = .custom,
+        .custom = &definition,
+        .custom_name = "ollama",
+        .fast = true,
+        .credential = .{ .access = "local-key", .refresh = "", .expires = 0 },
+    }));
+    var embedded = try Agent.init(std.testing.allocator, .{
+        .io = threaded.io(),
+        .cwd = "/workspace",
+        .provider = .custom,
+        .custom = &definition,
+        .custom_name = "ollama",
+        .effort = .high,
+        .credential = .{ .access = "local-key", .refresh = "", .expires = 0 },
+        .transport = .{ .post_stream = Fake.post },
+    });
+    defer embedded.deinit();
+    try std.testing.expectEqualStrings("qwen3-coder", embedded.model);
+    const turn = try embedded.prompt("hello", .{});
+    try std.testing.expectEqualStrings("hi", turn.text);
+    try std.testing.expectEqual(@as(u64, 3), turn.usage.input);
 }

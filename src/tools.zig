@@ -44,39 +44,29 @@ pub const ExecuteContext = struct {
     cancellation: ?*cancel.Token = null,
 };
 
+/// Tool schema envelope per wire format: Responses lists flat function
+/// objects, Anthropic uses `input_schema`, and Chat Completions nests the
+/// function under `function`.
+pub const Shape = enum {
+    responses,
+    claude,
+    chat,
+
+    pub fn forApi(api: auth.Api) Shape {
+        return switch (api) {
+            .responses => .responses,
+            .messages => .claude,
+            .chat_completions => .chat,
+        };
+    }
+};
+
 pub fn schemas(s: *std.json.Stringify, web_enabled: bool) !void {
     return schemasWithOptions(s, .{ .web_enabled = web_enabled });
 }
 
 pub fn schemasWithOptions(s: *std.json.Stringify, options: SchemaOptions) !void {
-    try s.beginArray();
-    if (options.include_builtin) {
-        try schema(s, "read", "Read a text file. Paths may be relative or absolute.",
-            \\{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":false}
-        );
-        try schema(s, "bash", "Run a shell command in the current directory with full host permissions.",
-            \\{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer","minimum":1,"maximum":3600}},"required":["command"],"additionalProperties":false}
-        );
-    }
-    if (options.include_builtin and options.write_enabled) {
-        try schema(s, "edit", "Apply exact, non-overlapping text replacements to a file.",
-            \\{"type":"object","properties":{"path":{"type":"string"},"edits":{"type":"array","items":{"type":"object","properties":{"oldText":{"type":"string"},"newText":{"type":"string"}},"required":["oldText","newText"],"additionalProperties":false},"minItems":1}},"required":["path","edits"],"additionalProperties":false}
-        );
-        try schema(s, "write", "Create or overwrite a text file, creating parent directories.",
-            \\{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false}
-        );
-    }
-    if (options.include_builtin and options.web_enabled) {
-        try schema(s, "web_fetch", "Fetch a public URL and return its main content as Markdown.",
-            \\{"type":"object","properties":{"url":{"type":"string","minLength":1,"maxLength":8192}},"required":["url"],"additionalProperties":false}
-        );
-        try schema(s, "web_search", "Search the web and return result titles, URLs, and descriptions.",
-            \\{"type":"object","properties":{"query":{"type":"string","minLength":1,"maxLength":500},"limit":{"type":"integer","minimum":1,"maximum":10,"description":"Number of results to return; defaults to 5."}},"required":["query"],"additionalProperties":false}
-        );
-    }
-    if (options.include_builtin and options.subagents_enabled) try subagentSchemas(s, false, options);
-    for (options.custom) |definition| try schema(s, definition.name, definition.description, definition.parameters_json);
-    try s.endArray();
+    return writeSchemas(s, .responses, options);
 }
 
 pub fn claudeSchemas(s: *std.json.Stringify, web_enabled: bool) !void {
@@ -84,37 +74,51 @@ pub fn claudeSchemas(s: *std.json.Stringify, web_enabled: bool) !void {
 }
 
 pub fn claudeSchemasWithOptions(s: *std.json.Stringify, options: SchemaOptions) !void {
+    return writeSchemas(s, .claude, options);
+}
+
+pub fn schemasForApi(s: *std.json.Stringify, api: auth.Api, options: SchemaOptions) !void {
+    return writeSchemas(s, Shape.forApi(api), options);
+}
+
+/// True when `writeSchemas` would emit at least one tool. Chat Completions
+/// servers differ on empty `tools` arrays, so the request omits the field.
+pub fn anySchemas(options: SchemaOptions) bool {
+    return options.include_builtin or options.custom.len > 0;
+}
+
+fn writeSchemas(s: *std.json.Stringify, shape: Shape, options: SchemaOptions) !void {
     try s.beginArray();
     if (options.include_builtin) {
-        try claudeSchema(s, "read", "Read a text file. Paths may be relative or absolute.",
+        try schemaFor(s, shape, "read", "Read a text file. Paths may be relative or absolute.",
             \\{"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":false}
         );
-        try claudeSchema(s, "bash", "Run a shell command in the current directory with full host permissions.",
+        try schemaFor(s, shape, "bash", "Run a shell command in the current directory with full host permissions.",
             \\{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer","minimum":1,"maximum":3600}},"required":["command"],"additionalProperties":false}
         );
     }
     if (options.include_builtin and options.write_enabled) {
-        try claudeSchema(s, "edit", "Apply exact, non-overlapping text replacements to a file.",
+        try schemaFor(s, shape, "edit", "Apply exact, non-overlapping text replacements to a file.",
             \\{"type":"object","properties":{"path":{"type":"string"},"edits":{"type":"array","items":{"type":"object","properties":{"oldText":{"type":"string"},"newText":{"type":"string"}},"required":["oldText","newText"],"additionalProperties":false},"minItems":1}},"required":["path","edits"],"additionalProperties":false}
         );
-        try claudeSchema(s, "write", "Create or overwrite a text file, creating parent directories.",
+        try schemaFor(s, shape, "write", "Create or overwrite a text file, creating parent directories.",
             \\{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false}
         );
     }
     if (options.include_builtin and options.web_enabled) {
-        try claudeSchema(s, "web_fetch", "Fetch a public URL and return its main content as Markdown.",
+        try schemaFor(s, shape, "web_fetch", "Fetch a public URL and return its main content as Markdown.",
             \\{"type":"object","properties":{"url":{"type":"string","minLength":1,"maxLength":8192}},"required":["url"],"additionalProperties":false}
         );
-        try claudeSchema(s, "web_search", "Search the web and return result titles, URLs, and descriptions.",
+        try schemaFor(s, shape, "web_search", "Search the web and return result titles, URLs, and descriptions.",
             \\{"type":"object","properties":{"query":{"type":"string","minLength":1,"maxLength":500},"limit":{"type":"integer","minimum":1,"maximum":10,"description":"Number of results to return; defaults to 5."}},"required":["query"],"additionalProperties":false}
         );
     }
-    if (options.include_builtin and options.subagents_enabled) try subagentSchemas(s, true, options);
-    for (options.custom) |definition| try claudeSchema(s, definition.name, definition.description, definition.parameters_json);
+    if (options.include_builtin and options.subagents_enabled) try subagentSchemas(s, shape, options);
+    for (options.custom) |definition| try schemaFor(s, shape, definition.name, definition.description, definition.parameters_json);
     try s.endArray();
 }
 
-fn subagentSchemas(s: *std.json.Stringify, claude: bool, options: SchemaOptions) !void {
+fn subagentSchemas(s: *std.json.Stringify, shape: Shape, options: SchemaOptions) !void {
     var description_buffer: [1024]u8 = undefined;
     const description = if (options.subagent_launch) |launch|
         std.fmt.bufPrint(&description_buffer, "Launch an autonomous subagent for a self-contained, multi-step task. Workers use provider={s} and cannot switch providers. Omit model to inherit {s}; valid overrides are listed in model.enum. Omit effort to inherit {s} when the model is inherited. Never guess or probe model IDs. Workers have workspace_write access with full host permissions; read_only is unavailable. At most {d} workers run at once and extra workers queue. Background is the default. Use get_subagent_result with wait true before relying on a result. Prompts must contain all context the worker needs.", .{ launch.provider, launch.model, launch.effort orelse "provider-default", options.subagent_max_concurrent }) catch unreachable
@@ -126,28 +130,26 @@ fn subagentSchemas(s: *std.json.Stringify, claude: bool, options: SchemaOptions)
     const steer_parameters =
         \\{"type":"object","properties":{"agent_id":{"type":"string"},"message":{"type":"string","maxLength":65536}},"required":["agent_id","message"],"additionalProperties":false}
     ;
-    if (claude) {
-        try dynamicAgentSchema(s, true, description, options.subagent_launch);
-        try claudeSchema(s, "get_subagent_result", "Check a background subagent's status and retrieve its result. Use wait true when the result gates your next action.", get_parameters);
-        try claudeSchema(s, "steer_subagent", "Send a message that redirects a running or queued subagent before its next model turn.", steer_parameters);
-    } else {
-        try dynamicAgentSchema(s, false, description, options.subagent_launch);
-        try schema(s, "get_subagent_result", "Check a background subagent's status and retrieve its result. Use wait true when the result gates your next action.", get_parameters);
-        try schema(s, "steer_subagent", "Send a message that redirects a running or queued subagent before its next model turn.", steer_parameters);
-    }
+    try dynamicAgentSchema(s, shape, description, options.subagent_launch);
+    try schemaFor(s, shape, "get_subagent_result", "Check a background subagent's status and retrieve its result. Use wait true when the result gates your next action.", get_parameters);
+    try schemaFor(s, shape, "steer_subagent", "Send a message that redirects a running or queued subagent before its next model turn.", steer_parameters);
 }
 
-fn dynamicAgentSchema(s: *std.json.Stringify, claude: bool, description: []const u8, launch: ?subagents.Launch) !void {
+fn dynamicAgentSchema(s: *std.json.Stringify, shape: Shape, description: []const u8, launch: ?subagents.Launch) !void {
     try s.beginObject();
-    if (!claude) {
+    if (shape != .claude) {
         try s.objectField("type");
         try s.write("function");
+    }
+    if (shape == .chat) {
+        try s.objectField("function");
+        try s.beginObject();
     }
     try s.objectField("name");
     try s.write("Agent");
     try s.objectField("description");
     try s.write(description);
-    try s.objectField(if (claude) "input_schema" else "parameters");
+    try s.objectField(if (shape == .claude) "input_schema" else "parameters");
     try s.beginObject();
     try s.objectField("type");
     try s.write("object");
@@ -168,13 +170,8 @@ fn dynamicAgentSchema(s: *std.json.Stringify, claude: bool, description: []const
         try s.write("Optional model ID for the active provider. Omit it to inherit the parent model.");
         try s.objectField("enum");
         try s.beginArray();
-        const provider = auth.Provider.parse(runtime.provider);
-        if (provider) |value| {
-            for (models.choices(value)) |model| try s.write(model);
-            if (models.find(value, runtime.model) == null) try s.write(runtime.model);
-        } else {
-            try s.write(runtime.model);
-        }
+        for (runtime.catalog.choices()) |model| try s.write(model);
+        if (!runtime.catalog.lists(runtime.model)) try s.write(runtime.model);
         try s.endArray();
     }
     try s.endObject();
@@ -210,6 +207,31 @@ fn dynamicAgentSchema(s: *std.json.Stringify, claude: bool, description: []const
     try s.endArray();
     try s.objectField("additionalProperties");
     try s.write(false);
+    try s.endObject();
+    if (shape == .chat) try s.endObject();
+    try s.endObject();
+}
+
+fn schemaFor(s: *std.json.Stringify, shape: Shape, name: []const u8, description: []const u8, parameters: []const u8) !void {
+    return switch (shape) {
+        .responses => schema(s, name, description, parameters),
+        .claude => claudeSchema(s, name, description, parameters),
+        .chat => chatSchema(s, name, description, parameters),
+    };
+}
+
+fn chatSchema(s: *std.json.Stringify, name: []const u8, description: []const u8, parameters: []const u8) !void {
+    try s.beginObject();
+    try s.objectField("type");
+    try s.write("function");
+    try s.objectField("function");
+    try s.beginObject();
+    try s.objectField("name");
+    try s.write(name);
+    try s.objectField("description");
+    try s.write(description);
+    try s.objectField("parameters");
+    try rawValue(s, parameters);
     try s.endObject();
     try s.endObject();
 }
@@ -993,7 +1015,7 @@ test "subagent schemas are parent-only and write tools can be omitted" {
     var parent_json: std.json.Stringify = .{ .writer = &parent.writer };
     const subagent_options: SchemaOptions = .{
         .subagents_enabled = true,
-        .subagent_launch = .{ .provider = "claude", .model = "claude-fable-5", .effort = "high", .fast = false },
+        .subagent_launch = .{ .provider = "claude", .catalog = .builtin(.claude), .model = "claude-fable-5", .effort = "high", .fast = false },
         .subagent_max_concurrent = 2,
     };
     try schemasWithOptions(&parent_json, subagent_options);

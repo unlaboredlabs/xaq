@@ -61,7 +61,7 @@ var layout_ready = false;
 var layout_dirty = false;
 
 // Bars' model; fixed buffers so rendering never allocates.
-var provider_buffer: [16]u8 = undefined;
+var provider_buffer: [32]u8 = undefined;
 var provider_len: usize = 0;
 var model_buffer: [96]u8 = undefined;
 var model_len: usize = 0;

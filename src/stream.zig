@@ -17,7 +17,9 @@ pub const Hooks = struct {
 /// `service_tier`. Missing or unfamiliar values stay unknown.
 pub const ServedSpeed = enum { unknown, standard, fast };
 
-const StreamingClaudeCall = struct {
+/// A tool call assembled from fragments: Anthropic `input_json_delta` or
+/// Chat Completions `tool_calls[].function.arguments` chunks keyed by index.
+const StreamingCall = struct {
     index: i64,
     id: []const u8,
     name: []const u8,
@@ -25,14 +27,14 @@ const StreamingClaudeCall = struct {
 };
 
 pub const Decoder = struct {
-    provider: auth.Provider,
+    api: auth.Api,
     parse_arena: std.heap.ArenaAllocator,
     persist: std.mem.Allocator,
     hooks: Hooks,
     text: Io.Writer.Allocating,
     calls: std.ArrayList(types.ToolCall) = .empty,
     raw: std.ArrayList([]const u8) = .empty,
-    claude_calls: std.ArrayList(StreamingClaudeCall) = .empty,
+    streamed_calls: std.ArrayList(StreamingCall) = .empty,
     usage: types.Usage = .{},
     speed: ServedSpeed = .unknown,
     service_tier_buffer: [64]u8 = undefined,
@@ -41,9 +43,9 @@ pub const Decoder = struct {
     completed: bool = false,
     provider_error: ?[]const u8 = null,
 
-    pub fn init(provider: auth.Provider, parse_gpa: std.mem.Allocator, persist: std.mem.Allocator, hooks: Hooks) Decoder {
+    pub fn init(api: auth.Api, parse_gpa: std.mem.Allocator, persist: std.mem.Allocator, hooks: Hooks) Decoder {
         return .{
-            .provider = provider,
+            .api = api,
             .parse_arena = .init(parse_gpa),
             .persist = persist,
             .hooks = hooks,
@@ -87,16 +89,70 @@ pub const Decoder = struct {
         const line = std.mem.trim(u8, raw_line, " \r");
         if (!std.mem.startsWith(u8, line, "data:")) return;
         const data = std.mem.trimStart(u8, line[5..], " ");
-        if (std.mem.eql(u8, data, "[DONE]") or data.len == 0) return;
+        if (std.mem.eql(u8, data, "[DONE]")) {
+            // Chat Completions has no completion event of its own; the
+            // terminal sentinel is the contract, alongside finish_reason.
+            if (self.api == .chat_completions) self.completed = true;
+            return;
+        }
+        if (data.len == 0) return;
         // Event values are only borrowed for this call. Reusing the arena
         // avoids allocator churn across the many events in one response.
         _ = self.parse_arena.reset(.{ .retain_with_limit = 256 * 1024 });
         const parsed = std.json.parseFromSliceLeaky(std.json.Value, self.parse_arena.allocator(), data, .{}) catch return;
-        if (self.provider == .claude) {
-            try self.feedClaude(parsed, data);
-        } else {
-            try self.feedResponses(parsed, data);
+        switch (self.api) {
+            .messages => try self.feedClaude(parsed, data),
+            .responses => try self.feedResponses(parsed, data),
+            .chat_completions => try self.feedChat(parsed, data),
         }
+    }
+
+    /// OpenAI-style chunks: `choices[0].delta` carries text and tool call
+    /// fragments, `finish_reason` closes the choice, and the final chunk
+    /// may carry `usage` when `stream_options.include_usage` is on.
+    fn feedChat(self: *Decoder, value: std.json.Value, data: []const u8) !void {
+        if (value != .object) return;
+        if (value.object.get("error")) |err| if (err != .null) return self.captureProviderError(data);
+        if (eventObject(value, "usage")) |usage_value| if (usage_value == .object) {
+            if (eventInteger(usage_value, "prompt_tokens")) |number| self.usage.input = number;
+            if (eventInteger(usage_value, "completion_tokens")) |number| self.usage.output = number;
+            if (eventObject(usage_value, "prompt_tokens_details")) |details| {
+                if (eventInteger(details, "cached_tokens")) |number| self.usage.cached = number;
+            }
+        };
+        const choices = value.object.get("choices") orelse return;
+        if (choices != .array or choices.array.items.len == 0) return;
+        const choice = choices.array.items[0];
+        if (eventObject(choice, "delta")) |delta| {
+            if (eventString(delta, "content")) |text| if (text.len > 0) try self.writeDelta(text);
+            if (eventObject(delta, "tool_calls")) |calls| if (calls == .array) {
+                for (calls.array.items) |call| try self.noteChatToolCall(call);
+            };
+        }
+        if (eventString(choice, "finish_reason") != null) self.completed = true;
+    }
+
+    fn noteChatToolCall(self: *Decoder, call: std.json.Value) !void {
+        try self.beforeOutput();
+        const function = eventObject(call, "function");
+        const index: i64 = if (eventInteger(call, "index")) |number| @intCast(number) else @intCast(self.streamed_calls.items.len);
+        const fragment = if (function) |value| eventString(value, "arguments") else null;
+        for (self.streamed_calls.items) |*existing| if (existing.index == index) {
+            // Some servers repeat the name on later fragments; only fill a gap.
+            if (existing.name.len == 0) if (function) |value| if (eventString(value, "name")) |name| {
+                existing.name = try self.persist.dupe(u8, name);
+            };
+            if (fragment) |part| try existing.args.writer.writeAll(part);
+            return;
+        };
+        const id = eventString(call, "id") orelse "";
+        try self.streamed_calls.append(self.persist, .{
+            .index = index,
+            .id = if (id.len > 0) try self.persist.dupe(u8, id) else try std.fmt.allocPrint(self.persist, "call_{d}", .{index}),
+            .name = try self.persist.dupe(u8, if (function) |value| eventString(value, "name") orelse "" else ""),
+            .args = .init(self.persist),
+        });
+        if (fragment) |part| try self.streamed_calls.items[self.streamed_calls.items.len - 1].args.writer.writeAll(part);
     }
 
     fn feedResponses(self: *Decoder, value: std.json.Value, data: []const u8) !void {
@@ -144,7 +200,7 @@ pub const Decoder = struct {
             };
             const block = value.object.get("content_block") orelse return;
             if (eventString(block, "type")) |block_type| if (std.mem.eql(u8, block_type, "tool_use")) {
-                try self.claude_calls.append(self.persist, .{
+                try self.streamed_calls.append(self.persist, .{
                     .index = index,
                     .id = try self.persist.dupe(u8, eventString(block, "id") orelse return error.InvalidProviderResponse),
                     .name = try self.persist.dupe(u8, eventString(block, "name") orelse return error.InvalidProviderResponse),
@@ -162,7 +218,7 @@ pub const Decoder = struct {
                     else => return,
                 };
                 const part = eventString(delta, "partial_json") orelse return;
-                for (self.claude_calls.items) |*call| if (call.index == index) {
+                for (self.streamed_calls.items) |*call| if (call.index == index) {
                     try call.args.writer.writeAll(part);
                     break;
                 };
@@ -232,15 +288,18 @@ pub const Decoder = struct {
 
     pub fn finish(self: *Decoder) !types.Assistant {
         try self.validateComplete();
-        if (self.provider == .claude) {
-            for (self.claude_calls.items) |*call| try self.calls.append(self.persist, .{
-                .id = call.id,
-                .name = call.name,
-                .arguments = if (call.args.written().len == 0)
-                    try self.persist.dupe(u8, "{}")
-                else
-                    try call.args.toOwnedSlice(),
-            });
+        if (self.api != .responses) {
+            for (self.streamed_calls.items) |*call| {
+                if (call.name.len == 0) return error.InvalidProviderResponse;
+                try self.calls.append(self.persist, .{
+                    .id = call.id,
+                    .name = call.name,
+                    .arguments = if (call.args.written().len == 0)
+                        try self.persist.dupe(u8, "{}")
+                    else
+                        try call.args.toOwnedSlice(),
+                });
+            }
         }
         return .{
             .text = try self.text.toOwnedSlice(),
@@ -283,7 +342,7 @@ fn eventInteger(value: std.json.Value, key: []const u8) ?u64 {
 test "decodes Responses text, calls, and usage" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var decoder = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), .{});
+    var decoder = Decoder.init(.responses, std.testing.allocator, arena.allocator(), .{});
     defer decoder.deinit();
     try decoder.feed("data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}");
     try decoder.feed("data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"read\",\"arguments\":\"{}\"}}");
@@ -311,7 +370,7 @@ test "classifies only recognized returned service tiers" {
         .{ .tier = "", .speed = .unknown },
     };
     for (cases) |case| {
-        var decoder = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), .{});
+        var decoder = Decoder.init(.responses, std.testing.allocator, arena.allocator(), .{});
         defer decoder.deinit();
         const event = try std.fmt.allocPrint(std.testing.allocator, "data: {{\"type\":\"response.completed\",\"response\":{{\"service_tier\":{f}}}}}", .{std.json.fmt(case.tier, .{})});
         defer std.testing.allocator.free(event);
@@ -321,7 +380,7 @@ test "classifies only recognized returned service tiers" {
         try std.testing.expect(!decoder.service_tier_truncated);
     }
 
-    var responses_silent = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), .{});
+    var responses_silent = Decoder.init(.responses, std.testing.allocator, arena.allocator(), .{});
     defer responses_silent.deinit();
     try responses_silent.feed("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}");
     try std.testing.expectEqual(ServedSpeed.unknown, responses_silent.speed);
@@ -338,7 +397,7 @@ test "classifies only recognized returned service tiers" {
 }
 
 test "returned service tier diagnostics survive parser reuse and stay bounded" {
-    var decoder = Decoder.init(.chatgpt, std.testing.allocator, std.testing.allocator, .{});
+    var decoder = Decoder.init(.responses, std.testing.allocator, std.testing.allocator, .{});
     defer decoder.deinit();
     const tier = "x" ** 63 ++ "界\n\x1b[31m";
     const event = try std.fmt.allocPrint(std.testing.allocator, "data: {{\"type\":\"response.completed\",\"response\":{{\"service_tier\":{f}}}}}", .{std.json.fmt(tier, .{})});
@@ -362,12 +421,12 @@ test "reports explicit Anthropic speed metadata" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var claude_fast = Decoder.init(.claude, std.testing.allocator, arena.allocator(), .{});
+    var claude_fast = Decoder.init(.messages, std.testing.allocator, arena.allocator(), .{});
     defer claude_fast.deinit();
     try claude_fast.feed("data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"speed\":\"fast\"}}}");
     try std.testing.expectEqual(ServedSpeed.fast, claude_fast.speed);
 
-    var claude_standard = Decoder.init(.claude, std.testing.allocator, arena.allocator(), .{});
+    var claude_standard = Decoder.init(.messages, std.testing.allocator, arena.allocator(), .{});
     defer claude_standard.deinit();
     try claude_standard.feed("data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}");
     try std.testing.expectEqual(ServedSpeed.unknown, claude_standard.speed);
@@ -378,7 +437,7 @@ test "reports explicit Anthropic speed metadata" {
 test "decodes Anthropic fragmented tool input" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var decoder = Decoder.init(.claude, std.testing.allocator, arena.allocator(), .{});
+    var decoder = Decoder.init(.messages, std.testing.allocator, arena.allocator(), .{});
     defer decoder.deinit();
     try decoder.feed("data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}");
     try decoder.feed("data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"bash\",\"input\":{}}}");
@@ -406,7 +465,7 @@ test "finishing Anthropic calls does not duplicate large argument buffers" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var counted: std.testing.FailingAllocator = .init(arena.allocator(), .{});
-    var decoder = Decoder.init(.claude, std.testing.allocator, counted.allocator(), .{});
+    var decoder = Decoder.init(.messages, std.testing.allocator, counted.allocator(), .{});
     defer decoder.deinit();
     try decoder.feed("data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"write\",\"input\":{}}}");
     try decoder.feed("data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_2\",\"name\":\"edit\",\"input\":{}}}");
@@ -443,7 +502,7 @@ test "finishing Anthropic calls does not duplicate large argument buffers" {
 test "preserves Anthropic streaming errors" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var decoder = Decoder.init(.claude, std.testing.allocator, arena.allocator(), .{});
+    var decoder = Decoder.init(.messages, std.testing.allocator, arena.allocator(), .{});
     defer decoder.deinit();
     try decoder.feed("data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Claude is overloaded\"}}");
     try std.testing.expectEqualStrings("Claude is overloaded", decoder.providerError().?);
@@ -453,7 +512,7 @@ test "preserves Anthropic streaming errors" {
 test "preserves Responses streaming errors" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var decoder = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), .{});
+    var decoder = Decoder.init(.responses, std.testing.allocator, arena.allocator(), .{});
     defer decoder.deinit();
     try decoder.feed("data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"Model unavailable\"}}}");
     try std.testing.expectEqualStrings("Model unavailable", decoder.providerError().?);
@@ -463,21 +522,25 @@ test "preserves Responses streaming errors" {
 test "requires a provider completion event before accepting an answer" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    for ([_]auth.Provider{ .chatgpt, .grok, .claude }) |provider| {
-        var decoder = Decoder.init(provider, std.testing.allocator, arena.allocator(), .{});
+    for ([_]auth.Api{ .responses, .messages, .chat_completions }) |api| {
+        var decoder = Decoder.init(api, std.testing.allocator, arena.allocator(), .{});
         defer decoder.deinit();
         try std.testing.expectError(error.IncompleteProviderResponse, decoder.finish());
-        try decoder.feed("data: [DONE]");
+        if (api != .chat_completions) {
+            try decoder.feed("data: [DONE]");
+            try std.testing.expectError(error.IncompleteProviderResponse, decoder.finish());
+        }
+        try decoder.feed(switch (api) {
+            .messages => "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}",
+            .responses => "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}",
+            .chat_completions => "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}",
+        });
         try std.testing.expectError(error.IncompleteProviderResponse, decoder.finish());
-        try decoder.feed(if (provider == .claude)
-            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}"
-        else
-            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}");
-        try std.testing.expectError(error.IncompleteProviderResponse, decoder.finish());
-        try decoder.feed(if (provider == .claude)
-            "data: {\"type\":\"message_stop\"}"
-        else
-            "data: {\"type\":\"response.completed\",\"response\":{}}");
+        try decoder.feed(switch (api) {
+            .messages => "data: {\"type\":\"message_stop\"}",
+            .responses => "data: {\"type\":\"response.completed\",\"response\":{}}",
+            .chat_completions => "data: [DONE]",
+        });
         const result = try decoder.finish();
         try std.testing.expectEqualStrings("partial", result.text);
     }
@@ -486,7 +549,7 @@ test "requires a provider completion event before accepting an answer" {
 test "incomplete Responses preserve usage without accepting tool calls" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    var decoder = Decoder.init(.chatgpt, std.testing.allocator, arena.allocator(), .{});
+    var decoder = Decoder.init(.responses, std.testing.allocator, arena.allocator(), .{});
     defer decoder.deinit();
     try decoder.feed("data: {\"type\":\"response.incomplete\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}");
     try std.testing.expectError(error.IncompleteProviderResponse, decoder.finish());
@@ -494,4 +557,57 @@ test "incomplete Responses preserve usage without accepting tool calls" {
     try std.testing.expectEqual(@as(u64, 10), result.usage.input);
     try std.testing.expectEqual(@as(u64, 5), result.usage.output);
     try std.testing.expectEqual(@as(usize, 0), result.calls.len);
+}
+
+test "decodes Chat Completions text, fragmented tool calls, usage, and finish" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var decoder = Decoder.init(.chat_completions, std.testing.allocator, arena.allocator(), .{});
+    defer decoder.deinit();
+    try decoder.feed("data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}");
+    try decoder.feed("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"look\"},\"finish_reason\":null}]}");
+    try decoder.feed("data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"pa\"}}]},\"finish_reason\":null}]}");
+    try decoder.feed("data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"th\\\":\\\"a\\\"}\"}},{\"index\":1,\"id\":\"call_b\",\"function\":{\"name\":\"bash\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}");
+    try std.testing.expectError(error.IncompleteProviderResponse, decoder.finish());
+    try decoder.feed("data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}");
+    try decoder.feed("data: {\"choices\":[],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":7,\"prompt_tokens_details\":{\"cached_tokens\":5}}}");
+    try decoder.feed("data: [DONE]");
+    const result = try decoder.finish();
+    try std.testing.expectEqualStrings("look", result.text);
+    try std.testing.expectEqual(@as(usize, 2), result.calls.len);
+    try std.testing.expectEqualStrings("call_a", result.calls[0].id);
+    try std.testing.expectEqualStrings("read", result.calls[0].name);
+    try std.testing.expectEqualStrings("{\"path\":\"a\"}", result.calls[0].arguments);
+    try std.testing.expectEqualStrings("bash", result.calls[1].name);
+    try std.testing.expectEqualStrings("{}", result.calls[1].arguments);
+    try std.testing.expectEqual(@as(usize, 0), result.raw_items.len);
+    try std.testing.expectEqual(@as(u64, 20), result.usage.input);
+    try std.testing.expectEqual(@as(u64, 5), result.usage.cached);
+    try std.testing.expectEqual(@as(u64, 7), result.usage.output);
+}
+
+test "Chat Completions tool calls without ids or indexes still assemble" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var decoder = Decoder.init(.chat_completions, std.testing.allocator, arena.allocator(), .{});
+    defer decoder.deinit();
+    try decoder.feed("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"pwd\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}");
+    const result = try decoder.finish();
+    try std.testing.expectEqualStrings("call_0", result.calls[0].id);
+    try std.testing.expectEqualStrings("{\"command\":\"pwd\"}", result.calls[0].arguments);
+
+    var nameless = Decoder.init(.chat_completions, std.testing.allocator, arena.allocator(), .{});
+    defer nameless.deinit();
+    try nameless.feed("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}");
+    try std.testing.expectError(error.InvalidProviderResponse, nameless.finish());
+}
+
+test "preserves Chat Completions streaming errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var decoder = Decoder.init(.chat_completions, std.testing.allocator, arena.allocator(), .{});
+    defer decoder.deinit();
+    try decoder.feed("data: {\"error\":{\"message\":\"model not found\",\"type\":\"invalid_request_error\"}}");
+    try std.testing.expectEqualStrings("model not found", decoder.providerError().?);
+    try std.testing.expectError(error.ProviderRequestFailed, decoder.finish());
 }

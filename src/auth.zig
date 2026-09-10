@@ -8,14 +8,45 @@ const term = @import("term.zig");
 const transport = @import("transport.zig");
 const tui = @import("tui.zig");
 
+/// The wire format a provider speaks. Built-in subscriptions each have a
+/// fixed format; a custom endpoint declares its own in settings.
+pub const Api = enum {
+    responses,
+    messages,
+    chat_completions,
+
+    pub fn parse(value: []const u8) ?Api {
+        inline for (@typeInfo(Api).@"enum".fields) |field| {
+            if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+        }
+        return null;
+    }
+
+    /// Path appended to a custom endpoint's base URL.
+    pub fn path(self: Api) []const u8 {
+        return switch (self) {
+            .responses => "/responses",
+            .messages => "/messages",
+            .chat_completions => "/chat/completions",
+        };
+    }
+};
+
+/// Built-in subscriptions plus one tag for user-configured endpoints. A
+/// custom provider is identified by its settings name; see providers.Ref.
 pub const Provider = enum {
     chatgpt,
     claude,
     grok,
+    custom,
 
+    pub const builtin = [_]Provider{ .chatgpt, .claude, .grok };
+
+    /// Built-in names only. "custom" is reserved and never parses so a
+    /// settings name can never collide with the tag itself.
     pub fn parse(value: []const u8) ?Provider {
-        inline for (@typeInfo(Provider).@"enum".fields) |field| {
-            if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+        inline for (builtin) |provider| {
+            if (std.mem.eql(u8, value, @tagName(provider))) return provider;
         }
         return null;
     }
@@ -25,6 +56,17 @@ pub const Provider = enum {
             .chatgpt => "ChatGPT",
             .claude => "Claude",
             .grok => "Grok",
+            .custom => "custom",
+        };
+    }
+
+    /// Wire format of a built-in subscription. Custom endpoints carry
+    /// theirs in settings, so this is null for them.
+    pub fn api(self: Provider) ?Api {
+        return switch (self) {
+            .chatgpt, .grok => .responses,
+            .claude => .messages,
+            .custom => null,
         };
     }
 };
@@ -104,6 +146,7 @@ pub fn login(gpa: std.mem.Allocator, io: Io, home: []const u8, provider: Provide
         .chatgpt => try loginChatGpt(gpa, io, input, output),
         .claude => try loginClaude(gpa, io, input, output),
         .grok => try loginGrok(gpa, io, input, output),
+        .custom => return error.UnsupportedProvider,
     };
     try put(gpa, io, home, provider, new_credential);
     try output.print("{s} connected.\n", .{provider.label()});
@@ -167,6 +210,7 @@ pub fn logout(gpa: std.mem.Allocator, io: Io, home: []const u8, provider: Provid
         .chatgpt => store.chatgpt = null,
         .claude => store.claude = null,
         .grok => store.grok = null,
+        .custom => return false,
     }
     try saveUnlocked(gpa, io, home, store);
     return true;
@@ -231,6 +275,7 @@ fn get(store: Store, provider: Provider) ?Credential {
         .chatgpt => store.chatgpt,
         .claude => store.claude,
         .grok => store.grok,
+        .custom => null,
     };
 }
 
@@ -239,6 +284,7 @@ fn set(store: *Store, provider: Provider, value: Credential) void {
         .chatgpt => store.chatgpt = value,
         .claude => store.claude = value,
         .grok => store.grok = value,
+        .custom => {},
     }
 }
 
@@ -640,11 +686,13 @@ fn refresh(gpa: std.mem.Allocator, io: Io, provider: Provider, old: Credential, 
         .chatgpt => "https://auth.openai.com/oauth/token",
         .claude => anthropic_token,
         .grok => "https://auth.x.ai/oauth2/token",
+        .custom => return error.UnsupportedProvider,
     };
     const client = switch (provider) {
         .chatgpt => openai_client,
         .claude => anthropic_client,
         .grok => xai_client,
+        .custom => unreachable,
     };
     var response: transport.Response = undefined;
     if (provider == .claude) {

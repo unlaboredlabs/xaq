@@ -142,18 +142,30 @@ pub fn readLine(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, 
 /// Read a credential without echoing it or adding it to prompt history.
 /// Bracketed paste supports API keys and OAuth callback URLs.
 pub fn readSecret(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, label: []const u8) !?[]const u8 {
-    return readSecretOptions(gpa, reader, output, label, null);
+    return readSecretOptions(gpa, reader, output, label, null, .{});
 }
+
+/// Read one short visible value (a URL, a name, a model list) with the
+/// same single-line editor as `readSecret`: no prompt history, no file
+/// completion. `initial` prefills the field for editing.
+pub fn readField(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, label: []const u8, initial: ?[]const u8) !?[]const u8 {
+    return readSecretOptions(gpa, reader, output, label, null, .{ .masked = false, .initial = initial });
+}
+
+const SecretOptions = struct {
+    masked: bool = true,
+    initial: ?[]const u8 = null,
+};
 
 const SecretCopy = struct { io: Io, text: []const u8 };
 
 /// Ctrl-Y copies the original login URL, independent of terminal wrapping.
 /// The callback remains hidden and is never copied or added to history.
 pub fn readSecretWithCopy(gpa: std.mem.Allocator, io: Io, reader: *Io.Reader, output: *Io.Writer, label: []const u8, copy_text: []const u8) !?[]const u8 {
-    return readSecretOptions(gpa, reader, output, label, if (interactive) .{ .io = io, .text = copy_text } else null);
+    return readSecretOptions(gpa, reader, output, label, if (interactive) .{ .io = io, .text = copy_text } else null, .{});
 }
 
-fn readSecretOptions(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, label: []const u8, copy: ?SecretCopy) !?[]const u8 {
+fn readSecretOptions(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Writer, label: []const u8, copy: ?SecretCopy, options: SecretOptions) !?[]const u8 {
     const raw = RawMode.enter() catch {
         if (interactive) return error.SecretInputUnavailable;
         return plainSecret(gpa, reader, output, label);
@@ -164,8 +176,10 @@ fn readSecretOptions(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Wri
 
     var buffer: std.ArrayList(u8) = .empty;
     defer buffer.deinit(gpa);
+    if (options.initial) |initial| try buffer.appendSlice(gpa, initial[0..@min(initial.len, 2048)]);
+    const masked = options.masked;
     var resize_wait = ResizeWait.init();
-    try drawSecret(output, label, 0);
+    try drawSecret(output, label, buffer.items, masked);
     try secretPasteMode(output, true);
     defer secretPasteMode(output, false) catch {};
 
@@ -173,7 +187,7 @@ fn readSecretOptions(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Wri
         const byte = switch (try resize_wait.next(reader, null)) {
             .byte => |byte| byte,
             .resize => {
-                try drawSecret(output, label, buffer.items.len);
+                try drawSecret(output, label, buffer.items, masked);
                 continue;
             },
             .end => {
@@ -194,14 +208,14 @@ fn readSecretOptions(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Wri
             },
             0x7f, 0x08 => if (buffer.items.len > 0) {
                 buffer.items.len = prevBoundary(buffer.items, buffer.items.len);
-                try drawSecret(output, label, buffer.items.len);
+                try drawSecret(output, label, buffer.items, masked);
             },
             0x19 => if (copy) |action| {
                 const copied = copySecretLink(gpa, action, output) catch false;
                 if (!tui.active) try output.writeAll("\r\x1b[2K");
                 try output.writeAll(if (copied) "Login link sent to clipboard.\n" else "Could not copy link; select the printed URL instead.\n");
                 try output.flush();
-                try drawSecret(output, label, buffer.items.len);
+                try drawSecret(output, label, buffer.items, masked);
             },
             0x1b => {
                 const second = (try takeSequenceByte(reader, null)) orelse continue;
@@ -220,12 +234,12 @@ fn readSecretOptions(gpa: std.mem.Allocator, reader: *Io.Reader, output: *Io.Wri
                 {
                     var cursor = buffer.items.len;
                     _ = try pasteInto(gpa, &buffer, &cursor, reader, null, 0);
-                    try drawSecret(output, label, buffer.items.len);
+                    try drawSecret(output, label, buffer.items, masked);
                 }
             },
-            else => if (byte >= 0x21 and byte <= 0x7e and buffer.items.len < 2048) {
+            else => if (byte >= (if (masked) @as(u8, 0x21) else 0x20) and byte <= 0x7e and buffer.items.len < 2048) {
                 try buffer.append(gpa, byte);
-                try drawSecret(output, label, buffer.items.len);
+                try drawSecret(output, label, buffer.items, masked);
             },
         }
     }
@@ -248,7 +262,7 @@ fn secretPasteMode(output: *Io.Writer, enabled: bool) !void {
     try target.flush();
 }
 
-fn drawSecret(output: *Io.Writer, label: []const u8, length: usize) !void {
+fn drawSecret(output: *Io.Writer, label: []const u8, text: []const u8, masked: bool) !void {
     if (tui.active) {
         _ = tui.checkResize();
         if (!tui.drawable()) return;
@@ -261,8 +275,13 @@ fn drawSecret(output: *Io.Writer, label: []const u8, length: usize) !void {
     const label_len = @min(label.len, width);
     try target.writeAll(label[0..label_len]);
     var used = label_len;
-    const stars = @min(length, width -| used);
-    for (0..stars) |_| try target.writeByte('*');
+    // A long visible value shows its tail so the cursor stays in view.
+    const stars = @min(text.len, width -| used);
+    if (masked) {
+        for (0..stars) |_| try target.writeByte('*');
+    } else {
+        try target.writeAll(text[text.len - stars ..]);
+    }
     used += stars;
     while (used < width) : (used += 1) try target.writeByte(' ');
     if (tui.active) {

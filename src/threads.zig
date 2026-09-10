@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const auth = @import("auth.zig");
+const providers = @import("providers.zig");
 const types = @import("types.zig");
 
 pub const Thread = struct {
@@ -42,7 +43,7 @@ pub const Thread = struct {
     /// truncated replayable history and long sessions grew the file
     /// without limit. Stream the snapshot so large histories do not need
     /// another full copy in memory.
-    pub fn rewrite(self: *Thread, provider: auth.Provider, model: []const u8, effort: ?[]const u8, fast: bool, cwd: []const u8, entries: []const types.Entry) !void {
+    pub fn rewrite(self: *Thread, provider: []const u8, model: []const u8, effort: ?[]const u8, fast: bool, cwd: []const u8, entries: []const types.Entry) !void {
         var random: [8]u8 = undefined;
         try self.io.randomSecure(&random);
         const hex = std.fmt.bytesToHex(random, .lower);
@@ -60,7 +61,7 @@ pub const Thread = struct {
         try js.beginObject();
         try field(&js, "type", "meta");
         try field(&js, "id", self.id);
-        try field(&js, "provider", @tagName(provider));
+        try field(&js, "provider", provider);
         try field(&js, "model", model);
         if (effort) |value| try field(&js, "effort", value);
         try js.objectField("fast");
@@ -127,13 +128,13 @@ pub const Thread = struct {
 
     /// Persist the full selection in one record so a failed provider/model
     /// change cannot leave a mixture of the old and new settings on replay.
-    pub fn appendSelection(self: *Thread, provider: auth.Provider, model: []const u8, effort: ?[]const u8, fast: bool) !void {
+    pub fn appendSelection(self: *Thread, provider: []const u8, model: []const u8, effort: ?[]const u8, fast: bool) !void {
         self.scratch.clearRetainingCapacity();
         defer self.recycleScratch();
         var js: std.json.Stringify = .{ .writer = &self.scratch.writer };
         try js.beginObject();
         try field(&js, "type", "selection");
-        try field(&js, "provider", @tagName(provider));
+        try field(&js, "provider", provider);
         try field(&js, "model", model);
         try js.objectField("effort");
         try js.write(effort);
@@ -182,6 +183,8 @@ pub const Thread = struct {
 pub const Loaded = struct {
     thread: Thread,
     provider: auth.Provider,
+    /// Settings name when `provider` is `.custom`; owned by the entry allocator.
+    custom: ?[]const u8 = null,
     model: []const u8,
     effort: ?[]const u8,
     fast: bool,
@@ -390,7 +393,7 @@ fn lockThread(io: Io, dir: Io.Dir, id: []const u8) !Io.File {
     };
 }
 
-pub fn create(gpa: std.mem.Allocator, io: Io, home: []const u8, cwd: []const u8, provider: auth.Provider, model: []const u8, effort: ?[]const u8, fast: bool) !Thread {
+pub fn create(gpa: std.mem.Allocator, io: Io, home: []const u8, cwd: []const u8, provider: []const u8, model: []const u8, effort: ?[]const u8, fast: bool) !Thread {
     const dir_path = try threadDir(gpa, home, cwd);
     defer gpa.free(dir_path);
     try Io.Dir.cwd().createDirPath(io, dir_path);
@@ -416,7 +419,7 @@ pub fn create(gpa: std.mem.Allocator, io: Io, home: []const u8, cwd: []const u8,
     try js.beginObject();
     try field(&js, "type", "meta");
     try field(&js, "id", id);
-    try field(&js, "provider", @tagName(provider));
+    try field(&js, "provider", provider);
     try field(&js, "model", model);
     if (effort) |value| try field(&js, "effort", value);
     try js.objectField("fast");
@@ -464,7 +467,7 @@ pub fn load(gpa: std.mem.Allocator, entry_gpa: std.mem.Allocator, io: Io, home: 
     var line_buffer: Io.Writer.Allocating = .init(gpa);
     defer line_buffer.deinit();
 
-    var provider: ?auth.Provider = null;
+    var provider: ?providers.Ref = null;
     var model: ?[]const u8 = null;
     var effort: ?[]const u8 = null;
     var fast = false;
@@ -480,12 +483,12 @@ pub fn load(gpa: std.mem.Allocator, entry_gpa: std.mem.Allocator, io: Io, home: 
         defer parsed.deinit();
         const kind = objectString(parsed.value, "type") orelse continue;
         if (std.mem.eql(u8, kind, "meta")) {
-            provider = auth.Provider.parse(objectString(parsed.value, "provider") orelse continue);
+            provider = try ownedRef(entry_gpa, objectString(parsed.value, "provider") orelse continue);
             model = try entry_gpa.dupe(u8, objectString(parsed.value, "model") orelse continue);
             if (objectString(parsed.value, "effort")) |value| effort = try entry_gpa.dupe(u8, value);
             fast = objectBool(parsed.value, "fast") orelse false;
         } else if (std.mem.eql(u8, kind, "selection")) {
-            const next_provider = auth.Provider.parse(objectString(parsed.value, "provider") orelse continue) orelse continue;
+            const next_provider = (try ownedRef(entry_gpa, objectString(parsed.value, "provider") orelse continue)) orelse continue;
             const next_model = objectString(parsed.value, "model") orelse continue;
             const next_effort: ?[]const u8 = switch (objectValue(parsed.value, "effort") orelse continue) {
                 .null => null,
@@ -495,7 +498,7 @@ pub fn load(gpa: std.mem.Allocator, entry_gpa: std.mem.Allocator, io: Io, home: 
             const next_fast = objectBool(parsed.value, "fast") orelse continue;
             const owned_model = try entry_gpa.dupe(u8, next_model);
             const owned_effort = if (next_effort) |value| try entry_gpa.dupe(u8, value) else null;
-            if (provider != next_provider) {
+            if (provider == null or !provider.?.eql(next_provider)) {
                 for (entries.items) |*entry| switch (entry.*) {
                     .assistant => |*answer| answer.raw_items = &.{},
                     else => {},
@@ -510,7 +513,7 @@ pub fn load(gpa: std.mem.Allocator, entry_gpa: std.mem.Allocator, io: Io, home: 
         } else if (std.mem.eql(u8, kind, "provider")) {
             // An unparseable provider line keeps the previous value; the
             // thread stays loadable on builds that predate a new provider.
-            provider = auth.Provider.parse(objectString(parsed.value, "provider") orelse continue) orelse provider;
+            provider = (try ownedRef(entry_gpa, objectString(parsed.value, "provider") orelse continue)) orelse provider;
         } else if (std.mem.eql(u8, kind, "effort")) {
             effort = try entry_gpa.dupe(u8, objectString(parsed.value, "effort") orelse continue);
         } else if (std.mem.eql(u8, kind, "fast")) {
@@ -533,12 +536,20 @@ pub fn load(gpa: std.mem.Allocator, entry_gpa: std.mem.Allocator, io: Io, home: 
     }
     return .{
         .thread = .{ .gpa = gpa, .io = io, .id = id, .path = path, .lock_file = lock_file, .scratch = .init(gpa) },
-        .provider = provider orelse return error.InvalidThread,
+        .provider = (provider orelse return error.InvalidThread).provider,
+        .custom = (provider orelse return error.InvalidThread).custom,
         .model = model orelse return error.InvalidThread,
         .effort = effort,
         .fast = fast,
         .entries = entries,
     };
+}
+
+/// A custom name borrows the JSON line, so copy it before the parser frees it.
+fn ownedRef(gpa: std.mem.Allocator, name: []const u8) !?providers.Ref {
+    var ref = providers.Ref.parse(name) orelse return null;
+    if (ref.custom) |custom| ref.custom = try gpa.dupe(u8, custom);
+    return ref;
 }
 
 fn validId(value: []const u8) bool {
@@ -757,7 +768,7 @@ test "discard removes an uninstalled thread file" {
     defer temporary.cleanup();
     const home = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path});
     defer std.testing.allocator.free(home);
-    var thread = try create(std.testing.allocator, std.testing.io, home, "/work/discard", .chatgpt, "model-a", null, false);
+    var thread = try create(std.testing.allocator, std.testing.io, home, "/work/discard", "chatgpt", "model-a", null, false);
     const path = try std.testing.allocator.dupe(u8, thread.path);
     defer std.testing.allocator.free(path);
 
@@ -784,7 +795,7 @@ test "failed metadata writes leave no new thread and do not prune existing histo
     defer std.testing.allocator.free(home);
     const cwd = "/work/failed-create";
     for (0..retained_threads) |_| {
-        var thread = try create(std.testing.allocator, std.testing.io, home, cwd, .chatgpt, "original", null, false);
+        var thread = try create(std.testing.allocator, std.testing.io, home, cwd, "chatgpt", "original", null, false);
         defer thread.deinit();
         var file = try Io.Dir.cwd().openFile(std.testing.io, thread.path, .{ .mode = .read_write });
         defer file.close(std.testing.io);
@@ -795,14 +806,14 @@ test "failed metadata writes leave no new thread and do not prune existing histo
     var failing_vtable = std.testing.io.vtable.*;
     failing_vtable.operate = FailMetadata.operate;
     const failing_io: Io = .{ .userdata = std.testing.io.userdata, .vtable = &failing_vtable };
-    try std.testing.expectError(error.NoSpaceLeft, create(std.testing.allocator, failing_io, home, cwd, .chatgpt, "not-created", null, false));
+    try std.testing.expectError(error.NoSpaceLeft, create(std.testing.allocator, failing_io, home, cwd, "chatgpt", "not-created", null, false));
     const after = try list(std.testing.allocator, std.testing.io, home, cwd, null, retained_threads + 1);
     defer freeSummaries(std.testing.allocator, after);
     try std.testing.expectEqual(retained_threads, after.len);
     for (before, after) |old, remaining| try std.testing.expectEqualStrings(old.id, remaining.id);
 
     // Successful creation still applies the retention limit.
-    var created = try create(std.testing.allocator, std.testing.io, home, cwd, .chatgpt, "created", null, false);
+    var created = try create(std.testing.allocator, std.testing.io, home, cwd, "chatgpt", "created", null, false);
     defer created.deinit();
     const retained = try list(std.testing.allocator, std.testing.io, home, cwd, null, retained_threads + 1);
     defer freeSummaries(std.testing.allocator, retained);
@@ -819,11 +830,11 @@ test "thread ownership excludes other sessions across append and atomic rewrite"
     defer arena.deinit();
     const cwd = "/work/ownership";
     const id = blk: {
-        var thread = try create(std.testing.allocator, std.testing.io, home, cwd, .chatgpt, "model-a", null, true);
+        var thread = try create(std.testing.allocator, std.testing.io, home, cwd, "chatgpt", "model-a", null, true);
         defer thread.deinit();
         try std.testing.expectError(error.ThreadInUse, load(std.testing.allocator, arena.allocator(), std.testing.io, home, cwd, thread.id, null));
         try thread.appendEntry(.{ .user = .{ .text = "before compaction" } });
-        try thread.rewrite(.chatgpt, "model-b", "high", true, cwd, &.{.{ .user = .{ .text = "compacted" } }});
+        try thread.rewrite("chatgpt", "model-b", "high", true, cwd, &.{.{ .user = .{ .text = "compacted" } }});
         // Renaming the JSONL must not release the session's ownership.
         try std.testing.expectError(error.ThreadInUse, load(std.testing.allocator, arena.allocator(), std.testing.io, home, cwd, null, null));
         try thread.appendEntry(.{ .user = .{ .text = "after compaction" } });
@@ -856,7 +867,7 @@ test "pruning protects an idle active thread and releases ownership after close"
     const dir_path = try threadDir(std.testing.allocator, home, cwd);
     defer std.testing.allocator.free(dir_path);
     const path = blk: {
-        var thread = try create(std.testing.allocator, std.testing.io, home, cwd, .chatgpt, "model-a", null, false);
+        var thread = try create(std.testing.allocator, std.testing.io, home, cwd, "chatgpt", "model-a", null, false);
         defer thread.deinit();
         var file = try Io.Dir.cwd().openFile(std.testing.io, thread.path, .{ .mode = .read_write });
         defer file.close(std.testing.io);
@@ -879,7 +890,7 @@ test "failed thread loads release ownership" {
     defer std.testing.allocator.free(home);
     const cwd = "/work/invalid-owned";
     const id = blk: {
-        var thread = try create(std.testing.allocator, std.testing.io, home, cwd, .chatgpt, "model-a", null, false);
+        var thread = try create(std.testing.allocator, std.testing.io, home, cwd, "chatgpt", "model-a", null, false);
         defer thread.deinit();
         try Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = thread.path, .data = "{}\n" });
         break :blk try std.testing.allocator.dupe(u8, thread.id);
@@ -896,7 +907,7 @@ test "thread JSONL resumes state after the last reset" {
     const home = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path});
     defer std.testing.allocator.free(home);
     const id = blk: {
-        var thread = try create(std.testing.allocator, std.testing.io, home, "/work/project", .chatgpt, "model-a", "high", true);
+        var thread = try create(std.testing.allocator, std.testing.io, home, "/work/project", "chatgpt", "model-a", "high", true);
         defer thread.deinit();
         try thread.appendEntry(.{ .user = .{ .text = "old" } });
         const scratch_capacity = thread.scratch.writer.buffer.len;
@@ -905,7 +916,7 @@ test "thread JSONL resumes state after the last reset" {
         try std.testing.expectEqual(scratch_capacity, thread.scratch.writer.buffer.len);
         try thread.appendFast(false);
         try thread.appendProvider("claude");
-        try thread.appendProvider("not-a-provider");
+        try thread.appendProvider("Not A Provider");
         const summaries = try list(std.testing.allocator, std.testing.io, home, "/work/project", null, 8);
         defer freeSummaries(std.testing.allocator, summaries);
         try std.testing.expectEqual(@as(usize, 1), summaries.len);
@@ -989,7 +1000,7 @@ test "thread JSONL persists image content" {
     @memset(image_data, 'A');
     const image: types.Image = .{ .name = "shot.png", .media_type = "image/png", .data = image_data };
     const id = blk: {
-        var thread = try create(std.testing.allocator, std.testing.io, home, "/work/images", .chatgpt, "model-a", null, false);
+        var thread = try create(std.testing.allocator, std.testing.io, home, "/work/images", "chatgpt", "model-a", null, false);
         defer thread.deinit();
         try thread.appendEntry(.{ .user = .{ .text = "look", .images = &.{image} } });
 
@@ -1020,10 +1031,10 @@ test "thread selection records apply together and clear replay items only on pro
     const cwd = "/work/selection";
     const raw = "{\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}";
     const id = blk: {
-        var thread = try create(std.testing.allocator, std.testing.io, home, cwd, .chatgpt, "model-a", "high", true);
+        var thread = try create(std.testing.allocator, std.testing.io, home, cwd, "chatgpt", "model-a", "high", true);
         defer thread.deinit();
         try thread.appendEntry(.{ .assistant = .{ .text = "answer", .calls = &.{}, .raw_items = &.{raw} } });
-        try thread.appendSelection(.chatgpt, "model-b", null, false);
+        try thread.appendSelection("chatgpt", "model-b", null, false);
         break :blk try std.testing.allocator.dupe(u8, thread.id);
     };
     defer std.testing.allocator.free(id);
@@ -1037,7 +1048,7 @@ test "thread selection records apply together and clear replay items only on pro
         try std.testing.expectEqual(null, loaded.effort);
         try std.testing.expect(!loaded.fast);
         try std.testing.expectEqualStrings(raw, loaded.entries.items[0].assistant.raw_items[0]);
-        try loaded.thread.appendSelection(.claude, "model-c", "medium", true);
+        try loaded.thread.appendSelection("claude", "model-c", "medium", true);
         // A malformed tuple must not change even its valid fields.
         try append(std.testing.io, loaded.thread.path, "{\"type\":\"selection\",\"provider\":\"grok\",\"model\":\"broken\",\"effort\":null,\"fast\":\"wrong type\"}\n");
         // A partially written next selection is ignored on replay.
@@ -1059,7 +1070,7 @@ test "thread appends recover an interrupted tail and preserve complete untermina
     const home = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path});
     defer std.testing.allocator.free(home);
     const id = blk: {
-        var thread = try create(std.testing.allocator, std.testing.io, home, "/work/interrupted", .chatgpt, "model-a", null, false);
+        var thread = try create(std.testing.allocator, std.testing.io, home, "/work/interrupted", "chatgpt", "model-a", null, false);
         defer thread.deinit();
         try thread.appendEntry(.{ .user = .{ .text = "before" } });
         try append(std.testing.io, thread.path, "{\"type\":\"user\",\"text\":\"interrupted");
@@ -1093,14 +1104,14 @@ test "failed selection append rolls back a complete JSON object without its newl
     defer std.testing.allocator.free(home);
     const cwd = "/work/failed-selection";
     const id = blk: {
-        var thread = try create(std.testing.allocator, std.testing.io, home, cwd, .chatgpt, "original", "high", true);
+        var thread = try create(std.testing.allocator, std.testing.io, home, cwd, "chatgpt", "original", "high", true);
         defer thread.deinit();
         const before = try Io.Dir.cwd().readFileAlloc(std.testing.io, thread.path, std.testing.allocator, .limited(1024));
         defer std.testing.allocator.free(before);
         var failing_vtable = std.testing.io.vtable.*;
         failing_vtable.fileWritePositional = FailFinalNewline.write;
         thread.io = .{ .userdata = std.testing.io.userdata, .vtable = &failing_vtable };
-        try std.testing.expectError(error.WriteFailed, thread.appendSelection(.claude, "not-applied", null, false));
+        try std.testing.expectError(error.WriteFailed, thread.appendSelection("claude", "not-applied", null, false));
         thread.io = std.testing.io;
         const after = try Io.Dir.cwd().readFileAlloc(std.testing.io, thread.path, std.testing.allocator, .limited(1024));
         defer std.testing.allocator.free(after);
@@ -1148,7 +1159,7 @@ test "thread previews truncate UTF-8 safely for either JSON field order" {
     };
     inline for (lines, 0..) |line, index| {
         const cwd = "/work/preview-" ++ std.fmt.comptimePrint("{d}", .{index});
-        var thread = try create(std.testing.allocator, std.testing.io, home, cwd, .chatgpt, "model-a", null, false);
+        var thread = try create(std.testing.allocator, std.testing.io, home, cwd, "chatgpt", "model-a", null, false);
         defer thread.deinit();
         try append(std.testing.io, thread.path, line);
         const summaries = try list(std.testing.allocator, std.testing.io, home, cwd, null, 8);
@@ -1178,7 +1189,7 @@ test "thread rewrite streams large snapshots with bounded allocation" {
         .{ .results = &.{.{ .id = "call-1", .text = "file contents" }} },
     };
     const id = blk: {
-        var thread = try create(std.testing.allocator, std.testing.io, home, cwd, .chatgpt, "old-model", null, false);
+        var thread = try create(std.testing.allocator, std.testing.io, home, cwd, "chatgpt", "old-model", null, false);
         defer thread.deinit();
         try thread.appendEntry(.{ .user = .{ .text = "discarded history" } });
         // Only the temporary filename needs heap space, regardless of the
@@ -1187,7 +1198,7 @@ test "thread rewrite streams large snapshots with bounded allocation" {
         var bounded = std.heap.FixedBufferAllocator.init(&heap);
         var snapshot = thread;
         snapshot.gpa = bounded.allocator();
-        try snapshot.rewrite(.claude, "new-model", "high", true, cwd, &entries);
+        try snapshot.rewrite("claude", "new-model", "high", true, cwd, &entries);
         break :blk try std.testing.allocator.dupe(u8, thread.id);
     };
     defer std.testing.allocator.free(id);
@@ -1217,7 +1228,7 @@ test "thread rewrite preserves history and removes partial snapshots on write fa
     const home = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path});
     defer std.testing.allocator.free(home);
     const cwd = "/work/failed-snapshot";
-    var thread = try create(std.testing.allocator, std.testing.io, home, cwd, .chatgpt, "old-model", null, false);
+    var thread = try create(std.testing.allocator, std.testing.io, home, cwd, "chatgpt", "old-model", null, false);
     defer thread.deinit();
     try thread.appendEntry(.{ .user = .{ .text = "saved history" } });
     const before = try Io.Dir.cwd().readFileAlloc(std.testing.io, thread.path, std.testing.allocator, .limited(4096));
@@ -1230,7 +1241,7 @@ test "thread rewrite preserves history and removes partial snapshots on write fa
     vtable.fileWritePositional = FailAfterFirstWrite.write;
     var snapshot = thread;
     snapshot.io.vtable = &vtable;
-    try std.testing.expectError(error.WriteFailed, snapshot.rewrite(.claude, "new-model", null, false, cwd, &.{.{ .user = .{ .text = text } }}));
+    try std.testing.expectError(error.WriteFailed, snapshot.rewrite("claude", "new-model", null, false, cwd, &.{.{ .user = .{ .text = text } }}));
 
     const after = try Io.Dir.cwd().readFileAlloc(std.testing.io, thread.path, std.testing.allocator, .limited(4096));
     defer std.testing.allocator.free(after);
@@ -1254,7 +1265,7 @@ test "thread loader streams files larger than the former aggregate cap" {
     const home = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path});
     defer std.testing.allocator.free(home);
     const id = blk: {
-        var thread = try create(std.testing.allocator, std.testing.io, home, "/work/large-thread", .chatgpt, "model-a", null, false);
+        var thread = try create(std.testing.allocator, std.testing.io, home, "/work/large-thread", "chatgpt", "model-a", null, false);
         defer thread.deinit();
         const padding = try std.testing.allocator.alloc(u8, 1024 * 1024);
         defer std.testing.allocator.free(padding);
@@ -1273,4 +1284,38 @@ test "thread loader streams files larger than the former aggregate cap" {
     defer loaded.thread.deinit();
     try std.testing.expectEqual(@as(usize, 1), loaded.entries.items.len);
     try std.testing.expectEqualStrings("still resumable", loaded.entries.items[0].user.text);
+}
+
+test "threads persist custom provider names and replay their selections" {
+    const gpa = std.testing.allocator;
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const home = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{temporary.sub_path});
+    defer gpa.free(home);
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const cwd = "/work/custom";
+    var id_buffer: [16]u8 = undefined;
+    {
+        var thread = try create(gpa, std.testing.io, home, cwd, "ollama", "qwen3-coder", "high", false);
+        defer thread.deinit();
+        @memcpy(&id_buffer, thread.id);
+        try thread.appendEntry(.{ .user = .{ .text = "hello" } });
+        try thread.appendEntry(.{ .assistant = .{ .text = "hi", .calls = &.{}, .raw_items = &.{"private"} } });
+        try thread.appendSelection("ollama", "llama4", null, false);
+    }
+    var same = try load(gpa, arena.allocator(), std.testing.io, home, cwd, &id_buffer, null);
+    try std.testing.expectEqual(auth.Provider.custom, same.provider);
+    try std.testing.expectEqualStrings("ollama", same.custom.?);
+    try std.testing.expectEqualStrings("llama4", same.model);
+    // Same provider, different model: private replay items survive.
+    try std.testing.expectEqualStrings("private", same.entries.items[1].assistant.raw_items[0]);
+    try same.thread.appendSelection("claude", "claude-sonnet-5", null, false);
+    same.thread.deinit();
+
+    var switched = try load(gpa, arena.allocator(), std.testing.io, home, cwd, &id_buffer, null);
+    defer switched.thread.deinit();
+    try std.testing.expectEqual(auth.Provider.claude, switched.provider);
+    try std.testing.expectEqual(null, switched.custom);
+    try std.testing.expectEqual(@as(usize, 0), switched.entries.items[1].assistant.raw_items.len);
 }
